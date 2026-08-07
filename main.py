@@ -1,11 +1,21 @@
 import os
 import re
+import json
 import shutil
 import subprocess
 import tempfile
+import threading
+import logging
+import mimetypes
+import uuid
+import urllib.error
+import urllib.request
 from pathlib import Path
 from tkinter import Canvas, filedialog, messagebox
 from tkinter.ttk import Progressbar
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
 try:
     import customtkinter as ctk
@@ -135,11 +145,459 @@ SUPPORTED_MEDIA_EXTENSIONS = {
     ".mov": "video",
     ".avi": "video",
     ".webm": "video",
+    ".mpeg": "video",
+    ".mpg": "video",
 }
 
 
+def _find_ffmpeg_path() -> str | None:
+    candidates = []
+    env_path = os.getenv("FFMPEG_PATH")
+    if env_path:
+        candidates.append(env_path)
+
+    candidates.extend([
+        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+        r"C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe",
+        r"C:\Users\sures\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-9.0-full_build\bin\ffmpeg.exe",
+    ])
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        candidate_path = Path(candidate)
+        if candidate_path.is_dir():
+            candidate_path = candidate_path / "ffmpeg.exe"
+        if candidate_path.exists():
+            return str(candidate_path)
+
+    system_ffmpeg = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+    if system_ffmpeg:
+        return system_ffmpeg
+
+    try:
+        import imageio_ffmpeg as ffmpeg
+        return ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def _ensure_ffmpeg_path() -> str | None:
+    ffmpeg_path = _find_ffmpeg_path()
+    if ffmpeg_path:
+        parent_dir = str(Path(ffmpeg_path).parent)
+        if parent_dir not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = parent_dir + os.pathsep + os.environ.get("PATH", "")
+    return ffmpeg_path
+
+
+def _sanitize_language_code(code: str | None) -> str | None:
+    """Return a safe language code or None for auto-detect.
+
+    - Prefer auto-detect for Odia/Oriya.
+    - Only allow simple two-letter codes; otherwise return None.
+    """
+    if not code:
+        return None
+    c = str(code).strip().casefold()
+    if c in {"odia", "oriya", "or"}:
+        return None
+    # allow two-letter ASCII codes (e.g., en, hi)
+    if re.fullmatch(r"[a-z]{2}", c):
+        return c
+    return None
+
+DEVANAGARI_TO_ODIA = {
+    # Independent vowels
+    "अ": "ଅ",
+    "आ": "ଆ",
+    "इ": "ଇ",
+    "ई": "ଈ",
+    "उ": "ଉ",
+    "ऊ": "ଊ",
+    "ऋ": "ଋ",
+    "ॠ": "ୠ",
+    "ऌ": "ଳ",
+    "ॡ": "ୡ",
+    "ए": "ଏ",
+    "ऐ": "ଐ",
+    "ओ": "ଓ",
+    "औ": "ଔ",
+    # Dependent vowel signs
+    "ा": "ା",
+    "ि": "ି",
+    "ी": "ୀ",
+    "ु": "ୁ",
+    "ू": "ୂ",
+    "ृ": "ୃ",
+    "ॄ": "ୄ",
+    "े": "େ",
+    "ै": "ୈ",
+    "ो": "ୋ",
+    "ौ": "ୌ",
+    "्": "୍",
+    "ँ": "ଁ",
+    "ं": "ଂ",
+    "ः": "ଃ",
+    # Consonants
+    "क": "କ",
+    "ख": "ଖ",
+    "ग": "ଗ",
+    "घ": "ଘ",
+    "ङ": "ଙ",
+    "च": "ଚ",
+    "छ": "ଛ",
+    "ज": "ଜ",
+    "झ": "ଝ",
+    "ञ": "ଞ",
+    "ट": "ଟ",
+    "ठ": "ଠ",
+    "ड": "ଡ",
+    "ढ": "ଢ",
+    "ण": "ଣ",
+    "त": "ତ",
+    "थ": "ଥ",
+    "द": "ଦ",
+    "ध": "ଧ",
+    "न": "ନ",
+    "प": "ପ",
+    "फ": "ଫ",
+    "ब": "ବ",
+    "भ": "ଭ",
+    "म": "ମ",
+    "य": "ୟ",
+    "र": "ର",
+    "ल": "ଲ",
+    "व": "ବ",
+    "श": "ଶ",
+    "ष": "ଷ",
+    "स": "ସ",
+    "ह": "ହ",
+    "ळ": "ଳ",
+    "ऩ": "ନ",
+    "ऱ": "ର",
+    "ड़": "ଡ୍",
+    "ढ़": "ଢ୍",
+}
+
+DEVANAGARI_BLOCK = re.compile(r"[\u0900-\u097F]")
+
+
+def _contains_devanagari(text: str) -> bool:
+    return bool(text and DEVANAGARI_BLOCK.search(text))
+
+
+def _convert_devanagari_to_odia(text: str) -> str:
+    if not text:
+        return text
+    return "".join(DEVANAGARI_TO_ODIA.get(ch, ch) for ch in text)
+
+
+def _cleanup_transcript_text(text: str, odia_selected: bool = False) -> str:
+    text = (text or "").strip()
+    if not text:
+        return text
+    text = re.sub(r"\s+", " ", text)
+    if odia_selected and _contains_devanagari(text):
+        text = _convert_devanagari_to_odia(text)
+    text = re.sub(r"\s+([,?.!;।॥])", r"\1", text)
+    return text
+
+
+def _parse_srt_blocks(srt_text: str) -> list[dict]:
+    blocks = []
+    if not srt_text:
+        return blocks
+    lines = [line.rstrip() for line in srt_text.replace('\r\n', '\n').replace('\r', '\n').split('\n')]
+    index = 0
+    while index < len(lines):
+        line = lines[index].strip()
+        if not line:
+            index += 1
+            continue
+        if not re.fullmatch(r"\d+", line):
+            index += 1
+            continue
+        try:
+            subtitle_index = int(line)
+        except ValueError:
+            index += 1
+            continue
+        index += 1
+        if index >= len(lines):
+            break
+        timestamp_line = lines[index].strip()
+        index += 1
+        text_lines = []
+        while index < len(lines) and lines[index].strip():
+            text_lines.append(lines[index])
+            index += 1
+        blocks.append({
+            "index": subtitle_index,
+            "timestamps": timestamp_line,
+            "text": "\n".join(text_lines).strip(),
+        })
+    return blocks
+
+
+def _build_gemini_prompt_for_subtitles(blocks: list[dict], preferred_language: str | None = None) -> str:
+    subtitles_json = [block["text"] for block in blocks]
+    prompt_lines = [
+        "You are correcting subtitle text.",
+        "Return a JSON array of strings only, where each item is the corrected subtitle text for the corresponding subtitle block in the input order.",
+        "Do not return timestamps, numbering, or any extra explanation.",
+        "Preserve subtitle block order exactly.",
+        "Remove any hallucinated English sentences if the audio is not in English.",
+    ]
+    if preferred_language:
+        preferred_language = preferred_language.strip().casefold()
+        if preferred_language in {"odia", "oriya", "or"}:
+            prompt_lines.extend([
+                "The subtitles should be returned in proper Odia Unicode (ଓଡ଼ିଆ), not Roman Odia.",
+                "Use Odia script for all corrected text.",
+            ])
+        elif preferred_language in {"hindi", "hi"}:
+            prompt_lines.extend([
+                "The subtitles should be returned in proper Hindi Devanagari script.",
+                "Use Hindi script for all corrected text.",
+            ])
+        elif preferred_language in {"english", "en"}:
+            prompt_lines.extend([
+                "The subtitles should be returned in proper English.",
+            ])
+        else:
+            prompt_lines.extend([
+                "Detect whether the text is Odia, Hindi, or English, and return it in the appropriate script.",
+            ])
+    else:
+        prompt_lines.extend([
+            "The audio may be Odia, Hindi, or English; detect the correct language and return the text in the appropriate script.",
+        ])
+    prompt_lines.append("Input subtitles:")
+    prompt_lines.append(json.dumps(subtitles_json, ensure_ascii=False, indent=2))
+    return "\n".join(prompt_lines)
+
+
+def _call_gemini_api(prompt: str, timeout_seconds: int = 30) -> str:
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("OPENAI_API_KEY")
+    api_url = os.getenv("GEMINI_API_URL") or os.getenv("OPENAI_API_BASE") or "https://api.openai.com/v1/chat/completions"
+    if not api_key:
+        raise RuntimeError("Gemini API key not configured. Set GEMINI_API_KEY or OPENAI_API_KEY.")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.0,
+        "max_tokens": int(os.getenv("GEMINI_MAX_TOKENS", "2000")),
+    }
+
+    request_data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(api_url, data=request_data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"Gemini API HTTP error: {exc.code} {exc.reason} - {body}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"Gemini API request failed: {exc}") from exc
+
+    try:
+        response_json = json.loads(body)
+    except Exception as exc:
+        raise RuntimeError(f"Could not parse Gemini response as JSON: {exc} - response: {body[:1000]}") from exc
+
+    # Support OpenAI-style responses
+    content = None
+    if isinstance(response_json, dict):
+        if "choices" in response_json and response_json["choices"]:
+            message = response_json["choices"][0].get("message")
+            if isinstance(message, dict):
+                content = message.get("content")
+            elif isinstance(response_json["choices"][0].get("text"), str):
+                content = response_json["choices"][0].get("text")
+        elif "output" in response_json:
+            outputs = response_json.get("output")
+            if isinstance(outputs, list) and outputs:
+                first = outputs[0]
+                if isinstance(first, dict) and "content" in first:
+                    content = first["content"]
+    if content is None:
+        raise RuntimeError(f"Gemini API returned an unexpected response structure: {json.dumps(response_json)[:1000]}")
+    if isinstance(content, dict):
+        if "text" in content:
+            content = content["text"]
+        else:
+            content = json.dumps(content, ensure_ascii=False)
+    return str(content)
+
+
+def _encode_multipart_formdata(fields: dict[str, str], files: list[tuple[str, str, str, bytes]]) -> tuple[bytes, str]:
+    boundary = uuid.uuid4().hex
+    body_lines: list[bytes] = []
+    encoder = lambda value: value.encode("utf-8") if isinstance(value, str) else value
+
+    for name, value in fields.items():
+        body_lines.append(encoder(f"--{boundary}\r\n"))
+        body_lines.append(encoder(f"Content-Disposition: form-data; name=\"{name}\"\r\n\r\n"))
+        body_lines.append(encoder(f"{value}\r\n"))
+
+    for field_name, filename, content_type, file_data in files:
+        body_lines.append(encoder(f"--{boundary}\r\n"))
+        body_lines.append(encoder(f"Content-Disposition: form-data; name=\"{field_name}\"; filename=\"{filename}\"\r\n"))
+        body_lines.append(encoder(f"Content-Type: {content_type}\r\n\r\n"))
+        body_lines.append(file_data)
+        body_lines.append(encoder("\r\n"))
+
+    body_lines.append(encoder(f"--{boundary}--\r\n"))
+    return b"".join(body_lines), f"multipart/form-data; boundary={boundary}"
+
+
+def _parse_gemini_subtitle_array(response_text: str, expected_count: int) -> list[str]:
+    try:
+        parsed = json.loads(response_text)
+        if isinstance(parsed, list):
+            return [str(item).strip() for item in parsed][:expected_count]
+    except Exception:
+        pass
+
+    lines = [line.strip() for line in response_text.strip().splitlines() if line.strip()]
+    if len(lines) == expected_count and all(not line.startswith("[") for line in lines):
+        return lines
+
+    # Attempt to extract numbered list items if present.
+    results = []
+    current = []
+    for line in lines:
+        numbered = re.match(r"^\s*\d+\s*[\).:-]\s*(.*)$", line)
+        if numbered:
+            if current:
+                results.append(" ".join(current).strip())
+            current = [numbered.group(1).strip()]
+        else:
+            current.append(line)
+    if current:
+        results.append(" ".join(current).strip())
+    if len(results) == expected_count:
+        return results
+
+    raise RuntimeError("Could not parse Gemini subtitle correction output into a subtitle array.")
+
+
+def _correct_subtitles_with_gemini(srt_text: str, preferred_language: str | None = None) -> str:
+    blocks = _parse_srt_blocks(srt_text)
+    if not blocks:
+        return srt_text
+    prompt = _build_gemini_prompt_for_subtitles(blocks, preferred_language=preferred_language)
+    logger.info("Sending %s subtitle blocks to Gemini for correction. Preferred language=%s", len(blocks), preferred_language)
+    response_text = _call_gemini_api(prompt)
+    logger.info("Received response from Gemini: %s", response_text[:1000])
+    corrected_texts = _parse_gemini_subtitle_array(response_text, len(blocks))
+    corrected_subtitles = []
+    for block, corrected in zip(blocks, corrected_texts):
+        corrected = corrected.strip()
+        if not corrected:
+            corrected = block["text"]
+        corrected_subtitles.append(f"{block['index']}\n{block['timestamps']}\n{corrected}\n")
+    return "\n".join(corrected_subtitles).strip() + "\n"
+
+
+def _is_junk_text(text: str) -> bool:
+    if not text or not text.strip():
+        return True
+    stripped = text.strip()
+    if re.fullmatch(r"[\W_]+", stripped, flags=re.UNICODE):
+        return True
+    return False
+
+
+def _is_model_output_junk(segments: list) -> bool:
+    if not segments:
+        return True
+    junk_count = 0
+    for segment in segments:
+        segment_text = (getattr(segment, "text", "") or "").strip()
+        words = [getattr(word, "word", "") or "" for word in getattr(segment, "words", []) or []]
+        if _is_junk_text(segment_text) and all(_is_junk_text(word) for word in words if word.strip()):
+            junk_count += 1
+    return junk_count >= max(1, len(segments))
+
+
+def _get_auto_batch_size(cpu_threads: int) -> int:
+    if cpu_threads >= 16:
+        return 32
+    if cpu_threads >= 8:
+        return 24
+    if cpu_threads >= 4:
+        return 16
+    return 8
+
+
+def _get_auto_chunk_seconds(duration_s: float) -> int:
+    if duration_s <= 0:
+        return 30
+    if duration_s < 300:
+        return 30
+    if duration_s < 900:
+        return 60
+    if duration_s < 1800:
+        return 90
+    return 120
+
+
+def _save_live_subtitles(path: Path, subtitles: list[dict], language: str) -> None:
+    if not subtitles:
+        return
+    try:
+        path.write_text(format_subtitles(subtitles, language), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _build_fallback_subtitles(words: list[dict], max_words: int = 6) -> list[dict]:
+    if not words:
+        return []
+    fallback = []
+    current = []
+    for word in words:
+        current.append(word)
+        if len(current) >= max_words or word["word"].endswith(('.', '?', '!', ';', ':', '।', '॥')):
+            text = " ".join(w["word"] for w in current).strip()
+            if text:
+                fallback.append({
+                    "text": text,
+                    "start": current[0]["start"],
+                    "end": current[-1]["end"],
+                })
+            current = []
+    if current:
+        text = " ".join(w["word"] for w in current).strip()
+        if text:
+            fallback.append({
+                "text": text,
+                "start": current[0]["start"],
+                "end": current[-1]["end"],
+            })
+    return fallback
+
+
 def _build_media_filetypes():
-    return [("All Files", "*.*")]
+    extensions = ["*.mp3", "*.wav", "*.m4a", "*.flac", "*.aac", "*.ogg", "*.mp4", "*.mkv", "*.avi", "*.mov", "*.webm", "*.mpeg", "*.mpg"]
+    return [
+        ("Audio & Video Files", ";".join(extensions)),
+        ("MP3 files", "*.mp3"),
+        ("WAV files", "*.wav"),
+        ("M4A files", "*.m4a"),
+        ("MP4 files", "*.mp4"),
+        ("MPEG files", "*.mpeg;*.mpg"),
+        ("All Files", "*.*"),
+    ]
 
 
 def _path_matches_filter(path, filetypes):
@@ -225,9 +683,12 @@ class OfflineSubtitleGeneratorApp(ctk.CTk):
 
         button_row = ctk.CTkFrame(card, fg_color="transparent")
         button_row.grid(row=3, column=0, padx=18, pady=(0, 10), sticky="w")
-        ctk.CTkButton(button_row, text="Browse...", command=self.browse_media, width=140).pack(side="left")
-        ctk.CTkButton(button_row, text="Generate Subtitles", command=self.generate_subtitles, width=150).pack(side="left", padx=(10, 0))
-        ctk.CTkButton(button_row, text="Save As", command=self.save_as, width=120).pack(side="left", padx=(10, 0))
+        self.browse_button = ctk.CTkButton(button_row, text="Browse...", command=self.browse_media, width=140)
+        self.browse_button.pack(side="left")
+        self.generate_button = ctk.CTkButton(button_row, text="Generate Subtitles", command=self.generate_subtitles, width=150)
+        self.generate_button.pack(side="left", padx=(10, 0))
+        self.save_button = ctk.CTkButton(button_row, text="Save As", command=self.save_as, width=120)
+        self.save_button.pack(side="left", padx=(10, 0))
 
         ctk.CTkLabel(card, textvariable=self.status_var, font=ctk.CTkFont(size=12), text_color="#94a3b8").grid(row=4, column=0, padx=18, pady=(0, 6), sticky="w")
         ctk.CTkLabel(card, textvariable=self.timeline_var, font=ctk.CTkFont(size=12), text_color="#cbd5e1", wraplength=760).grid(row=5, column=0, padx=18, pady=(0, 10), sticky="w")
@@ -272,6 +733,9 @@ class OfflineSubtitleGeneratorApp(ctk.CTk):
         if clipboard_text:
             self.load_media_from_path(clipboard_text)
 
+    def _show_warning(self, title: str, message: str) -> None:
+        messagebox.showwarning(title, message)
+
     def _handle_drop(self, event):
         dropped = event.data or ""
         paths = []
@@ -284,7 +748,7 @@ class OfflineSubtitleGeneratorApp(ctk.CTk):
         return "break"
 
     def browse_media(self):
-        file_path = filedialog.askopenfilename(filetypes=[("All Files", "*.*")])
+        file_path = filedialog.askopenfilename(filetypes=_build_media_filetypes())
         if file_path:
             self.load_media_from_path(file_path)
 
@@ -328,31 +792,16 @@ class OfflineSubtitleGeneratorApp(ctk.CTk):
             messagebox.showerror("Error", "Please open a valid audio or video file first.")
             return
 
-        self.progress["value"] = 10
-        self.update_idletasks()
+        self._set_controls_enabled(False)
+        self._set_progress(10)
         self._preview_text = ""
-        self.output_box.delete("0.0", "end")
-        self.output_box.insert("0.0", "Generating subtitles from media...\n")
-        self.status_var.set("Transcribing audio and creating subtitle phrases...")
+        self._generated_text = ""
+        self._set_output_text("Generating subtitles from media...\n")
+        self._set_status("Preparing media and starting transcription...")
+        self._set_timeline("Live subtitle preview")
 
-        try:
-            audio_path = prepare_audio_path(self._media_path)
-            self._audio_path = audio_path
-            language_hint = _to_whisper_language(self.language_var.get())
-            generated, language = transcribe_audio(audio_path, language_hint=language_hint, preview_callback=self._update_preview)
-        except Exception as exc:
-            messagebox.showerror("Transcription failed", f"Could not generate subtitles: {exc}")
-            self.progress["value"] = 0
-            return
-
-        self.progress["value"] = 90
-        self.update_idletasks()
-        self._generated_text = generated
-        self._language = language or "unknown"
-        self._update_preview(generated)
-        self.progress["value"] = 100
-        self.status_var.set(f"Generated subtitles — language: {self._language}")
-        self.timeline_var.set("Live subtitle preview")
+        worker = threading.Thread(target=self._generate_subtitles_background, daemon=True)
+        worker.start()
 
     def save_as(self):
         if not self._generated_text:
@@ -385,6 +834,87 @@ class OfflineSubtitleGeneratorApp(ctk.CTk):
             content = export_as_txt(self._generated_text)
         target_path.write_text(content, encoding="utf-8")
         messagebox.showinfo("Saved", f"Generated subtitles saved to:\n{target_path}")
+        self._open_file(target_path)
+
+    def _open_file(self, file_path: Path) -> None:
+        try:
+            if os.name == "nt":
+                os.startfile(str(file_path))
+            else:
+                subprocess.run(["xdg-open", str(file_path)], check=False)
+        except Exception:
+            messagebox.showwarning("Open file", f"Could not open file automatically: {file_path}")
+
+    def _run_in_main_thread(self, func, *args, **kwargs):
+        self.after(0, lambda: func(*args, **kwargs))
+
+    def _set_controls_enabled(self, enabled: bool) -> None:
+        for widget in (self.browse_button, self.generate_button, self.save_button):
+            try:
+                widget.configure(state="normal" if enabled else "disabled")
+            except Exception:
+                pass
+
+    def _set_progress(self, value: float) -> None:
+        self.progress["value"] = max(0, min(100, value))
+        self.update_idletasks()
+
+    def _set_status(self, message: str) -> None:
+        self.status_var.set(message)
+
+    def _set_timeline(self, message: str) -> None:
+        self.timeline_var.set(message)
+
+    def _set_output_text(self, text: str) -> None:
+        self.output_box.delete("0.0", "end")
+        self.output_box.insert("0.0", text)
+        self.update_idletasks()
+
+    def _background_preview_update(self, content: str) -> None:
+        self._run_in_main_thread(self._set_output_text, content)
+
+    def _background_progress_update(self, percent: float | None, status_text: str | None = None) -> None:
+        if percent is not None:
+            self._run_in_main_thread(self._set_progress, percent)
+        if status_text is not None:
+            self._run_in_main_thread(self._set_status, status_text)
+
+    def _background_warning(self, title: str, message: str) -> None:
+        self._run_in_main_thread(self._show_warning, title, message)
+
+    def _on_transcription_finished(self, generated: str, language: str) -> None:
+        self._generated_text = generated
+        self._language = language or "unknown"
+        self._update_preview(generated)
+        self._set_progress(100)
+        self._set_status(f"Generated subtitles — language: {self._language}")
+        self._set_timeline("Live subtitle preview")
+        self._set_controls_enabled(True)
+
+    def _on_transcription_failed(self, exc: Exception) -> None:
+        messagebox.showerror("Transcription failed", f"Could not generate subtitles: {exc}")
+        self._set_progress(0)
+        self._set_status("Transcription failed")
+        self._set_controls_enabled(True)
+
+    def _generate_subtitles_background(self) -> None:
+        try:
+            audio_path = prepare_audio_path(self._media_path)
+            self._audio_path = audio_path
+            language_hint = _to_whisper_language(self.language_var.get())
+            live_save_file = Path(tempfile.gettempdir()) / f"{audio_path.stem}_live.srt"
+            generated, language = transcribe_audio(
+                audio_path,
+                language_hint=language_hint,
+                preview_callback=self._background_preview_update,
+                progress_callback=self._background_progress_update,
+                warning_callback=self._background_warning,
+                live_save_path=live_save_file,
+                odia_selected=self.language_var.get().strip().casefold() == "odia",
+            )
+            self._run_in_main_thread(self._on_transcription_finished, generated, language)
+        except Exception as exc:
+            self._run_in_main_thread(self._on_transcription_failed, exc)
 
     def _update_preview(self, content: str) -> None:
         self._preview_text = content
@@ -477,11 +1007,36 @@ def _count_words(text: str) -> int:
 
 
 def _to_whisper_language(value: str) -> str | None:
-    mapping = {"english": "en", "hindi": "hi", "odia": "or"}
+    mapping = {"english": "en", "hindi": "hi"}
     normalized = (value or "").strip().casefold()
     if not normalized or normalized == "auto detect":
         return None
+    # For Odia/Oriya prefer auto-detect rather than passing an explicit 'or' code
+    if normalized in {"odia", "oriya"}:
+        return None
     return mapping.get(normalized)
+
+
+def _is_unsupported_language_error(exc: Exception | None) -> bool:
+    if exc is None:
+        return False
+    message = str(exc).strip().casefold()
+    unsupported_markers = [
+        "unsupported language",
+        "language not supported",
+        "invalid language",
+        "unknown language",
+    ]
+    return any(marker in message for marker in unsupported_markers)
+
+
+def _build_language_hints(language_hint: str | None) -> list[str | None]:
+    hints: list[str | None] = []
+    if language_hint is not None:
+        hints.append(language_hint)
+    # Try auto-detect, then English as a last resort
+    hints.extend([None, "en"])
+    return hints
 
 
 TAG_PATTERN = re.compile(r"<(NOISE|MUSIC|LAUGH|APPLAUSE|SILENCE|BREATH)>.*?</\1>", re.IGNORECASE)
@@ -499,28 +1054,12 @@ NON_SPEECH_MARKERS = {
 
 
 def _is_filler_only(text: str) -> bool:
-    stripped = re.sub(r"\s+", " ", text).strip()
-    if not stripped:
-        return True
-    parts = re.split(r"\s+", stripped)
+    if not text:
+        return False
+    parts = re.findall(r"\w+", text, flags=re.UNICODE)
     if not parts:
-        return True
+        return False
     return all(_normalize_text(part) in FILLER_WORDS for part in parts)
-
-
-def _looks_like_non_speech(text: str, word_items: list[dict] | None = None) -> tuple[bool, str]:
-    normalized = re.sub(r"\s+", " ", text).strip().lower()
-    if not normalized:
-        return False, ""
-
-    for marker, candidate in NON_SPEECH_MARKERS.items():
-        if marker in normalized:
-            return True, candidate[1]
-
-    if word_items and len(word_items) <= 2 and any(_normalize_text(item["word"]) in FILLER_WORDS for item in word_items):
-        return True, f"<BREATH>{text.strip()}</BREATH>"
-
-    return False, ""
 
 
 def _flush_chunk(chunks: list[dict], current_chunk: list[dict]) -> None:
@@ -618,16 +1157,34 @@ def prepare_audio_path(media_path: Path) -> Path:
 
     suffix = media_path.suffix.lower()
     if suffix in {".mp3", ".wav", ".m4a", ".flac"}:
-        return media_path
-
-    if suffix in {".mp4", ".mkv", ".avi", ".mov"}:
-        ffmpeg_path = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+        # Prefer converting audio to a consistent 16k mono WAV for fastest, deterministic transcription.
+        ffmpeg_path = _find_ffmpeg_path()
         if not ffmpeg_path:
-            raise RuntimeError("ffmpeg was not found on PATH. Please install ffmpeg to extract audio from video files.")
+            return media_path
         temp_dir = Path(tempfile.gettempdir())
         output_path = temp_dir / f"{media_path.stem}_audio.wav"
+        try:
+            subprocess.run(
+                [ffmpeg_path, "-y", "-i", str(media_path), "-vn", "-ac", "1", "-ar", "16000", str(output_path)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return output_path
+        except Exception:
+            return media_path
+
+    if suffix in {".mp4", ".mkv", ".avi", ".mov", ".mpeg", ".mpg"}:
+        ffmpeg_path = _ensure_ffmpeg_path()
+        if not ffmpeg_path:
+            raise RuntimeError(
+                "ffmpeg was not found. Please install ffmpeg or set the FFMPEG_PATH environment variable."
+            )
+        temp_dir = Path(tempfile.gettempdir())
+        output_path = temp_dir / f"{media_path.stem}_audio.wav"
+        command = [ffmpeg_path, "-y", "-i", str(media_path), "-vn", "-ac", "1", "-ar", "16000", str(output_path)]
         subprocess.run(
-            [ffmpeg_path, "-y", "-i", str(media_path), "-vn", "-ac", "1", "-ar", "16000", str(output_path)],
+            command,
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -637,70 +1194,97 @@ def prepare_audio_path(media_path: Path) -> Path:
     raise ValueError("Unsupported media file type.")
 
 
-def transcribe_audio(audio_path: Path, language_hint: str | None = None, preview_callback=None) -> tuple[str, str]:
-    model_size = os.getenv("WHISPER_MODEL", "large-v3")
+def _call_transcription_api(audio_path: Path, language_hint: str | None = None, timeout_seconds: int = 180) -> tuple[str, str]:
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("Online transcription requires GEMINI_API_KEY or OPENAI_API_KEY.")
 
+    api_base = os.getenv("OPENAI_API_BASE") or os.getenv("GEMINI_API_URL") or "https://api.openai.com"
+    if api_base.endswith("/v1"):
+        api_base = api_base[: -len("/v1")]
+    endpoint = os.getenv("TRANSCRIPTION_URL") or f"{api_base.rstrip('/')}/v1/audio/transcriptions"
+    model = os.getenv("TRANSCRIPTION_MODEL", "whisper-1")
+
+    fields = {
+        "model": model,
+        "response_format": "srt",
+        "temperature": "0.0",
+    }
+    if language_hint is not None:
+        fields["language"] = language_hint
+
+    audio_bytes = audio_path.read_bytes()
+    mime_type = mimetypes.guess_type(audio_path.name)[0] or "application/octet-stream"
+    body, content_type = _encode_multipart_formdata(fields, [("file", audio_path.name, mime_type, audio_bytes)])
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": content_type,
+        "User-Agent": "SubtitleTranscriber/1.0",
+    }
+    request = urllib.request.Request(endpoint, data=body, headers=headers, method="POST")
     try:
-        from faster_whisper import WhisperModel
-
-        model = WhisperModel(model_size, device="cpu", compute_type="int8")
-        segments, info = model.transcribe(str(audio_path), word_timestamps=True, beam_size=5, vad_filter=True, language=language_hint)
-        language = getattr(info, "language", None) or "unknown"
-        subtitles = []
-        all_words = []
-        for segment in segments:
-            for word in getattr(segment, "words", []) or []:
-                word_text = getattr(word, "word", "") or ""
-                if not word_text.strip():
-                    continue
-                all_words.append({
-                    "word": word_text.strip(),
-                    "start": int(getattr(word, "start", 0) * 1000),
-                    "end": int(getattr(word, "end", 0) * 1000),
-                })
-
-        for chunk in build_subtitle_segments(all_words, max_words=3, pause_threshold_ms=800):
-            text = (chunk.get("text") or "").strip()
-            if not text:
-                continue
-            subtitles.append({"text": text, "start": int(chunk["start"]), "end": int(chunk["end"])})
-            if preview_callback is not None:
-                preview_callback(format_subtitles(subtitles, language))
-
-        return format_subtitles(subtitles, language), language
-    except Exception:
-        pass
-
-    try:
-        import whisper
-
-        model = whisper.load_model(model_size)
-        result = model.transcribe(str(audio_path), word_timestamps=True, fp16=False, language=language_hint)
-        language = result.get("language", "unknown")
-        subtitles = []
-        all_words = []
-        for segment in result.get("segments", []):
-            for word in segment.get("words", []) or []:
-                word_text = word.get("word", "") or ""
-                if not word_text.strip():
-                    continue
-                all_words.append({
-                    "word": word_text.strip(),
-                    "start": int(word.get("start", 0) * 1000),
-                    "end": int(word.get("end", 0) * 1000),
-                })
-
-        for chunk in build_subtitle_segments(all_words, max_words=3, pause_threshold_ms=800):
-            text = (chunk.get("text") or "").strip()
-            if not text:
-                continue
-            subtitles.append({"text": text, "start": int(chunk["start"]), "end": int(chunk["end"])})
-            if preview_callback is not None:
-                preview_callback(format_subtitles(subtitles, language))
-
-        return format_subtitles(subtitles, language), language
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            response_body = response.read()
+            decoded = response_body.decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"Transcription API HTTP error: {exc.code} {exc.reason} - {body}") from exc
     except Exception as exc:
-        raise RuntimeError(f"Whisper transcription failed: {exc}") from exc
+        raise RuntimeError(f"Transcription API request failed: {exc}") from exc
+
+    if decoded.lstrip().startswith("{"):
+        try:
+            parsed = json.loads(decoded)
+            if isinstance(parsed, dict) and parsed.get("error"):
+                raise RuntimeError(f"Transcription API error: {parsed['error']}")
+        except json.JSONDecodeError:
+            pass
+
+    return decoded, language_hint or "unknown"
+
+
+def transcribe_audio(
+    audio_path: Path,
+    language_hint: str | None = None,
+    preview_callback=None,
+    progress_callback=None,
+    warning_callback=None,
+    live_save_path: Path | None = None,
+    odia_selected: bool = False,
+) -> tuple[str, str]:
+    _ensure_ffmpeg_path()
+    if progress_callback is not None:
+        progress_callback(5, "Preparing audio for transcription...")
+
+    srt_text, detected_language = _call_transcription_api(audio_path, language_hint=_sanitize_language_code(language_hint))
+
+    if preview_callback is not None:
+        preview_callback(srt_text)
+    if progress_callback is not None:
+        progress_callback(80, "Transcription complete, applying text correction...")
+
+    preferred_language = None
+    if odia_selected:
+        preferred_language = "odia"
+    elif language_hint:
+        preferred_language = language_hint
+
+    try:
+        corrected = _correct_subtitles_with_gemini(srt_text, preferred_language=preferred_language)
+        if corrected and corrected.strip():
+            srt_text = corrected
+            logger.info("Subtitle text corrected by Gemini.")
+        else:
+            logger.warning("Gemini correction returned no text; keeping original transcription.")
+    except Exception as exc:
+        logger.error("Subtitle correction failed: %s", exc, exc_info=True)
+        logger.info("Proceeding with transcription output.")
+
+    if progress_callback is not None:
+        progress_callback(100, "Subtitle generation complete.")
+
+    return srt_text, detected_language
 
 
 def format_subtitles(subtitles: list[dict], language: str) -> str:
