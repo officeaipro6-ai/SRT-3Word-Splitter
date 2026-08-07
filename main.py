@@ -6,8 +6,6 @@ import subprocess
 import tempfile
 import threading
 import logging
-import mimetypes
-import uuid
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -343,58 +341,88 @@ def _parse_srt_blocks(srt_text: str) -> list[dict]:
 def _build_gemini_prompt_for_subtitles(blocks: list[dict], preferred_language: str | None = None) -> str:
     subtitles_json = [block["text"] for block in blocks]
     prompt_lines = [
-        "You are correcting subtitle text.",
-        "Return a JSON array of strings only, where each item is the corrected subtitle text for the corresponding subtitle block in the input order.",
-        "Do not return timestamps, numbering, or any extra explanation.",
-        "Preserve subtitle block order exactly.",
-        "Remove any hallucinated English sentences if the audio is not in English.",
+        "You are correcting machine-transcribed subtitle text.",
+        "",
+        "Output format:",
+        "- Return a JSON array of strings only.",
+        "- Each array item is the corrected text for the corresponding subtitle block in the input order.",
+        "- The array must contain exactly the same number of items as the input.",
+        "",
+        "Strict rules:",
+        "- Do NOT return timestamps, subtitle numbers, speaker labels, markdown, or any explanation.",
+        "- The original SRT timestamps are preserved separately by the application; you must correct text only.",
+        "- Preserve speaker order exactly — do not reorder, merge, split, or drop subtitle blocks.",
+        "- Do not translate personal names, place names, or other proper nouns; keep them as spoken.",
     ]
     if preferred_language:
         preferred_language = preferred_language.strip().casefold()
         if preferred_language in {"odia", "oriya", "or"}:
             prompt_lines.extend([
-                "The subtitles should be returned in proper Odia Unicode (ଓଡ଼ିଆ), not Roman Odia.",
-                "Use Odia script for all corrected text.",
+                "",
+                "Odia correction requirements:",
+                "- Output only valid Odia Unicode in the Odia script (ଓଡ଼ିଆ). Do not use Roman transliteration.",
+                "- Remove hallucinated English words, phrases, and sentences that do not belong in Odia speech.",
+                "- Fix transcription errors while keeping natural, spoken Odia.",
+                "- Preserve the original speaker order block by block.",
+                "- Do not translate names; keep proper nouns unchanged.",
             ])
         elif preferred_language in {"hindi", "hi"}:
             prompt_lines.extend([
-                "The subtitles should be returned in proper Hindi Devanagari script.",
-                "Use Hindi script for all corrected text.",
+                "",
+                "Hindi correction requirements:",
+                "- Output only valid Hindi in Devanagari script.",
+                "- Remove hallucinated English words and phrases that do not belong.",
             ])
         elif preferred_language in {"english", "en"}:
             prompt_lines.extend([
-                "The subtitles should be returned in proper English.",
+                "",
+                "English correction requirements:",
+                "- Output only proper English.",
+                "- Remove clearly hallucinated or nonsensical text.",
             ])
         else:
             prompt_lines.extend([
+                "",
                 "Detect whether the text is Odia, Hindi, or English, and return it in the appropriate script.",
+                "- Remove hallucinated English words when the speech is not in English.",
             ])
     else:
         prompt_lines.extend([
+            "",
             "The audio may be Odia, Hindi, or English; detect the correct language and return the text in the appropriate script.",
+            "- If the speech is Odia, output only valid Odia Unicode and remove hallucinated English.",
+            "- Preserve speaker order and do not translate names.",
         ])
-    prompt_lines.append("Input subtitles:")
-    prompt_lines.append(json.dumps(subtitles_json, ensure_ascii=False, indent=2))
+    prompt_lines.extend([
+        "",
+        "Input subtitles:",
+        json.dumps(subtitles_json, ensure_ascii=False, indent=2),
+    ])
     return "\n".join(prompt_lines)
 
 
 def _call_gemini_api(prompt: str, timeout_seconds: int = 30) -> str:
-    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("OPENAI_API_KEY")
-    api_url = os.getenv("GEMINI_API_URL") or os.getenv("OPENAI_API_BASE") or "https://api.openai.com/v1/chat/completions"
+    api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        raise RuntimeError("Gemini API key not configured. Set GEMINI_API_KEY or OPENAI_API_KEY.")
+        raise RuntimeError("Gemini API key not configured. Set GEMINI_API_KEY.")
+
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    api_url = os.getenv("GEMINI_API_URL") or (
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    )
 
     headers = {
-        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
+        "x-goog-api-key": api_key,
     }
     payload = {
-        "model": os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
-        "messages": [
-            {"role": "user", "content": prompt}
+        "contents": [
+            {"parts": [{"text": prompt}]}
         ],
-        "temperature": 0.0,
-        "max_tokens": int(os.getenv("GEMINI_MAX_TOKENS", "2000")),
+        "generationConfig": {
+            "temperature": 0.0,
+            "maxOutputTokens": int(os.getenv("GEMINI_MAX_TOKENS", "2000")),
+        },
     }
 
     request_data = json.dumps(payload).encode("utf-8")
@@ -413,63 +441,37 @@ def _call_gemini_api(prompt: str, timeout_seconds: int = 30) -> str:
     except Exception as exc:
         raise RuntimeError(f"Could not parse Gemini response as JSON: {exc} - response: {body[:1000]}") from exc
 
-    # Support OpenAI-style responses
+    if isinstance(response_json, dict) and response_json.get("error"):
+        raise RuntimeError(f"Gemini API error: {response_json['error']}")
+
     content = None
-    if isinstance(response_json, dict):
-        if "choices" in response_json and response_json["choices"]:
-            message = response_json["choices"][0].get("message")
-            if isinstance(message, dict):
-                content = message.get("content")
-            elif isinstance(response_json["choices"][0].get("text"), str):
-                content = response_json["choices"][0].get("text")
-        elif "output" in response_json:
-            outputs = response_json.get("output")
-            if isinstance(outputs, list) and outputs:
-                first = outputs[0]
-                if isinstance(first, dict) and "content" in first:
-                    content = first["content"]
+    candidates = response_json.get("candidates") if isinstance(response_json, dict) else None
+    if isinstance(candidates, list) and candidates:
+        parts = candidates[0].get("content", {}).get("parts", [])
+        if isinstance(parts, list) and parts:
+            text_parts = [part.get("text", "") for part in parts if isinstance(part, dict) and part.get("text")]
+            if text_parts:
+                content = "".join(text_parts)
+
     if content is None:
         raise RuntimeError(f"Gemini API returned an unexpected response structure: {json.dumps(response_json)[:1000]}")
-    if isinstance(content, dict):
-        if "text" in content:
-            content = content["text"]
-        else:
-            content = json.dumps(content, ensure_ascii=False)
     return str(content)
 
 
-def _encode_multipart_formdata(fields: dict[str, str], files: list[tuple[str, str, str, bytes]]) -> tuple[bytes, str]:
-    boundary = uuid.uuid4().hex
-    body_lines: list[bytes] = []
-    encoder = lambda value: value.encode("utf-8") if isinstance(value, str) else value
-
-    for name, value in fields.items():
-        body_lines.append(encoder(f"--{boundary}\r\n"))
-        body_lines.append(encoder(f"Content-Disposition: form-data; name=\"{name}\"\r\n\r\n"))
-        body_lines.append(encoder(f"{value}\r\n"))
-
-    for field_name, filename, content_type, file_data in files:
-        body_lines.append(encoder(f"--{boundary}\r\n"))
-        body_lines.append(encoder(f"Content-Disposition: form-data; name=\"{field_name}\"; filename=\"{filename}\"\r\n"))
-        body_lines.append(encoder(f"Content-Type: {content_type}\r\n\r\n"))
-        body_lines.append(file_data)
-        body_lines.append(encoder("\r\n"))
-
-    body_lines.append(encoder(f"--{boundary}--\r\n"))
-    return b"".join(body_lines), f"multipart/form-data; boundary={boundary}"
-
-
 def _parse_gemini_subtitle_array(response_text: str, expected_count: int) -> list[str]:
+    text = (response_text or "").strip()
+    fence_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL | re.IGNORECASE)
+    if fence_match:
+        text = fence_match.group(1).strip()
+
     try:
-        parsed = json.loads(response_text)
+        parsed = json.loads(text)
         if isinstance(parsed, list):
             return [str(item).strip() for item in parsed][:expected_count]
     except Exception:
         pass
 
-    lines = [line.strip() for line in response_text.strip().splitlines() if line.strip()]
-    if len(lines) == expected_count and all(not line.startswith("[") for line in lines):
-        return lines
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
 
     # Attempt to extract numbered list items if present.
     results = []
@@ -487,6 +489,9 @@ def _parse_gemini_subtitle_array(response_text: str, expected_count: int) -> lis
     if len(results) == expected_count:
         return results
 
+    if len(lines) == expected_count and all(not line.startswith("[") for line in lines):
+        return lines
+
     raise RuntimeError("Could not parse Gemini subtitle correction output into a subtitle array.")
 
 
@@ -499,9 +504,15 @@ def _correct_subtitles_with_gemini(srt_text: str, preferred_language: str | None
     response_text = _call_gemini_api(prompt)
     logger.info("Received response from Gemini: %s", response_text[:1000])
     corrected_texts = _parse_gemini_subtitle_array(response_text, len(blocks))
+    if len(corrected_texts) != len(blocks):
+        logger.warning(
+            "Gemini returned %s subtitle(s) but expected %s; keeping original text for missing blocks.",
+            len(corrected_texts),
+            len(blocks),
+        )
     corrected_subtitles = []
-    for block, corrected in zip(blocks, corrected_texts):
-        corrected = corrected.strip()
+    for index, block in enumerate(blocks):
+        corrected = corrected_texts[index].strip() if index < len(corrected_texts) else block["text"]
         if not corrected:
             corrected = block["text"]
         corrected_subtitles.append(f"{block['index']}\n{block['timestamps']}\n{corrected}\n")
@@ -1194,54 +1205,86 @@ def prepare_audio_path(media_path: Path) -> Path:
     raise ValueError("Unsupported media file type.")
 
 
-def _call_transcription_api(audio_path: Path, language_hint: str | None = None, timeout_seconds: int = 180) -> tuple[str, str]:
-    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("Online transcription requires GEMINI_API_KEY or OPENAI_API_KEY.")
+def _get_faster_whisper_model(model_size: str, cpu_threads: int, num_workers: int):
+    from faster_whisper import WhisperModel
 
-    api_base = os.getenv("OPENAI_API_BASE") or os.getenv("GEMINI_API_URL") or "https://api.openai.com"
-    if api_base.endswith("/v1"):
-        api_base = api_base[: -len("/v1")]
-    endpoint = os.getenv("TRANSCRIPTION_URL") or f"{api_base.rstrip('/')}/v1/audio/transcriptions"
-    model = os.getenv("TRANSCRIPTION_MODEL", "whisper-1")
+    device = os.getenv("WHISPER_DEVICE", "cpu")
+    compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "int8" if device == "cpu" else "float16")
+    return WhisperModel(
+        model_size,
+        device=device,
+        compute_type=compute_type,
+        cpu_threads=cpu_threads,
+        num_workers=num_workers,
+    )
 
-    fields = {
-        "model": model,
-        "response_format": "srt",
-        "temperature": "0.0",
-    }
-    if language_hint is not None:
-        fields["language"] = language_hint
 
-    audio_bytes = audio_path.read_bytes()
-    mime_type = mimetypes.guess_type(audio_path.name)[0] or "application/octet-stream"
-    body, content_type = _encode_multipart_formdata(fields, [("file", audio_path.name, mime_type, audio_bytes)])
+def _transcribe_with_faster_whisper(
+    audio_path: Path,
+    language_hint: str | None = None,
+    odia_selected: bool = False,
+) -> tuple[list[dict], str]:
+    cpu_threads = int(os.getenv("WHISPER_CPU_THREADS", os.cpu_count() or 4))
+    num_workers = int(os.getenv("WHISPER_NUM_WORKERS", 1))
+    model_size = os.getenv("WHISPER_MODEL", "base")
+    model = _get_faster_whisper_model(model_size, cpu_threads, num_workers)
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": content_type,
-        "User-Agent": "SubtitleTranscriber/1.0",
-    }
-    request = urllib.request.Request(endpoint, data=body, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            response_body = response.read()
-            decoded = response_body.decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"Transcription API HTTP error: {exc.code} {exc.reason} - {body}") from exc
-    except Exception as exc:
-        raise RuntimeError(f"Transcription API request failed: {exc}") from exc
+    detected_language = "unknown"
+    segments = []
+    last_error: Exception | None = None
 
-    if decoded.lstrip().startswith("{"):
+    for hint in _build_language_hints(_sanitize_language_code(language_hint)):
         try:
-            parsed = json.loads(decoded)
-            if isinstance(parsed, dict) and parsed.get("error"):
-                raise RuntimeError(f"Transcription API error: {parsed['error']}")
-        except json.JSONDecodeError:
-            pass
+            raw_segments, info = model.transcribe(
+                str(audio_path),
+                word_timestamps=True,
+                language=hint,
+                vad_filter=True,
+            )
+            segments = list(raw_segments)
+            detected_language = getattr(info, "language", None) or hint or "unknown"
+            if segments and not _is_model_output_junk(segments):
+                break
+            if not segments:
+                continue
+        except Exception as exc:
+            last_error = exc
+            if _is_unsupported_language_error(exc):
+                continue
+            raise
 
-    return decoded, language_hint or "unknown"
+    if not segments:
+        if last_error is not None:
+            raise last_error
+        return [], detected_language
+
+    words: list[dict] = []
+    for segment in segments:
+        for word in getattr(segment, "words", None) or []:
+            word_text = (getattr(word, "word", "") or "").strip()
+            if not word_text:
+                continue
+            word_text = _cleanup_transcript_text(word_text, odia_selected=odia_selected)
+            if not word_text:
+                continue
+            words.append({
+                "word": word_text,
+                "start": int(getattr(word, "start", 0) * 1000),
+                "end": int(getattr(word, "end", 0) * 1000),
+            })
+
+    if not words:
+        return [], detected_language
+
+    subtitle_chunks = build_subtitle_segments(words, max_words=3)
+    if not subtitle_chunks:
+        subtitle_chunks = _build_fallback_subtitles(words)
+
+    subtitles = [
+        {"text": chunk["text"], "start": chunk["start"], "end": chunk["end"]}
+        for chunk in subtitle_chunks
+    ]
+    return subtitles, detected_language
 
 
 def transcribe_audio(
@@ -1257,7 +1300,22 @@ def transcribe_audio(
     if progress_callback is not None:
         progress_callback(5, "Preparing audio for transcription...")
 
-    srt_text, detected_language = _call_transcription_api(audio_path, language_hint=_sanitize_language_code(language_hint))
+    model_size = os.getenv("WHISPER_MODEL", "base")
+    if progress_callback is not None:
+        progress_callback(10, f"Loading Whisper model ({model_size})...")
+
+    subtitles, detected_language = _transcribe_with_faster_whisper(
+        audio_path,
+        language_hint=language_hint,
+        odia_selected=odia_selected,
+    )
+
+    if not subtitles:
+        if progress_callback is not None:
+            progress_callback(100, "No speech detected.")
+        return "", detected_language
+
+    srt_text = format_subtitles(subtitles, detected_language)
 
     if preview_callback is not None:
         preview_callback(srt_text)
@@ -1280,6 +1338,16 @@ def transcribe_audio(
     except Exception as exc:
         logger.error("Subtitle correction failed: %s", exc, exc_info=True)
         logger.info("Proceeding with transcription output.")
+
+    if live_save_path is not None:
+        try:
+            live_save_path.write_text(srt_text, encoding="utf-8")
+            logger.info("Saved final corrected subtitles to %s", live_save_path)
+        except Exception as exc:
+            logger.warning("Could not save final subtitles: %s", exc)
+
+    if preview_callback is not None:
+        preview_callback(srt_text)
 
     if progress_callback is not None:
         progress_callback(100, "Subtitle generation complete.")
