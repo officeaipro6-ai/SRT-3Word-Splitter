@@ -1,0 +1,6 @@
+{
+  "name": "ODIA AUDIO/VIDEO → TAGGED SRT",
+  "description": "Production pipeline to detect spoken language, transcribe Odia speech in native script with millisecond timestamps, analyze acoustic background layers, and generate rule-compliant tagged SRT subtitles.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
