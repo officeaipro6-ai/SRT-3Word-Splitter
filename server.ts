@@ -11,6 +11,14 @@ import {
   isSarvamConfigured,
   getActiveProvider,
 } from './server/sarvamTranscriber';
+import {
+  transcribeRawOdiaWithOlive,
+  isOliveConfigured,
+} from './server/oliveTranscriber';
+import {
+  computeSpeechRegions,
+  alignSegmentsToSpeechRegions,
+} from './server/voiceTiming';
 import { SubtitleSegment } from './src/types';
 import {
   formatSrtTimestamp,
@@ -349,6 +357,7 @@ async function startServer() {
       service: 'ODIA AUDIO/VIDEO → TAGGED SRT Engine',
       activeProvider: getActiveProvider(),
       hasSarvamApiKey: isSarvamConfigured(),
+      hasOlive: isOliveConfigured(),
       hasApiKey,
       hasFallback,
       timestamp: new Date().toISOString(),
@@ -396,6 +405,8 @@ async function startServer() {
       //   - Sarvam (default): designed for Indian languages; forces Odia od-IN,
       //     model saaras:v4, mode verbatim.
       //   - Groq (fallback): kept available for testing via TRANSCRIPTION_PROVIDER=groq.
+      //   - Olive (opt-in): OdiaGenAI Whisper Odia fine-tune via
+      //     TRANSCRIPTION_PROVIDER=olive + OLIVE_API_URL. Never default.
       const provider = getActiveProvider();
 
       // RAW transcription of the EXACT uploaded audio. We do NOT use any
@@ -404,6 +415,9 @@ async function startServer() {
       const rawText = await (async () => {
         if (provider === 'sarvam') {
           const r = await transcribeRawOdiaWithSarvam(audioBuffer, mimeType);
+          return { text: r.transcript, duration: r.durationSeconds, meta: r };
+        } else if (provider === 'olive') {
+          const r = await transcribeRawOdiaWithOlive(audioBuffer, mimeType);
           return { text: r.transcript, duration: r.durationSeconds, meta: r };
         } else {
           const r = await transcribeRawOdiaWithWhisper(audioBuffer, mimeType);
@@ -452,6 +466,29 @@ async function startServer() {
       );
       segments = taggedSegments;
 
+      // VOICE-ALIGNED TIMING: snap spoken-word cue boundaries to the actual
+      // voice regions detected on the exact uploaded audio (Start = first
+      // overlapping speech region's start, End = last overlapping speech
+      // region's end), so subtitles appear ONLY over real speech - never over
+      // leading/trailing silence or BGM - while staying clamped between the
+      // neighboring cues (no overlaps, no invented timing). Text and tags are
+      // never modified; non-speech cues are untouched.
+      const voiceRegions = await computeSpeechRegions(audioBuffer, mimeType || 'audio/wav');
+      const beforeAligned = segments;
+      segments = alignSegmentsToSpeechRegions(segments, voiceRegions);
+      const alignedCount = segments.reduce(
+        (acc, s, idx) => {
+          const prev = beforeAligned[idx];
+          if (prev && (prev.startSeconds !== s.startSeconds || prev.endSeconds !== s.endSeconds)) acc++;
+          return acc;
+        },
+        0
+      );
+      console.log(
+        `[VOICE TIMING] speechRegions=${voiceRegions.filter((r) => r.type === 'speech').length}, ` +
+          `cuesRealigned=${alignedCount}`
+      );
+
       // Verification: raw word count must equal final subtitle word count.
       const rawWordCount = rawTranscript.split(/\s+/).filter(Boolean).length;
       const finalWordCount = segments.reduce((sum, s) => sum + (s.text.split(/\s+/).filter(Boolean).length), 0);
@@ -483,10 +520,21 @@ async function startServer() {
       // key is never logged or returned.
       const audioDiagnostics: Record<string, unknown> = {
         provider,
-        providerDisplay: provider === 'sarvam' ? 'Sarvam' : 'Groq (fallback)',
-        model: provider === 'sarvam' ? 'saaras:v4' : 'whisper-large-v3-turbo',
-        language: 'od-IN',
-        mode: provider === 'sarvam' ? 'verbatim' : 'n/a',
+        providerDisplay:
+          provider === 'sarvam'
+            ? 'Sarvam'
+            : provider === 'olive'
+              ? 'Olive (OdiaGenAI Whisper)'
+              : 'Groq (fallback)',
+        model:
+          provider === 'sarvam'
+            ? 'saaras:v4'
+            : provider === 'olive'
+              ? 'whisper-odia-small-finetune-int8-ct2'
+              : 'whisper-large-v3-turbo',
+        language: provider === 'olive' ? 'or' : 'od-IN',
+        mode:
+          provider === 'sarvam' ? 'verbatim' : provider === 'olive' ? 'transcribe' : 'n/a',
         fileName,
         mimeType,
         fileSizeBytes,
@@ -505,6 +553,10 @@ async function startServer() {
         const m = rawText.meta as any;
         audioDiagnostics.languageCode = m.languageCode || 'od-IN';
         audioDiagnostics.chunkCount = (m.chunks || []).length;
+      } else if (provider === 'olive') {
+        const o = rawText.meta as any;
+        audioDiagnostics.languageCode = o.languageCode || 'or';
+        audioDiagnostics.chunkCount = (o.chunks || []).length;
       } else {
         const g = rawText.meta as any;
         audioDiagnostics.languageSentToWhisper = g.forcedLanguage || 'hi';
@@ -524,7 +576,9 @@ async function startServer() {
         notes: [
           provider === 'sarvam'
             ? 'Sarvam Saaras (saaras:v4, od-IN, verbatim) transcription of the exact uploaded audio. Subtitles split to max 3 words each and classified against the actual audio (NOISE/SILENCE/MB) so the exported SRT contains real tags. No spelling correction, no canonical/old SRT fallback.'
-            : 'Groq raw transcription (fallback provider). Subtitles split to max 3 words each and classified against the actual audio. No spelling correction, no canonical/old SRT fallback.',
+            : provider === 'olive'
+              ? 'Olive OdiaGenAI Whisper (language=or) transcription of the exact uploaded audio. Subtitles split to max 3 words each and classified against the actual audio (NOISE/SILENCE/MB) so the exported SRT contains real tags. No spelling correction, no canonical/old SRT fallback.'
+              : 'Groq raw transcription (fallback provider). Subtitles split to max 3 words each and classified against the actual audio. No spelling correction, no canonical/old SRT fallback.',
         ],
         audioDiagnostics,
       });

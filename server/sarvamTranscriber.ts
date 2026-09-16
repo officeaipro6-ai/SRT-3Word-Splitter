@@ -63,11 +63,13 @@ export function isSarvamConfigured(): boolean {
 
 /**
  * Resolve the active transcription provider from the environment.
- * Default is Sarvam; Groq is kept available as an explicit testing fallback.
+ * Default is Sarvam (unchanged); Groq stays available as a testing fallback;
+ * Olive is an additional OPT-IN provider, never selected implicitly.
  */
-export function getActiveProvider(): 'sarvam' | 'groq' {
+export function getActiveProvider(): 'sarvam' | 'groq' | 'olive' {
   const p = (process.env.TRANSCRIPTION_PROVIDER || 'sarvam').trim().toLowerCase();
   if (p === 'groq') return 'groq';
+  if (p === 'olive') return 'olive';
   return 'sarvam';
 }
 
