@@ -22,7 +22,7 @@ export const RulesGuideModal: React.FC<RulesGuideModalProps> = ({ isOpen, onClos
               </span>
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
-              Strict execution order: Language Detection → Odia Transcription → Acoustic Analysis → Tagging
+              Strict execution order: Language Selection → Speech Transcription → Acoustic Analysis → Tagging
             </p>
           </div>
           <button
@@ -50,7 +50,7 @@ export const RulesGuideModal: React.FC<RulesGuideModalProps> = ({ isOpen, onClos
               Each subtitle segment must contain <strong>MAXIMUM 3 words</strong>. If a sentence contains more than 3 words, it is <strong>automatically split into multiple consecutive subtitle segments</strong> with proportional continuous timestamps.
             </p>
             <ul className="text-xs list-disc list-inside space-y-1 text-indigo-900">
-              <li>Original Odia Unicode text is preserved exactly (no rewriting, translation, or omissions).</li>
+              <li>Original Unicode text is preserved exactly (no rewriting, translation, or omissions).</li>
               <li>Words are never split across segments.</li>
               <li>Timestamps are recalculated proportionally and remain continuous.</li>
               <li><code>&lt;NOISE&gt;</code>, <code>&lt;FILLER&gt;</code>, and <code>&lt;SILENCE&gt;</code> tags remain intact on all split segments. (Tags do not count toward the 3-word limit).</li>
@@ -203,7 +203,7 @@ export const RulesGuideModal: React.FC<RulesGuideModalProps> = ({ isOpen, onClos
               Key Pipeline Guarantees
             </div>
             <p>• <strong>Never lose speech</strong>: Speech is never replaced with empty tags.</p>
-            <p>• <strong>Strict Odia Unicode</strong>: Odia words stay in native script (ଓଡ଼ିଆ), never Latin transliteration.</p>
+            <p>• <strong>Strict Unicode preservation</strong>: words stay in their native script (ଓଡ଼ିଆ, हिन्दी, English), never transliterated.</p>
             <p>• <strong>Normal sequential SRT numbering</strong> (1, 2, 3...) with standard timestamps.</p>
           </div>
         </div>

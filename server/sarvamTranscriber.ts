@@ -107,17 +107,34 @@ async function throwOnBad(res: Response, what: string): Promise<any> {
 }
 
 /**
+ * Sarvam Saaras supported BCP-47 language codes (existing provider codes).
+ * Auto-detect is NOT a Sarvam batch option, so the caller resolves the code.
+ */
+export const SARVAM_LANGUAGE_CODES: Record<string, string> = {
+  odia: 'od-IN',
+  hindi: 'hi-IN',
+  english: 'en-IN',
+};
+
+/** Human display names for the supported language codes. */
+export const SARVAM_LANGUAGE_NAMES: Record<string, string> = {
+  'od-IN': 'Odia (ଓଡ଼ିଆ)',
+  'hi-IN': 'Hindi (हिन्दी)',
+  'en-IN': 'English',
+};
+
+/**
  * Step 1: initialise a batch job.
  * Returns the job_id.
  */
-async function initBatchJob(): Promise<string> {
+async function initBatchJob(languageCode: string): Promise<string> {
   const res = await fetch(`${BATCH_API_BASE}`, {
     method: 'POST',
     headers: { ...authHeaders(), 'Content-Type': 'application/json' },
     body: JSON.stringify({
       job_parameters: {
         model: 'saaras:v4',
-        language_code: 'od-IN',
+        language_code: languageCode,
         mode: 'verbatim',
         with_timestamps: true,
       },
@@ -266,7 +283,7 @@ async function downloadTranscript(jobId: string, outputFileNames: string[]): Pro
   return {
     transcript,
     languageCode,
-    detectedLanguage: languageCode === 'od-IN' ? 'Odia (ଓଡ଼ିଆ)' : languageCode,
+    detectedLanguage: SARVAM_LANGUAGE_NAMES[languageCode] || languageCode,
     durationSeconds,
     chunks,
   };
@@ -279,12 +296,12 @@ async function downloadTranscript(jobId: string, outputFileNames: string[]): Pro
  *
  * @param audioBuffer  The EXACT bytes uploaded by the browser.
  * @param mimeType     MIME type of the audio.
- * @param opts         Optional settings (e.g. job timeout).
+ * @param opts         Optional settings (e.g. job timeout, language code).
  */
 export async function transcribeRawOdiaWithSarvam(
   audioBuffer: Buffer,
   mimeType: string = 'audio/wav',
-  opts: { jobTimeoutMs?: number } = {}
+  opts: { jobTimeoutMs?: number; languageCode?: string } = {}
 ): Promise<SarvamRawResult> {
   if (!isSarvamConfigured()) {
     throw new Error(
@@ -293,12 +310,17 @@ export async function transcribeRawOdiaWithSarvam(
   }
 
   const timeoutMs = opts.jobTimeoutMs && opts.jobTimeoutMs > 0 ? opts.jobTimeoutMs : 180000;
+  const languageCode = opts.languageCode
+    ? (Object.values(SARVAM_LANGUAGE_CODES).includes(opts.languageCode)
+        ? opts.languageCode
+        : 'od-IN')
+    : 'od-IN';
   const ext = detectExt(mimeType);
   const fileName = `odia_upload.${ext}`;
   const fileBytes = new Uint8Array(audioBuffer);
 
-  console.log(`[SARVAM BATCH] init job (model=saaras:v4, language_code=od-IN, mode=verbatim)...`);
-  const jobId = await initBatchJob();
+  console.log(`[SARVAM BATCH] init job (model=saaras:v4, language_code=${languageCode}, mode=verbatim)...`);
+  const jobId = await initBatchJob(languageCode);
 
   console.log(`[SARVAM BATCH] ${jobId} uploading ${audioBuffer.length} bytes...`);
   await uploadAudio(jobId, fileBytes, fileName, mimeType);

@@ -66,6 +66,9 @@ export interface AudioDiagnostics {
   providerDisplay?: string;
   model?: string;
   language?: string;
+  languageCode?: string;
+  languageName?: string;
+  requestedLanguage?: SupportedLanguage;
   mode?: string;
   fileName: string;
   mimeType: string;
@@ -73,7 +76,6 @@ export interface AudioDiagnostics {
   durationSeconds: number;
   sha256: string;
   rawTranscript?: string;
-  languageCode?: string;
   chunkCount?: number;
   wordCount?: number;
   languageSentToWhisper?: string;
@@ -83,8 +85,14 @@ export interface AudioDiagnostics {
   maxWordsPerSegment?: number;
 }
 
+export type SupportedLanguage = 'auto' | 'odia' | 'hindi' | 'english';
+
 export interface TranscriptionResult {
   detectedLanguage: string;
+  languageCode: string;
+  languageName: string;
+  requestedLanguage: SupportedLanguage;
+  isLanguageDetected: boolean;
   isOdia: boolean;
   languageConfidence: number;
   durationSeconds: number;

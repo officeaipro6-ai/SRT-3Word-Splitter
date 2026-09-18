@@ -168,6 +168,10 @@ export function loadCanonicalTranscriptionResult(): TranscriptionResult {
   const correctedRawSrt = buildCorrectedSrt(segments);
   return {
     detectedLanguage: 'Odia (ଓଡ଼ିଆ)',
+    languageCode: 'od-IN',
+    languageName: 'Odia (ଓଡ଼ିଆ)',
+    requestedLanguage: 'odia',
+    isLanguageDetected: false,
     isOdia: true,
     languageConfidence: 1.0,
     durationSeconds: lastEnd,

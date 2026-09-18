@@ -1,5 +1,5 @@
 import React from 'react';
-import { Volume2, BookOpen, RotateCcw, Sparkles, CheckCircle2, ShieldCheck } from 'lucide-react';
+import { Volume2, BookOpen, RotateCcw, Sparkles, CheckCircle2, ShieldCheck, Languages } from 'lucide-react';
 
 interface HeaderProps {
   onOpenRules: () => void;
@@ -7,6 +7,10 @@ interface HeaderProps {
   hasData: boolean;
   detectedLanguage?: string;
   isOdia?: boolean;
+  reportedLanguageName?: string;
+  reportedLanguageCode?: string;
+  requestedLanguage?: 'auto' | 'odia' | 'hindi' | 'english';
+  isLanguageDetected?: boolean;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -15,7 +19,12 @@ export const Header: React.FC<HeaderProps> = ({
   hasData,
   detectedLanguage,
   isOdia,
+  reportedLanguageName,
+  reportedLanguageCode,
+  requestedLanguage,
+  isLanguageDetected,
 }) => {
+  const displayLanguage = reportedLanguageName || detectedLanguage;
   return (
     <header className="border-b border-slate-200 bg-white/95 backdrop-blur-sm sticky top-0 z-40">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3.5 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
@@ -30,7 +39,7 @@ export const Header: React.FC<HeaderProps> = ({
                 ODIA AUDIO/VIDEO → TAGGED SRT
               </h1>
               <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-indigo-50 text-indigo-700 border border-indigo-200">
-                ଓଡ଼ିଆ Unicode
+                <Languages className="w-3 h-3 mr-1" />ଓଡ଼ିଆ • हिन्दी • English
               </span>
             </div>
             <p className="text-xs text-slate-500 hidden sm:block">
@@ -41,11 +50,27 @@ export const Header: React.FC<HeaderProps> = ({
 
         {/* Action Controls & Badges */}
         <div className="flex items-center gap-2 w-full sm:w-auto justify-between sm:justify-end">
-          {detectedLanguage && (
+          {displayLanguage && (
             <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-medium">
               <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-              <span>Language: <strong>{detectedLanguage}</strong></span>
-              {isOdia && <span className="text-[10px] bg-emerald-200 px-1.5 py-0.2 rounded text-emerald-900 font-bold">MATCH</span>}
+              <span>
+                Language:{' '}
+                <strong>
+                  {displayLanguage}
+                  {reportedLanguageCode ? ` (${reportedLanguageCode})` : ''}
+                </strong>
+              </span>
+              {requestedLanguage === 'auto' && !isLanguageDetected ? (
+                <span className="text-[10px] bg-slate-200 px-1.5 py-0.2 rounded text-slate-700 font-bold">
+                  AUTO DEFAULT
+                </span>
+              ) : (
+                isOdia && (
+                  <span className="text-[10px] bg-emerald-200 px-1.5 py-0.2 rounded text-emerald-900 font-bold">
+                    MATCH
+                  </span>
+                )
+              )}
             </div>
           )}
 

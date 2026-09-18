@@ -1126,8 +1126,20 @@ export async function runOdiaPipeline(options: PipelineOptions): Promise<Transcr
     `[OdiaPipeline] Completed: ${finalSegmentsResolved.length} subtitle segments, duration=${duration.toFixed(2)}s`
   );
 
+  const languageNameMap: Record<string, string> = {
+    'od-IN': 'Odia (ଓଡ଼ିଆ)',
+    or: 'Odia (ଓଡ଼ିଆ)',
+    'hi-IN': 'Hindi (हिन्दी)',
+    'en-IN': 'English',
+  };
+  const finalLanguageCode = isOdia ? 'od-IN' : (detectedLanguage === 'Odia (ଓଡ଼ିଆ)' ? 'od-IN' : detectedLanguage);
+
   return {
     detectedLanguage,
+    languageCode: finalLanguageCode,
+    languageName: languageNameMap[finalLanguageCode] || detectedLanguage,
+    requestedLanguage: 'auto',
+    isLanguageDetected: true,
     isOdia,
     languageConfidence,
     durationSeconds: duration,

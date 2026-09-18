@@ -29,7 +29,7 @@ export const ProgressPipeline: React.FC<ProgressPipelineProps> = ({
             <span>Multi-Stage AI Audio & Subtitle Processing Pipeline</span>
           </h3>
           <p className="text-xs text-slate-500 mt-0.5">
-            Strict sequential execution: Language ID → Native Odia Unicode Transcription → Waveform Acoustic Tagging
+            Strict sequential execution: Language ID → Speech Transcription → Waveform Acoustic Tagging
           </p>
         </div>
         <div className="text-right">

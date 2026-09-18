@@ -24,7 +24,7 @@ export const ExportToolbar: React.FC<ExportToolbarProps> = ({
   copied,
   onReset,
 }) => {
-  const baseName = fileName.replace(/\.[^/.]+$/, '') || 'odia_tagged_subtitles';
+  const baseName = fileName.replace(/\.[^/.]+$/, '') || 'tagged_subtitles';
 
   const downloadFile = (content: string, ext: string, mime: string) => {
     const blob = new Blob([content], { type: `${mime};charset=utf-8` });
@@ -67,7 +67,7 @@ export const ExportToolbar: React.FC<ExportToolbarProps> = ({
           <span>Export Tagged Subtitles</span>
         </div>
         <p className="text-xs text-slate-500">
-          Standard UTF-8 SRT with strict Odia Unicode & Rule A–E tags
+          Standard UTF-8 SRT with strict Unicode & Rule A–E tags
         </p>
       </div>
 

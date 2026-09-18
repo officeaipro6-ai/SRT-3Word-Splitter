@@ -1,6 +1,6 @@
 import express from 'express';
 import path from 'path';
-import { createHash } from 'crypto';
+import { createHash, timingSafeEqual } from 'crypto';
 import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
 import multer from 'multer';
@@ -33,6 +33,37 @@ import {
   convertToWav,
   SpeechRegion,
 } from './server/audioAnalysis';
+import { config } from './server/config';
+import { nestedLog, redact } from './server/logger';
+import { DataStore } from './server/db/store';
+import { UserRepo, JobRepo, CreditRepo, newId } from './server/db/repos';
+import { type JobRecord, isJobStatus } from './server/db/types';
+import { FileCreditService, CreditError } from './server/services/creditService';
+import {
+  LocalFileStorageProvider,
+  uploadKey,
+  srtKey,
+  safeOriginalName,
+} from './server/services/storage';
+import { JobQueue, type RunPipeline } from './server/services/queue';
+import { extractToken, hashToken, issueToken, isValidTokenShape } from './server/services/auth';
+import {
+  validateUpload,
+  assertWithinActiveJobLimit,
+  SlidingWindowLimiter,
+  UploadError,
+} from './server/services/uploadPolicy';
+import {
+  getAsrProvider,
+  getAsrProviderName,
+  listConfiguredProviders,
+  getProviderStrict,
+} from './server/providers/registry';
+import {
+  type TranscriptionProviderResult,
+  type TranscriptionProvider,
+  ProviderNotConfiguredError,
+} from './server/providers/types';
 
 dotenv.config();
 
@@ -340,9 +371,102 @@ export async function applyAudioAnalysisTags(
   return finalSegments;
 }
 
+/**
+ * Queue-worker pipeline: the EXACT same post-processing as the legacy
+ * synchronous /api/process-audio route (max-3-word segmentation -> VAD tagging
+ * -> voice-aligned timing -> SRT + stats), so a queued job yields the identical
+ * tagged SRT. No rule logic is duplicated; these are the same functions.
+ */
+export const runJobPipeline: RunPipeline = async ({
+  audioBuffer,
+  mimeType,
+  provider,
+  providerResult,
+  fileDurationSeconds,
+}) => {
+  const rawTranscript = providerResult.transcript.trim();
+  const durationForSrt =
+    provider === 'sarvam' && providerResult.durationSeconds > 0
+      ? providerResult.durationSeconds
+      : fileDurationSeconds || 0;
+  const wordTimings = provider === 'sarvam' ? providerResult.wordTimings : [];
+  let segments: SubtitleSegment[] =
+    rawTranscript.length > 0 ? buildMax3WordSegments(rawTranscript, durationForSrt, wordTimings) : [];
+  segments = await applyAudioAnalysisTags(audioBuffer, mimeType, segments, durationForSrt);
+  const voiceRegions = await computeSpeechRegions(audioBuffer, mimeType || 'audio/wav');
+  segments = alignSegmentsToSpeechRegions(segments, voiceRegions);
+  const rawSrt = generateSrtContent(segments);
+  const wordCount = segments.reduce((sum, s) => sum + (s.text.split(/\s+/).filter(Boolean).length), 0);
+  return { rawSrt, segmentCount: segments.length, wordCount, provider };
+};
+
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
+
+  // ---------------------------------------------------------------------------
+  // Architecture layer: durable user/job/credit stores + storage + queue.
+  // Everything below is ADDITIVE — the legacy /api/process-audio behaviour is
+  // untouched. These instances are wired in-process; a future deployment swaps
+  // DataStore/StorageProvider/JobQueue for cloud backends behind the same
+  // interfaces.
+  // ---------------------------------------------------------------------------
+  const store = new DataStore(config.dbFile);
+  await store.init();
+  const users = new UserRepo(store);
+  const creditsRepo = new CreditRepo(store);
+  const jobs = new JobRepo(store);
+  const credits = new FileCreditService(users, creditsRepo);
+  const storage = new LocalFileStorageProvider(config.storageDir);
+  const queue = new JobQueue({
+    repo: jobs,
+    storage,
+    credits,
+    getProvider: getProviderStrict as (name: string) => TranscriptionProvider,
+    runPipeline: runJobPipeline,
+  });
+  const uploadLimiter = new SlidingWindowLimiter(config.uploadRateLimitWindowMs, config.uploadRateLimitMax);
+
+  /** Bearer-token auth: resolves identity, verifies ownership, records access. */
+  function auth() {
+    return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+      const token = extractToken(req);
+      if (!isValidTokenShape(token)) {
+        return res.status(401).json({ error: 'Missing or invalid bearer token. Create a session via POST /api/session.' });
+      }
+      const user = users.getByToken(hashToken(token as string));
+      if (!user) {
+        return res.status(401).json({ error: 'Unknown or expired session. Create a session via POST /api/session.' });
+      }
+      users.touch(user.id);
+      res.locals.user = user;
+      next();
+    };
+  }
+
+  /** Never leak internal storage paths / keys to clients. */
+  function publicJob(job: JobRecord) {
+    const base = {
+      id: job.id,
+      status: job.status,
+      provider: job.provider,
+      createdAt: job.createdAt,
+      startedAt: job.startedAt,
+      completedAt: job.completedAt,
+      retryCount: job.retryCount,
+      lastError: job.lastError,
+      errorCode: job.errorCode,
+      creditsCharged: job.creditsCharged,
+      input: {
+        originalName: job.input.originalName,
+        mimeType: job.input.mimeType,
+        sizeBytes: job.input.sizeBytes,
+        sha256: job.input.sha256,
+        durationSeconds: job.input.durationSeconds,
+      },
+    };
+    return job.output ? { ...base, output: { segmentCount: job.output.segmentCount, wordCount: job.output.wordCount } } : base;
+  }
 
   // JSON payload parser for base64 uploads
   app.use(express.json({ limit: '100mb' }));
@@ -356,6 +480,10 @@ async function startServer() {
       status: 'ok',
       service: 'ODIA AUDIO/VIDEO → TAGGED SRT Engine',
       activeProvider: getActiveProvider(),
+      asrProvider: getAsrProviderName(),
+      availableProviders: listConfiguredProviders(),
+      hasAzure: config.azureConfigured,
+      jobsEnabled: config.enableJobQueue,
       hasSarvamApiKey: isSarvamConfigured(),
       hasOlive: isOliveConfigured(),
       hasApiKey,
@@ -387,6 +515,37 @@ async function startServer() {
         });
       }
 
+      // ------------------------------------------------------------------
+      // Language selection routing (multi-language support).
+      //   - 'odia'   -> od-IN
+      //   - 'hindi'  -> hi-IN
+      //   - 'english'-> en-IN
+      //   - 'auto'   -> the current system has NO reliable automatic language
+      //                 detector, so it defaults to the primary project
+      //                 language (Odia). It is never reported as "detected"
+      //                 and never receives a fabricated confidence value.
+      // The resolved code is sent to the active ASR provider (Sarvam).
+      // ------------------------------------------------------------------
+      const requestedLanguageRaw = String(req.body.language || 'auto').trim().toLowerCase();
+      const requestedLanguage = ['odia', 'hindi', 'english'].includes(requestedLanguageRaw)
+        ? requestedLanguageRaw
+        : 'auto';
+      const languageCode = {
+        odia: 'od-IN',
+        hindi: 'hi-IN',
+        english: 'en-IN',
+        auto: 'od-IN',
+      }[requestedLanguage];
+      const languageName = {
+        'od-IN': 'Odia (ଓଡ଼ିଆ)',
+        'hi-IN': 'Hindi (हिन्दी)',
+        'en-IN': 'English',
+      }[languageCode];
+      const isLanguageDetected = false; // no reliable auto-detector in this system
+      const languageConfidence = 0; // never fabricated
+
+      console.log(`  language(request): ${requestedLanguage} -> ${languageCode} (${languageName})`);
+
       const audioBuffer = Buffer.from(audioBase64, 'base64');
       const fileSizeBytes = audioBuffer.length;
       const sha256 = createHash('sha256').update(audioBuffer).digest('hex');
@@ -414,7 +573,7 @@ async function startServer() {
       // and we do NOT run max-3-word segmentation yet (raw text is verified first).
       const rawText = await (async () => {
         if (provider === 'sarvam') {
-          const r = await transcribeRawOdiaWithSarvam(audioBuffer, mimeType);
+          const r = await transcribeRawOdiaWithSarvam(audioBuffer, mimeType, { languageCode });
           return { text: r.transcript, duration: r.durationSeconds, meta: r };
         } else if (provider === 'olive') {
           const r = await transcribeRawOdiaWithOlive(audioBuffer, mimeType);
@@ -513,7 +672,7 @@ async function startServer() {
       );
 
       console.log(
-        `[RAW ${provider.toUpperCase()}] lang=od-IN (forced) — ${rawWordCount} word(s): "${rawTranscript.slice(0, 120)}..."`
+        `[RAW ${provider.toUpperCase()}] lang=${languageCode}${requestedLanguage === 'auto' ? ' (auto/default od-IN)' : ` (requested ${requestedLanguage})`} — ${rawWordCount} word(s): "${rawTranscript.slice(0, 120)}..."`
       );
 
       // Provider-specific diagnostics (all visible in the UI panel). The Sarvam
@@ -532,7 +691,10 @@ async function startServer() {
             : provider === 'olive'
               ? 'whisper-odia-small-finetune-int8-ct2'
               : 'whisper-large-v3-turbo',
-        language: provider === 'olive' ? 'or' : 'od-IN',
+        language: provider === 'olive' ? 'or' : languageCode,
+        languageCode: provider === 'olive' ? 'or' : languageCode,
+        languageName,
+        requestedLanguage,
         mode:
           provider === 'sarvam' ? 'verbatim' : provider === 'olive' ? 'transcribe' : 'n/a',
         fileName,
@@ -566,16 +728,20 @@ async function startServer() {
       }
 
       return res.json({
-        detectedLanguage: 'Odia (ଓଡ଼ିଆ)',
-        isOdia: true,
-        languageConfidence: 0.98,
+        detectedLanguage: languageName,
+        isOdia: languageCode === 'od-IN',
+        languageConfidence,
+        languageCode,
+        languageName,
+        requestedLanguage,
+        isLanguageDetected,
         durationSeconds: durationForSrt,
         segments,
         rawSrt: generateSrtContent(segments),
         stats: calculateTranscriptionStats(segments),
         notes: [
           provider === 'sarvam'
-            ? 'Sarvam Saaras (saaras:v4, od-IN, verbatim) transcription of the exact uploaded audio. Subtitles split to max 3 words each and classified against the actual audio (NOISE/SILENCE/MB) so the exported SRT contains real tags. No spelling correction, no canonical/old SRT fallback.'
+            ? `Sarvam Saaras (saaras:v4, ${languageCode}, verbatim) transcription of the exact uploaded audio. Subtitles split to max 3 words each and classified against the actual audio (NOISE/SILENCE/MB) so the exported SRT contains real tags. No spelling correction, no canonical/old SRT fallback.`
             : provider === 'olive'
               ? 'Olive OdiaGenAI Whisper (language=or) transcription of the exact uploaded audio. Subtitles split to max 3 words each and classified against the actual audio (NOISE/SILENCE/MB) so the exported SRT contains real tags. No spelling correction, no canonical/old SRT fallback.'
               : 'Groq raw transcription (fallback provider). Subtitles split to max 3 words each and classified against the actual audio. No spelling correction, no canonical/old SRT fallback.',
@@ -634,6 +800,330 @@ async function startServer() {
     }
   });
 
+  // ---------------------------------------------------------------------------
+  // ADDITIVE architecture API: async job queue + credits + sessions.
+  // These routes never change the legacy /api/process-audio behaviour.
+  // ---------------------------------------------------------------------------
+
+  // Create a session: returns an opaque bearer token (stored server-side as a
+  // hash) plus the user's server-maintained credit balance.
+  // Admin bootstrap: if the request body includes `adminBootstrapToken` equal to
+  // the operator's env secret, the resulting user is granted role ADMIN +
+  // creditMode UNLIMITED. This is the ONLY server-side path that assigns roles;
+  // client-supplied role/creditMode fields are never trusted.
+  app.post('/api/session', (req, res) => {
+    try {
+      const existing = extractToken(req);
+      const bootstrap = typeof req.body?.adminBootstrapToken === 'string' ? req.body.adminBootstrapToken.trim() : '';
+      const isAdminBootstrap = Boolean(config.adminBootstrapToken && bootstrap && config.adminBootstrapToken.length === bootstrap.length) &&
+        timingSafeEqual(Buffer.from(config.adminBootstrapToken as string, 'utf8'), Buffer.from(bootstrap, 'utf8'));
+      let userId: string;
+      if (existing && isValidTokenShape(existing)) {
+        const user = users.getByToken(hashToken(existing));
+        if (!user) return res.status(401).json({ error: 'Unknown or expired session token.' });
+        userId = user.id;
+      } else {
+        const tokenHash = hashToken(issueToken());
+        const user = users.createUser(tokenHash, config.initialCredits);
+        if (config.initialCredits > 0) {
+          creditsRepo.add({
+            userId: user.id,
+            amount: config.initialCredits,
+            type: 'CREDIT',
+            reason: 'initial_grant',
+            jobId: undefined,
+            balanceAfter: user.credits,
+          });
+        }
+        userId = user.id;
+      }
+      if (isAdminBootstrap) {
+        users.setRole(userId, 'ADMIN');
+        users.setCreditMode(userId, 'UNLIMITED');
+        nestedLog.info('admin role granted via bootstrap token', { userId });
+      }
+      const token = issueToken();
+      users.addToken(userId, hashToken(token));
+      const user = users.getById(userId);
+      res.json({
+        userId,
+        token,
+        credits: user?.credits ?? 0,
+        role: user?.role ?? 'USER',
+        creditMode: user?.creditMode ?? 'NORMAL',
+        unlimited: (user?.creditMode ?? 'NORMAL') === 'UNLIMITED',
+        provider: getAsrProviderName(),
+        createdAt: user?.createdAt,
+      });
+    } catch (err: any) {
+      nestedLog.error('session creation failed', { message: redact(err.message) });
+      res.status(500).json({ error: 'Failed to create session.' });
+    }
+  });
+
+  // Upload -> validate -> charge credits server-side -> enqueue (async worker).
+  // No long audio is transcribed inside this request.
+  app.post('/api/jobs', auth(), upload.single('mediaFile'), (req, res) => {
+    void (async () => {
+      try {
+        const user = res.locals.user;
+        if (!uploadLimiter.isAllowed(`${user.id}:${req.ip || ''}`)) {
+          return res.status(429).json({ error: 'Upload rate limit exceeded. Please try again later.', code: 'RATE_LIMITED' });
+        }
+        const file = req.file;
+        if (!file) {
+          return res.status(400).json({
+            error: 'Missing mediaFile. Use multipart/form-data with a mediaFile field (plus an optional duration field).',
+          });
+        }
+        validateUpload({ mimeType: file.mimetype || 'audio/wav', sizeBytes: file.size });
+        const active = jobs.countActiveForUser(user.id);
+        assertWithinActiveJobLimit(active);
+
+        const jobId = newId();
+        const buffer = file.buffer;
+        const sha256 = createHash('sha256').update(buffer).digest('hex');
+        // Charge BEFORE enqueueing; chargeJob is idempotent per jobId, so a
+        // client retry can never double-charge.
+        const charged = credits.chargeJob({
+          userId: user.id,
+          jobId,
+          amount: config.creditsPerJob,
+          reason: 'charge_transcription',
+        });
+        const storageKey = uploadKey(jobId, file.mimetype || 'audio/wav');
+        try {
+          await storage.put(storageKey, buffer);
+        } catch (putErr) {
+          credits.refundFinishedJob(user.id, jobId, 'refund_storage_failure');
+          throw putErr;
+        }
+
+        const now = new Date().toISOString();
+        jobs.create({
+          id: jobId,
+          userId: user.id,
+          status: 'QUEUED',
+          provider: getAsrProviderName(),
+          input: {
+            storageKey,
+            originalName: safeOriginalName(file.originalname),
+            mimeType: file.mimetype || 'audio/wav',
+            sizeBytes: file.size,
+            sha256,
+            durationSeconds: Number(req.body.duration) || 0,
+          },
+          creditTxnId: charged.transaction?.id,
+          creditsCharged: charged.transaction ? config.creditsPerJob : 0,
+          createdAt: now,
+          retryCount: 0,
+        });
+        const job = jobs.getForUser(jobId, user.id) as JobRecord;
+        nestedLog.info('job enqueued', { jobId, userId: user.id, sizeBytes: file.size });
+        return res.status(202).json({ job: publicJob(job) });
+      } catch (err: any) {
+        if (err instanceof UploadError) {
+          return res.status(err.httpStatus).json({ error: err.message, code: err.code });
+        }
+        if (err instanceof CreditError) {
+          return res.status(402).json({ error: err.message, code: err.code });
+        }
+        if (err instanceof ProviderNotConfiguredError) {
+          return res.status(503).json({ error: err.message, code: err.code });
+        }
+        nestedLog.error('job enqueue failed', { message: redact(err.message) });
+        return res.status(500).json({ error: 'Failed to enqueue job.' });
+      }
+    })();
+  });
+
+  // List own jobs (ownership-filtered), optional ?status= filter.
+  app.get('/api/jobs', auth(), (req, res) => {
+    const user = res.locals.user;
+    const statusParam = String(req.query.status || '').trim().toUpperCase();
+    const status = isJobStatus(statusParam) ? statusParam : undefined;
+    const list = jobs.listForUser(user.id, status).map(publicJob);
+    res.json({ jobs: list });
+  });
+
+  // Own-job detail (ownership-checked; 404 for other users' jobs).
+  app.get('/api/jobs/:id', auth(), (req, res) => {
+    const user = res.locals.user;
+    const job = jobs.getForUser(req.params.id, user.id);
+    if (!job) return res.status(404).json({ error: 'Job not found.' });
+    res.json({ job: publicJob(job) });
+  });
+
+  // Stream own completed SRT (ownership-checked).
+  app.get('/api/jobs/:id/srt', auth(), (req, res) => {
+    const user = res.locals.user;
+    const job = jobs.getForUser(req.params.id, user.id);
+    if (!job) return res.status(404).json({ error: 'Job not found.' });
+    if (job.status !== 'COMPLETED' || !job.output) {
+      return res.status(409).json({ error: `SRT is not ready yet (job status: ${job.status}).` });
+    }
+    const fileName = safeOriginalName(job.input.originalName).replace(/\.[^.]+$/, '') + '.srt';
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    res.send(job.output.rawSrt);
+  });
+
+  // Cancel an unstarted/running own job (refunds the charge).
+  app.post('/api/jobs/:id/cancel', auth(), (req, res) => {
+    const user = res.locals.user;
+    const job = jobs.getForUser(req.params.id, user.id);
+    if (!job) return res.status(404).json({ error: 'Job not found.' });
+    if (job.status === 'COMPLETED' || job.status === 'FAILED' || job.status === 'CANCELLED') {
+      return res.status(409).json({ error: `Job cannot be cancelled (status: ${job.status}).` });
+    }
+    jobs.update(job.id, { status: 'CANCELLED', completedAt: new Date().toISOString() });
+    credits.refundFinishedJob(user.id, job.id, 'refund_cancelled_job');
+    nestedLog.info('job cancelled', { jobId: job.id, userId: user.id });
+    const updated = jobs.getForUser(job.id, user.id) as JobRecord;
+    res.json({ job: publicJob(updated) });
+  });
+
+  // Own credit balance + ledger (server-authoritative; never client values).
+  app.get('/api/credits/me', auth(), (req, res) => {
+    const user = res.locals.user;
+    const fresh = users.getById(user.id);
+    res.json({
+      userId: user.id,
+      credits: fresh?.credits ?? 0,
+      role: fresh?.role ?? 'USER',
+      creditMode: fresh?.creditMode ?? 'NORMAL',
+      unlimited: (fresh?.creditMode ?? 'NORMAL') === 'UNLIMITED',
+      transactions: credits.getTransactions(user.id, 25),
+      provider: getAsrProviderName(),
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // ADMIN API (role-checked server-side; never trusts a client-supplied role).
+  // Every route here runs auth() + requireAdmin(), so a non-admin session gets
+  // 401 (no auth) or 403 (authenticated but not admin).
+  // ---------------------------------------------------------------------------
+  const requireAdmin = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const user = res.locals.user;
+    if (!user || user.role !== 'ADMIN') {
+      return res.status(403).json({ error: 'Forbidden: admin role required.', code: 'FORBIDDEN' });
+    }
+    next();
+  };
+
+  // Public projection for admin listings (never token hashes, never secrets).
+  function adminUserView(userId: string) {
+    const u = users.getById(userId);
+    if (!u) return null;
+    return {
+      id: u.id,
+      role: u.role,
+      creditMode: u.creditMode,
+      unlimited: u.creditMode === 'UNLIMITED',
+      credits: u.credits,
+      purchasedCredits: u.purchasedCredits ?? 0,
+      bonusCredits: u.bonusCredits ?? 0,
+      totalGranted: credits.sumGrants(userId),
+      totalUsed: credits.sumUsed(userId),
+      createdAt: u.createdAt,
+      lastSeenAt: u.lastSeenAt ?? null,
+    };
+  }
+
+  function adminJobView(job: JobRecord) {
+    return {
+      id: job.id,
+      userId: job.userId,
+      status: job.status,
+      provider: job.provider,
+      createdAt: job.createdAt,
+      startedAt: job.startedAt,
+      completedAt: job.completedAt,
+      retryCount: job.retryCount,
+      lastError: job.lastError,
+      errorCode: job.errorCode,
+      creditsCharged: job.creditsCharged,
+      input: {
+        originalName: job.input.originalName,
+        mimeType: job.input.mimeType,
+        sizeBytes: job.input.sizeBytes,
+        durationSeconds: job.input.durationSeconds,
+      },
+    };
+  }
+
+  // List all users with balance + lifetime aggregates (admin dashboard).
+  app.get('/api/admin/users', auth(), requireAdmin, (req, res) => {
+    const limit = Math.min(Number(req.query.limit) || 100, 500);
+    const usersList = users.listUsers().slice(0, limit).map((u) => adminUserView(u.id));
+    res.json({ users: usersList });
+  });
+
+  // Single user detail incl. recent ledger (admin dashboard).
+  app.get('/api/admin/users/:id', auth(), requireAdmin, (req, res) => {
+    const view = adminUserView(req.params.id);
+    if (!view) return res.status(404).json({ error: 'User not found.' });
+    res.json({ user: view, transactions: credits.getTransactions(req.params.id, 50) });
+  });
+
+  // All transactions across users (admin Transaction History).
+  app.get('/api/admin/transactions', auth(), requireAdmin, (req, res) => {
+    const limit = Math.min(Number(req.query.limit) || 200, 500);
+    const userId = typeof req.query.userId === 'string' ? req.query.userId : undefined;
+    let list = credits.getAllTransactions(limit);
+    if (userId) list = list.filter((t) => t.userId === userId);
+    res.json({ transactions: list });
+  });
+
+  // All jobs across users (admin Jobs dashboard).
+  app.get('/api/admin/jobs', auth(), requireAdmin, (req, res) => {
+    const limit = Math.min(Number(req.query.limit) || 200, 500);
+    const userId = typeof req.query.userId === 'string' ? req.query.userId : undefined;
+    let list = jobs.listAll(limit);
+    if (userId) list = list.filter((j) => j.userId === userId);
+    res.json({ jobs: list.map(adminJobView) });
+  });
+
+  // Admin credit grant (idempotent via idempotencyKey; reason mandatory).
+  app.post('/api/admin/credits/grant', auth(), requireAdmin, (req, res) => {
+    try {
+      const result = credits.adminGrantCredits({
+        adminUserId: res.locals.user.id,
+        userId: String(req.body?.userId || ''),
+        amount: Number(req.body?.amount),
+        reason: String(req.body?.reason || ''),
+        idempotencyKey: req.body?.idempotencyKey,
+      });
+      res.json({ transaction: result.transaction, applied: result.applied });
+    } catch (err: any) {
+      if (err instanceof CreditError) {
+        return res.status(err.code === 'NO_USER' ? 404 : 400).json({ error: err.message, code: err.code });
+      }
+      nestedLog.error('admin grant failed', { message: redact(err.message) });
+      res.status(500).json({ error: 'Failed to grant credits.' });
+    }
+  });
+
+  // Admin credit debit (idempotent via idempotencyKey; reason mandatory; never negative).
+  app.post('/api/admin/credits/debit', auth(), requireAdmin, (req, res) => {
+    try {
+      const result = credits.adminDebitCredits({
+        adminUserId: res.locals.user.id,
+        userId: String(req.body?.userId || ''),
+        amount: Number(req.body?.amount),
+        reason: String(req.body?.reason || ''),
+        idempotencyKey: req.body?.idempotencyKey,
+      });
+      res.json({ transaction: result.transaction, applied: result.applied });
+    } catch (err: any) {
+      if (err instanceof CreditError) {
+        return res.status(err.code === 'NO_USER' ? 404 : 400).json({ error: err.message, code: err.code });
+      }
+      nestedLog.error('admin debit failed', { message: redact(err.message) });
+      res.status(500).json({ error: 'Failed to debit credits.' });
+    }
+  });
+
   // Mount Vite middleware for development
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
@@ -649,8 +1139,26 @@ async function startServer() {
     });
   }
 
+  // Multer/multipart error handling (additive; legacy routes unaffected).
+  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (err?.name === 'MulterError') {
+      const msg = err.code === 'LIMIT_FILE_SIZE'
+        ? `File exceeds the upload limit of ${Math.round(config.maxUploadBytes / 1024 / 1024)}MB.`
+        : `Upload error: ${err.message}`;
+      return res.status(413).json({ error: msg });
+    }
+    next(err);
+  });
+
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`[Server] ODIA AUDIO/VIDEO → TAGGED SRT running on http://0.0.0.0:${PORT}`);
+    if (config.enableJobQueue) {
+      queue.rehydrate();
+      queue.start();
+      nestedLog.info('job queue worker started', { provider: getAsrProviderName() });
+    } else {
+      nestedLog.warn('job queue disabled (ENABLE_JOB_QUEUE=false) job endpoints will not process work');
+    }
   });
 }
 

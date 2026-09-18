@@ -166,7 +166,7 @@ export const FileUpload: React.FC<FileUploadProps> = ({
 
           <div>
             <h3 className="text-base font-semibold text-slate-800">
-              {selectedFile ? 'File Ready for Processing' : 'Upload Audio or Video for Odia Tagged SRT'}
+              {selectedFile ? 'File Ready for Processing' : 'Upload Audio or Video for Tagged SRT'}
             </h3>
             <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto">
               Drag and drop any audio or video file, or click to browse.
@@ -218,7 +218,7 @@ export const FileUpload: React.FC<FileUploadProps> = ({
               <span className="text-sm font-bold text-slate-900">Audio Ready for 7-Step Pipeline</span>
             </div>
             <p className="text-xs text-slate-600">
-              Detect Odia speech → generate timestamps → acoustic background check → apply Rules A–E.
+              Detect speech → generate timestamps → acoustic background check → apply Rules A–E.
             </p>
           </div>
 
@@ -228,7 +228,7 @@ export const FileUpload: React.FC<FileUploadProps> = ({
             className="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-6 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white font-medium text-sm shadow-md shadow-indigo-200 transition-all cursor-pointer"
           >
             <Sparkles className="w-4 h-4" />
-            <span>Start Odia Processing</span>
+            <span>Start Processing</span>
             <ArrowRight className="w-4 h-4" />
           </button>
         </div>

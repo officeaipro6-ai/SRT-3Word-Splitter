@@ -13,6 +13,10 @@ import { RawSrtViewer } from './components/RawSrtViewer';
 import { RuleComplianceAudit } from './components/RuleComplianceAudit';
 import { ExportToolbar } from './components/ExportToolbar';
 import { RulesGuideModal } from './components/RulesGuideModal';
+import { CreditsWidget } from './components/CreditsWidget';
+import { LanguageSelector } from './components/LanguageSelector';
+import { LandingPage } from './components/LandingPage';
+import { ResultSummary } from './components/ResultSummary';
 import {
   SubtitleSegment,
   TranscriptionResult,
@@ -21,6 +25,7 @@ import {
   PipelineStageId,
   AudioClassification,
   AudioDiagnostics,
+  SupportedLanguage,
 } from './types';
 import {
   formatSrtTimestamp,
@@ -32,8 +37,8 @@ import {
 const INITIAL_STAGES: PipelineStageInfo[] = [
   { id: 'uploading', label: '1. Uploading Media', stepNumber: 1, status: 'idle' },
   { id: 'extracting_audio', label: '2. Extracting Audio', stepNumber: 2, status: 'idle' },
-  { id: 'detecting_language', label: '3. Detecting Language', stepNumber: 3, status: 'idle' },
-  { id: 'transcribing_odia', label: '4. Transcribing Odia Speech', stepNumber: 4, status: 'idle' },
+  { id: 'detecting_language', label: '3. Setting Language', stepNumber: 3, status: 'idle' },
+  { id: 'transcribing_odia', label: '4. Transcribing Speech', stepNumber: 4, status: 'idle' },
   { id: 'analyzing_audio', label: '5. Analyzing Audio Waveform', stepNumber: 5, status: 'idle' },
   { id: 'detecting_music_noise', label: '6. Detecting BGM / Noise', stepNumber: 6, status: 'idle' },
   { id: 'detecting_fillers', label: '7. Detecting Fillers / Laughs', stepNumber: 7, status: 'idle' },
@@ -44,6 +49,7 @@ const INITIAL_STAGES: PipelineStageInfo[] = [
 ];
 
 export default function App() {
+  const [selectedLanguage, setSelectedLanguage] = useState<SupportedLanguage>('odia');
   const [selectedMedia, setSelectedMedia] = useState<MediaFileInfo | null>(null);
   const [stages, setStages] = useState<PipelineStageInfo[]>(INITIAL_STAGES);
   const [currentStageId, setCurrentStageId] = useState<PipelineStageId>('uploading');
@@ -153,10 +159,10 @@ export default function App() {
       updateStage('extracting_audio', 'completed', '16kHz PCM stream ready');
       addLog('Stage 2: Audio track extracted and acoustic sample normalized.');
 
-      // Step 3: Detecting Language
-      updateStage('detecting_language', 'in_progress', 'Detecting spoken dialect...');
+      // Step 3: Setting Language
+      updateStage('detecting_language', 'in_progress', 'Configuring transcription language...');
       setOverallProgress(30);
-      addLog('Stage 3: Running language identification model...');
+      addLog(`Stage 3: Sending language "${selectedLanguage}" to transcription provider...`);
 
       // Server-side AI pipeline request
       const response = await fetch('/api/process-audio', {
@@ -167,6 +173,7 @@ export default function App() {
           mimeType: audioToProcess.type || 'audio/wav',
           fileName: selectedMedia.name,
           duration: selectedMedia.duration,
+          language: selectedLanguage,
         }),
       });
 
@@ -180,16 +187,16 @@ export default function App() {
       updateStage(
         'detecting_language',
         'completed',
-        `Language: ${result.detectedLanguage} (${(result.languageConfidence * 100).toFixed(0)}%)`
+        `Language: ${result.languageName} (${result.languageCode})`
       );
-      addLog(`Stage 3 Complete: Detected "${result.detectedLanguage}" with high confidence.`);
+      addLog(`Stage 3 Complete: Language "${result.languageName}" (${result.languageCode}).`);
 
-      // Step 4: Transcribing Odia Speech
-      updateStage('transcribing_odia', 'in_progress', 'Transcribing native Odia Unicode text...');
+      // Step 4: Transcribing Speech
+      updateStage('transcribing_odia', 'in_progress', 'Transcribing speech...');
       setOverallProgress(45);
       await new Promise((r) => setTimeout(r, 200));
-      updateStage('transcribing_odia', 'completed', 'Odia Unicode transcription complete');
-      addLog('Stage 4 Complete: Transcribed spoken segments in native Odia script (ଓଡ଼ିଆ).');
+      updateStage('transcribing_odia', 'completed', 'Transcription complete');
+      addLog(`Stage 4 Complete: Transcribed spoken segments in ${result.languageName}.`);
 
       // Step 5: Analyzing Audio Waveform
       updateStage('analyzing_audio', 'in_progress', 'Analyzing spectral waveform & RMS...');
@@ -396,6 +403,7 @@ export default function App() {
     setIsPlaying(false);
     setStages(INITIAL_STAGES);
     setOverallProgress(0);
+    setSelectedLanguage('odia');
     addLog('Pipeline reset. Ready for a new media file.');
   };
 
@@ -412,6 +420,9 @@ export default function App() {
         />
       )}
 
+      {/* Credits + Admin widget (additive, never part of the transcription flow) */}
+      <CreditsWidget />
+
       {/* Top Header */}
       <Header
         onOpenRules={() => setRulesModalOpen(true)}
@@ -419,20 +430,31 @@ export default function App() {
         hasData={segments.length > 0}
         detectedLanguage={transcriptionResult?.detectedLanguage}
         isOdia={transcriptionResult?.isOdia}
+        reportedLanguageName={transcriptionResult?.languageName}
+        reportedLanguageCode={transcriptionResult?.languageCode}
+        requestedLanguage={transcriptionResult?.requestedLanguage}
+        isLanguageDetected={transcriptionResult?.isLanguageDetected}
       />
 
       {/* Main Content Area */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
         {/* Upload & Preset Selector (Shown when no active transcription yet, or can be reconfigured) */}
         {!transcriptionResult && (
-          <div className="space-y-6 animate-in fade-in duration-200">
-            <FileUpload
-              onFileSelected={(info) => setSelectedMedia(info)}
-              isProcessing={isProcessing}
-              selectedFile={selectedMedia}
-              onStartPipeline={handleStartPipeline}
-            />
-          </div>
+          <LandingPage>
+            <div className="space-y-6 animate-in fade-in duration-200">
+              <LanguageSelector
+                value={selectedLanguage}
+                onChange={setSelectedLanguage}
+                disabled={isProcessing}
+              />
+              <FileUpload
+                onFileSelected={(info) => setSelectedMedia(info)}
+                isProcessing={isProcessing}
+                selectedFile={selectedMedia}
+                onStartPipeline={handleStartPipeline}
+              />
+            </div>
+          </LandingPage>
         )}
 
         {/* Processing Progress Pipeline Component */}
@@ -466,6 +488,11 @@ export default function App() {
         {/* Results View: Interactive Editor, Waveform Player, Table & Raw SRT */}
         {segments.length > 0 && !isProcessing && (
           <div className="space-y-6 animate-in fade-in duration-300">
+            {/* Result Summary Card */}
+            {transcriptionResult && (
+              <ResultSummary result={transcriptionResult} segments={segments} />
+            )}
+
             {/* Temporary Audio Input Verification Panel */}
             <div className="rounded-2xl border border-amber-300 bg-amber-50 p-4">
               <div className="text-xs font-extrabold uppercase tracking-wide text-amber-800 mb-2">
@@ -474,8 +501,16 @@ export default function App() {
               <div className="text-xs font-mono bg-white/70 border border-amber-200 rounded-lg p-2 mb-3 space-y-0.5">
                 <div><span className="font-bold text-amber-900">PROVIDER:</span> {serverDiag?.providerDisplay ?? serverDiag?.provider ?? '—'}</div>
                 <div><span className="font-bold text-amber-900">MODEL:</span> {serverDiag?.model ?? '—'}</div>
-                <div><span className="font-bold text-amber-900">LANGUAGE:</span> {serverDiag?.language ?? '—'}{' '}
-                  {serverDiag?.language ? <span className="text-amber-700">(forced Odia; no translation/transliteration)</span> : null}</div>
+                <div><span className="font-bold text-amber-900">SELECTED LANGUAGE:</span> {serverDiag?.languageName ?? '—'} {serverDiag?.languageName ? <span className="text-amber-700">(selected by user)</span> : null}</div>
+                <div><span className="font-bold text-amber-900">LANGUAGE SENT TO ASR:</span> {serverDiag?.languageCode ?? serverDiag?.language ?? '—'}{' '}
+                  {serverDiag?.language ? <span className="text-amber-700">(no translation/transliteration)</span> : null}</div>
+                <div><span className="font-bold text-amber-900">MATCH:</span>{' '}
+                  {serverDiag?.languageName && serverDiag?.languageCode ? (
+                    <span className={serverDiag.requestedLanguage !== 'auto' ? 'font-bold text-emerald-700' : 'text-amber-700'}>
+                      {serverDiag.requestedLanguage !== 'auto' ? 'YES' : 'DEFAULT (no reliable auto-detect)'}
+                    </span>
+                  ) : '—'}
+                </div>
                 <div><span className="font-bold text-amber-900">MODE:</span> {serverDiag?.mode ?? '—'}</div>
                 <div><span className="font-bold text-amber-900">UPLOADED FILE:</span> {serverDiag?.fileName ?? '—'}</div>
                 <div><span className="font-bold text-amber-900">FILE SIZE:</span>{' '}
@@ -621,7 +656,7 @@ export default function App() {
 
             {/* Export & Download Bar */}
             <ExportToolbar
-              fileName={selectedMedia?.name || 'odia_subtitles'}
+              fileName={selectedMedia?.name || 'tagged_subtitles'}
               segments={segments}
               transcriptionResult={transcriptionResult}
               onCopySrt={handleCopySrt}

@@ -225,7 +225,7 @@ export const SubtitleTable: React.FC<SubtitleTableProps> = ({
             <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
             <input
               type="text"
-              placeholder="Search Odia text or time..."
+              placeholder="Search text or time..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               className="w-full pl-8 pr-3 py-1.5 rounded-xl border border-slate-200 bg-slate-50 text-xs focus:bg-white focus:outline-indigo-500 transition-all"
@@ -275,7 +275,7 @@ export const SubtitleTable: React.FC<SubtitleTableProps> = ({
               <th className="py-2.5 px-3 w-12 text-center">#</th>
               <th className="py-2.5 px-3 w-32">Start (SRT)</th>
               <th className="py-2.5 px-3 w-32">End (SRT)</th>
-              <th className="py-2.5 px-3 min-w-[220px]">Transcribed Odia Text</th>
+              <th className="py-2.5 px-3 min-w-[220px]">Transcribed Text</th>
               <th className="py-2.5 px-3 w-48">Classification</th>
               <th className="py-2.5 px-3 min-w-[180px]">Tagged Output Preview</th>
               <th className="py-2.5 px-3 w-28 text-center">Actions</th>
@@ -343,7 +343,7 @@ export const SubtitleTable: React.FC<SubtitleTableProps> = ({
                       </div>
                     </td>
 
-                    {/* Odia Text Editor */}
+                    {/* Text Editor */}
                     <td className="py-2 px-3">
                       <input
                         type="text"
@@ -355,7 +355,7 @@ export const SubtitleTable: React.FC<SubtitleTableProps> = ({
                             ? 'silence'
                             : seg.classification === 'UNINTELLIGIBLE_SPEECH'
                             ? '(Speech not understandable)'
-                            : 'Enter Odia text...'
+                            : 'Enter text...'
                         }
                         onChange={(e) => handleTextChange(seg, e.target.value)}
                         className={`w-full font-sans text-xs px-2.5 py-1.5 rounded-lg border focus:bg-white focus:outline-hidden ${

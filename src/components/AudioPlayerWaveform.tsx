@@ -219,7 +219,7 @@ export const AudioPlayerWaveform: React.FC<AudioPlayerWaveformProps> = ({
           </div>
         ) : (
           <div className="text-xs text-slate-400 py-1 italic">
-            Play audio or click on any segment to preview Odia subtitle
+            Play audio or click on any segment to preview subtitle
           </div>
         )}
       </div>
