@@ -67,6 +67,7 @@ export interface AudioDiagnostics {
   model?: string;
   language?: string;
   languageCode?: string;
+  asrReportedLanguage?: string;
   languageName?: string;
   requestedLanguage?: SupportedLanguage;
   mode?: string;

@@ -520,22 +520,32 @@ async function startServer() {
       //   - 'odia'   -> od-IN
       //   - 'hindi'  -> hi-IN
       //   - 'english'-> en-IN
-      //   - 'auto'   -> the current system has NO reliable automatic language
-      //                 detector, so it defaults to the primary project
-      //                 language (Odia). It is never reported as "detected"
-      //                 and never receives a fabricated confidence value.
-      // The resolved code is sent to the active ASR provider (Sarvam).
+      // The selection is STRICTLY validated: missing, unknown, or inconsistent
+      // values are rejected with a 400 error. The server NEVER silently assumes
+      // Odia. od-IN is used only when the user explicitly selects Odia, exactly
+      // as before. The explicit BCP-47 code may also be supplied as `languageCode`;
+      // when both `language` and `languageCode` are present they must agree.
+      // The resolved code is then sent to the active ASR provider (Sarvam).
       // ------------------------------------------------------------------
-      const requestedLanguageRaw = String(req.body.language || 'auto').trim().toLowerCase();
-      const requestedLanguage = ['odia', 'hindi', 'english'].includes(requestedLanguageRaw)
-        ? requestedLanguageRaw
-        : 'auto';
-      const languageCode = {
+      const LANGUAGE_CODE_BY_KEY: Record<string, string> = {
         odia: 'od-IN',
         hindi: 'hi-IN',
         english: 'en-IN',
-        auto: 'od-IN',
-      }[requestedLanguage];
+      };
+      const rawLang = String(req.body.language ?? '').trim().toLowerCase();
+      const requestedLanguage = Object.prototype.hasOwnProperty.call(LANGUAGE_CODE_BY_KEY, rawLang)
+        ? rawLang
+        : null;
+      const rawCode = String(req.body.languageCode ?? '').trim().toUpperCase();
+      const explicitCode = ['od-IN', 'hi-IN', 'en-IN'].includes(rawCode) ? rawCode : null;
+
+      if (!requestedLanguage && !explicitCode) {
+        return res.status(400).json({ error: 'Please select a valid language before processing.' });
+      }
+      if (requestedLanguage && explicitCode && LANGUAGE_CODE_BY_KEY[requestedLanguage] !== explicitCode) {
+        return res.status(400).json({ error: 'Please select a valid language before processing.' });
+      }
+      const languageCode = requestedLanguage ? LANGUAGE_CODE_BY_KEY[requestedLanguage] : (explicitCode as string);
       const languageName = {
         'od-IN': 'Odia (ଓଡ଼ିଆ)',
         'hi-IN': 'Hindi (हिन्दी)',
@@ -713,7 +723,10 @@ async function startServer() {
 
       if (provider === 'sarvam') {
         const m = rawText.meta as any;
-        audioDiagnostics.languageCode = m.languageCode || 'od-IN';
+        // Keep audioDiagnostics.languageCode = the code WE sent to the ASR
+        // (set above). Record what the provider echoed separately so the
+        // diagnostic never mislabels od-IN as "sent" for hi-IN/en-IN.
+        audioDiagnostics.asrReportedLanguage = m.languageCode || 'od-IN';
         audioDiagnostics.chunkCount = (m.chunks || []).length;
       } else if (provider === 'olive') {
         const o = rawText.meta as any;

@@ -34,6 +34,14 @@ import {
   enforceMaxWordsPerSegment,
 } from './utils/srtRules';
 
+// Single source of truth: selected language -> Sarvam ASR BCP-47 code.
+export const LANGUAGE_CODE_BY_SELECTION: Record<SupportedLanguage, string> = {
+  auto: 'od-IN', // defensive default; the selector never offers "auto"
+  odia: 'od-IN',
+  hindi: 'hi-IN',
+  english: 'en-IN',
+};
+
 const INITIAL_STAGES: PipelineStageInfo[] = [
   { id: 'uploading', label: '1. Uploading Media', stepNumber: 1, status: 'idle' },
   { id: 'extracting_audio', label: '2. Extracting Audio', stepNumber: 2, status: 'idle' },
@@ -174,6 +182,7 @@ export default function App() {
           fileName: selectedMedia.name,
           duration: selectedMedia.duration,
           language: selectedLanguage,
+          languageCode: LANGUAGE_CODE_BY_SELECTION[selectedLanguage],
         }),
       });
 
@@ -501,13 +510,14 @@ export default function App() {
               <div className="text-xs font-mono bg-white/70 border border-amber-200 rounded-lg p-2 mb-3 space-y-0.5">
                 <div><span className="font-bold text-amber-900">PROVIDER:</span> {serverDiag?.providerDisplay ?? serverDiag?.provider ?? '—'}</div>
                 <div><span className="font-bold text-amber-900">MODEL:</span> {serverDiag?.model ?? '—'}</div>
-                <div><span className="font-bold text-amber-900">SELECTED LANGUAGE:</span> {serverDiag?.languageName ?? '—'} {serverDiag?.languageName ? <span className="text-amber-700">(selected by user)</span> : null}</div>
-                <div><span className="font-bold text-amber-900">LANGUAGE SENT TO ASR:</span> {serverDiag?.languageCode ?? serverDiag?.language ?? '—'}{' '}
+                <div><span className="font-bold text-amber-900">SELECTED LANGUAGE:</span> {serverDiag?.languageName ?? serverDiag?.requestedLanguage ?? '—'} {serverDiag?.languageName ? <span className="text-amber-700">(selected by user)</span> : null}</div>
+                <div><span className="font-bold text-amber-900">LANGUAGE CODE:</span> {transcriptionResult?.languageCode ?? serverDiag?.languageCode ?? '—'}</div>
+                <div><span className="font-bold text-amber-900">LANGUAGE SENT TO ASR:</span> {serverDiag?.languageCode ?? '—'}{' '}
                   {serverDiag?.language ? <span className="text-amber-700">(no translation/transliteration)</span> : null}</div>
                 <div><span className="font-bold text-amber-900">MATCH:</span>{' '}
-                  {serverDiag?.languageName && serverDiag?.languageCode ? (
-                    <span className={serverDiag.requestedLanguage !== 'auto' ? 'font-bold text-emerald-700' : 'text-amber-700'}>
-                      {serverDiag.requestedLanguage !== 'auto' ? 'YES' : 'DEFAULT (no reliable auto-detect)'}
+                  {serverDiag?.languageCode && transcriptionResult?.languageCode ? (
+                    <span className={serverDiag.languageCode === transcriptionResult.languageCode ? 'font-bold text-emerald-700' : 'font-bold text-rose-700'}>
+                      {serverDiag.languageCode === transcriptionResult.languageCode ? 'YES' : 'NO'}
                     </span>
                   ) : '—'}
                 </div>
