@@ -6,3 +6,9 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Durable local state (DB file, uploaded audio, generated SRTs)
+data/
+
+# Isolated prototype artifacts (indicwav2vec-odia)
+prototype/

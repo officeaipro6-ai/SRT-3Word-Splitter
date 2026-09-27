@@ -14,6 +14,7 @@ import { RuleComplianceAudit } from './components/RuleComplianceAudit';
 import { ExportToolbar } from './components/ExportToolbar';
 import { RulesGuideModal } from './components/RulesGuideModal';
 import { CreditsWidget } from './components/CreditsWidget';
+import { ensureSession } from './lib/sessionClient';
 import { LanguageSelector } from './components/LanguageSelector';
 import { LandingPage } from './components/LandingPage';
 import { ResultSummary } from './components/ResultSummary';
@@ -73,6 +74,22 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<'editor' | 'raw_srt'>('editor');
   const [copied, setCopied] = useState<boolean>(false);
   const [rulesModalOpen, setRulesModalOpen] = useState<boolean>(false);
+
+  // Free-trial usage (server-authoritative count; the stable session token in
+  // localStorage survives page refreshes, so the count cannot be reset).
+  const [freeTrial, setFreeTrial] = useState<{ used: number; limit: number; remaining: number } | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    ensureSession()
+      .then((s) => {
+        if (active) setFreeTrial({ used: s.freeTrialsUsed, limit: s.freeTrialLimit, remaining: s.freeTrialsRemaining });
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, []);
 
   // Temporary audio-input verification state
   const [serverDiag, setServerDiag] = useState<AudioDiagnostics | null>(null);
@@ -172,10 +189,21 @@ export default function App() {
       setOverallProgress(30);
       addLog(`Stage 3: Sending language "${selectedLanguage}" to transcription provider...`);
 
-      // Server-side AI pipeline request
+      // Server-side AI pipeline request (free-trial enforcement uses the session token)
+      let sessionToken: string | null = null;
+      try {
+        const session = await ensureSession();
+        sessionToken = session.token;
+        setFreeTrial({ used: session.freeTrialsUsed, limit: session.freeTrialLimit, remaining: session.freeTrialsRemaining });
+      } catch {
+        // session unavailable — the pipeline call below surfaces the real error
+      }
       const response = await fetch('/api/process-audio', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(sessionToken ? { 'x-user-token': sessionToken } : {}),
+        },
         body: JSON.stringify({
           audioBase64: base64Audio,
           mimeType: audioToProcess.type || 'audio/wav',
@@ -265,6 +293,13 @@ export default function App() {
       setTranscriptionResult(result);
       setSegments(result.segments);
       setServerDiag(result.audioDiagnostics || null);
+      // Refresh server-side free-trial usage after a successful run.
+      try {
+        const s = await ensureSession();
+        setFreeTrial({ used: s.freeTrialsUsed, limit: s.freeTrialLimit, remaining: s.freeTrialsRemaining });
+      } catch {
+        /* non-critical */
+      }
       if (result.audioDiagnostics) {
         addLog(
           `AUDIO VERIFY: server received "${result.audioDiagnostics.fileName}" ` +
@@ -451,6 +486,21 @@ export default function App() {
         {!transcriptionResult && (
           <LandingPage>
             <div className="space-y-6 animate-in fade-in duration-200">
+              {freeTrial && freeTrial.limit > 0 && (
+                <div className="flex justify-center">
+                  <span
+                    className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-[11px] font-semibold shadow-sm ${
+                      freeTrial.remaining > 0
+                        ? 'bg-white border-slate-200 text-slate-600'
+                        : 'bg-rose-50 border-rose-200 text-rose-600'
+                    }`}
+                  >
+                    {freeTrial.remaining > 0
+                      ? `Free trials remaining: ${freeTrial.remaining} of ${freeTrial.limit}`
+                      : 'Free trials exhausted — please choose a plan to continue.'}
+                  </span>
+                </div>
+              )}
               <LanguageSelector
                 value={selectedLanguage}
                 onChange={setSelectedLanguage}

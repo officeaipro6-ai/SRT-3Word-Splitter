@@ -30,6 +30,7 @@ import {
 import {
   parseWav,
   detectSpeechRegions,
+  detectBgmUnderVoiceIntervals,
   convertToWav,
   SpeechRegion,
 } from './server/audioAnalysis';
@@ -37,7 +38,7 @@ import { config } from './server/config';
 import { nestedLog, redact } from './server/logger';
 import { DataStore } from './server/db/store';
 import { UserRepo, JobRepo, CreditRepo, newId } from './server/db/repos';
-import { type JobRecord, isJobStatus } from './server/db/types';
+import { type JobRecord, type UserRecord, isJobStatus } from './server/db/types';
 import { FileCreditService, CreditError } from './server/services/creditService';
 import {
   LocalFileStorageProvider,
@@ -64,6 +65,14 @@ import {
   type TranscriptionProvider,
   ProviderNotConfiguredError,
 } from './server/providers/types';
+import {
+  FREE_TRIAL_EXHAUSTED_CODE,
+  freeTrialBlockMessage,
+  freeTrialsRemaining,
+  freeTrialsUsedFor,
+  isFreeTrialExempt,
+  isFreeTrialExhausted,
+} from './server/services/freeTrialPolicy';
 
 dotenv.config();
 
@@ -87,38 +96,237 @@ const upload = multer({
  * All segments are CLEAR_SPEECH. Tagging uses the existing Rule A (unchanged
  * text, no tags) via applyTaggingRule. No tagging/VAD/provider/spelling changes.
  */
+/**
+ * Decoded wall-clock duration (seconds) of the uploaded media using the local
+ * ffmpeg WAV decode (parseWav handles true WAV inputs directly). Returns 0
+ * when the audio cannot be decoded locally.
+ */
+async function measureAudioDurationSeconds(inputBuffer: Buffer, inputMimeType: string): Promise<number> {
+  const direct = parseWav(inputBuffer);
+  if (direct && direct.duration > 0) return direct.duration;
+  try {
+    const wav = await convertToWav(inputBuffer, inputMimeType || 'audio/wav');
+    if (!wav) return 0;
+    const parsed = parseWav(wav);
+    return parsed && parsed.duration > 0 ? parsed.duration : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Resolve the wall-clock ranges for Sarvam phrase/segment anchors. Entries
+ * with invalid spans are bridged between the previous valid end and the next
+ * valid start (or the decoded audio duration). Returns null when the anchors
+ * cannot be fully resolved so the caller falls back to safe even distribution.
+ */
+function resolvePhraseRanges(
+  phrases: Array<{ startSeconds: number; endSeconds: number }>,
+  totalDuration: number
+): Array<[number, number]> | null {
+  const ranges: Array<[number, number] | null> = phrases.map((p) => {
+    if (
+      Number.isFinite(p.startSeconds) &&
+      Number.isFinite(p.endSeconds) &&
+      p.endSeconds > p.startSeconds
+    ) {
+      return [p.startSeconds, p.endSeconds] as [number, number];
+    }
+    return null;
+  });
+
+  let lastEnd = 0;
+  for (let i = 0; i < ranges.length; i++) {
+    if (!ranges[i]) {
+      let nextStart = totalDuration > 0 ? totalDuration : lastEnd;
+      for (let j = i + 1; j < ranges.length; j++) {
+        if (ranges[j]) {
+          nextStart = ranges[j]![0];
+          break;
+        }
+      }
+      if (nextStart <= lastEnd) return null;
+      ranges[i] = [lastEnd, nextStart];
+    }
+    lastEnd = ranges[i]![1];
+  }
+
+  if (ranges.every((r) => r !== null) && ranges.some((r) => r![1] > r![0])) {
+    return ranges as Array<[number, number]>;
+  }
+  return null;
+}
+
+/**
+ * Number of transcript words owned by each Sarvam phrase. Primary: phrase text
+ * word counts (used when they sum exactly to the transcript length). Fallback:
+ * duration-proportional counts that always sum exactly to the transcript
+ * length. Returns [] when neither can be trusted.
+ */
+function phraseCountsForList(
+  phrases: Array<{ text: string; startSeconds: number; endSeconds: number }>,
+  wordCount: number
+): number[] {
+  const textCounts = phrases.map((p) => (p.text || '').split(/\s+/).filter(Boolean).length);
+  if (textCounts.reduce((a, b) => a + b, 0) === wordCount) return textCounts;
+
+  const spans = phrases.map((p) =>
+    Number.isFinite(p.startSeconds) && Number.isFinite(p.endSeconds) && p.endSeconds > p.startSeconds
+      ? p.endSeconds - p.startSeconds
+      : 0
+  );
+  const totalSpan = spans.reduce((a, b) => a + b, 0);
+  if (totalSpan <= 0) return [];
+
+  const counts = spans.map((s) => Math.floor((s / totalSpan) * wordCount + 0.5));
+  let diff = wordCount - counts.reduce((a, b) => a + b, 0);
+  let guard = 0;
+  while (diff !== 0 && guard < spans.length * 2 + 1) {
+    const maxSpan = Math.max(...spans);
+    const idx = spans.indexOf(maxSpan);
+    counts[idx] += diff > 0 ? 1 : -1;
+    if (counts[idx] < 0) counts[idx] = 0;
+    diff += diff > 0 ? -1 : 1;
+    guard++;
+  }
+  return counts.reduce((a, b) => a + b, 0) === wordCount ? counts : [];
+}
+
 export function buildMax3WordSegments(
   rawTranscript: string,
   totalDuration: number,
-  wordTimings: Array<{ text: string; startSeconds: number; endSeconds: number }>
+  wordTimings: Array<{ text: string; startSeconds: number; endSeconds: number }>,
+  scalingFactor = 1
 ): SubtitleSegment[] {
   const words = rawTranscript.split(/\s+/).filter(Boolean);
   if (words.length === 0) return [];
 
+  const validRange = (w: { startSeconds: number; endSeconds: number }) =>
+    Number.isFinite(w.startSeconds) &&
+    Number.isFinite(w.endSeconds) &&
+    w.endSeconds >= w.startSeconds;
+
   // Use Sarvam timestamps ONLY when they align 1:1 (same count, in order, valid
-  // ranges). Otherwise fall back to the existing even-distribution timing so
-  // segmentation never fabricates or misaligns timings.
-  const hasUsableTimings =
-    wordTimings.length === words.length &&
-    wordTimings.every(
-      (w) =>
-        Number.isFinite(w.startSeconds) &&
-        Number.isFinite(w.endSeconds) &&
-        w.endSeconds >= w.startSeconds
-    );
+  // ranges). Otherwise anchor to Sarvam phrase/segment timestamps (words mapped
+  // to phrases by index), preserving every word, the max-3 rule, phrase gaps,
+  // and the real audio timeline. Even distribution is the last resort.
+  const hasUsableTimings = wordTimings.length === words.length && wordTimings.every(validRange);
 
   const chunks = findOptimalNaturalWordChunks(words, 3);
   let cursor = 0;
   let prevEnd = 0;
 
+  if (hasUsableTimings) {
+    return chunks.map((chunkWords, idx) => {
+      let segStart = wordTimings[cursor].startSeconds;
+      let segEnd = wordTimings[cursor + chunkWords.length - 1].endSeconds;
+
+      // Keep chronological order and valid start < end intervals.
+      if (segStart < prevEnd) segStart = prevEnd;
+      if (segEnd <= segStart) segEnd = segStart + 0.001;
+
+      segStart = Number(segStart.toFixed(3));
+      segEnd = Number(segEnd.toFixed(3));
+      prevEnd = segEnd;
+
+      const text = chunkWords.join(' ');
+      const { taggedText } = applyTaggingRule(text, 'CLEAR_SPEECH', segEnd - segStart);
+
+      const chunkTimeWordTimings = wordTimings
+        .slice(cursor, cursor + chunkWords.length)
+        .map((w) => ({ word: w.text, startSeconds: w.startSeconds, endSeconds: w.endSeconds }));
+
+      cursor += chunkWords.length;
+
+      return {
+        id: idx + 1,
+        startSeconds: segStart,
+        endSeconds: segEnd,
+        startTimeFormatted: formatSrtTimestamp(segStart),
+        endTimeFormatted: formatSrtTimestamp(segEnd),
+        text,
+        classification: 'CLEAR_SPEECH' as const,
+        taggedText,
+        confidence: 0.98,
+        wordTimings: chunkTimeWordTimings,
+      };
+    });
+  }
+
+  // Phrase-anchor path: Sarvam returned phrase/segment timestamps (not 1:1 word
+  // timestamps). Map every transcript word to a phrase by index, chunk each
+  // phrase's words with the max-3 rule, and place each cue proportionally
+  // inside its phrase range so real phrase gaps are preserved. When the
+  // provider's durations are compressed/expanded relative to the locally
+  // decoded audio, phrase ranges are rescaled to the real timeline first.
+  if (wordTimings.length > 0) {
+    const phraseAnchors =
+      scalingFactor > 0 && scalingFactor !== 1
+        ? wordTimings.map((p) => ({
+            text: p.text,
+            startSeconds: p.startSeconds * scalingFactor,
+            endSeconds: p.endSeconds * scalingFactor,
+          }))
+        : wordTimings;
+    const resolved = resolvePhraseRanges(phraseAnchors, totalDuration);
+    const counts = resolved ? phraseCountsForList(phraseAnchors, words.length) : [];
+    if (
+      resolved &&
+      counts.length === phraseAnchors.length &&
+      counts.reduce((a, b) => a + b, 0) === words.length
+    ) {
+      const out: SubtitleSegment[] = [];
+      let wordIdx = 0;
+      let segId = 1;
+      for (let i = 0; i < phraseAnchors.length; i++) {
+        const pCount = counts[i];
+        if (pCount <= 0) continue;
+        const phraseWords = words.slice(wordIdx, wordIdx + pCount);
+        const [pStart, pEnd] = resolved[i];
+        const span = pEnd - pStart;
+        const phraseChunks = findOptimalNaturalWordChunks(phraseWords, 3);
+        let offset = 0;
+        for (const pc of phraseChunks) {
+          let segStart = pStart + (offset / phraseWords.length) * span;
+          let segEnd = pStart + ((offset + pc.length) / phraseWords.length) * span;
+          if (segStart < prevEnd) segStart = prevEnd;
+          if (segEnd <= segStart) segEnd = segStart + 0.001;
+          segStart = Number(segStart.toFixed(3));
+          segEnd = Number(segEnd.toFixed(3));
+          prevEnd = segEnd;
+
+          const text = pc.join(' ');
+          const { taggedText } = applyTaggingRule(text, 'CLEAR_SPEECH', segEnd - segStart);
+
+          out.push({
+            id: segId++,
+            startSeconds: segStart,
+            endSeconds: segEnd,
+            startTimeFormatted: formatSrtTimestamp(segStart),
+            endTimeFormatted: formatSrtTimestamp(segEnd),
+            text,
+            classification: 'CLEAR_SPEECH' as const,
+            taggedText,
+            confidence: 0.98,
+            wordTimings: undefined,
+          });
+          offset += pc.length;
+        }
+        wordIdx += pCount;
+      }
+      if (out.length > 0 && wordIdx === words.length) {
+        return out;
+      }
+    }
+  }
+
+  // Last resort: distribute evenly across the (decoded) audio timeline when no
+  // usable timestamps or phrase anchors are available.
   return chunks.map((chunkWords, idx) => {
     let startSeconds: number;
     let endSeconds: number;
 
-    if (hasUsableTimings) {
-      startSeconds = wordTimings[cursor].startSeconds;
-      endSeconds = wordTimings[cursor + chunkWords.length - 1].endSeconds;
-    } else if (totalDuration > 0) {
+    if (totalDuration > 0) {
       // Existing audio timing logic: distribute evenly across the timeline.
       const perWord = totalDuration / words.length;
       startSeconds = cursor * perWord;
@@ -140,12 +348,6 @@ export function buildMax3WordSegments(
     const text = chunkWords.join(' ');
     const { taggedText } = applyTaggingRule(text, 'CLEAR_SPEECH', segEnd - segStart);
 
-    const chunkTimeWordTimings = hasUsableTimings
-      ? wordTimings
-          .slice(cursor, cursor + chunkWords.length)
-          .map((w) => ({ word: w.text, startSeconds: w.startSeconds, endSeconds: w.endSeconds }))
-      : undefined;
-
     cursor += chunkWords.length;
 
     return {
@@ -158,29 +360,41 @@ export function buildMax3WordSegments(
       classification: 'CLEAR_SPEECH' as const,
       taggedText,
       confidence: 0.98,
-      wordTimings: chunkTimeWordTimings,
+      wordTimings: undefined,
     };
   });
 }
 
 /**
- * Audio-analysis classification used to emit real NOISE / SILENCE / MB tags in
- * the exported SRT, WITHOUT retranscribing and WITHOUT changing the Sarvam
- * speech text, word order, or timestamps.
+ * Audio-analysis classification used to emit real tags in the exported SRT,
+ * WITHOUT retranscribing and WITHOUT changing the Sarvam speech text, word
+ * order, or timestamps.
  *
  * The speech cues produced by max-3-word segmentation sit at real word times
- * (from Sarvam), leaving gaps where the actual audio has noise / silence. This
- * runs the existing VAD `detectSpeechRegions` on the exact uploaded audio and,
- * for every VAD non-speech region NOT already covered by a spoken-word cue:
- *   - noise region                 -> NOISE_ONLY    -> <NOISE></NOISE>
- *   - silence region (>= 2.00s)    -> SILENCE       -> <SIL></SIL>
- *   - speech region, no words      -> UNINTELLIGIBLE-> <MB></MB> (Rule F)
- * Spoken-word cues are kept CLEAR_SPEECH (plain text, never tagged NOISE/SIL),
- * so no invented tags and no normal word is ever marked as noise or silence.
+ * (from Sarvam). This runs the existing VAD `detectSpeechRegions` plus the
+ * ADDITIVE `detectBgmUnderVoiceIntervals` on the exact uploaded audio and
+ * classifies each spoken-word cue:
+ *   - cue overlaps a VAD noise region OR a BGM-under-voice interval (>= 0.5s)
+ *     -> SPEECH_WITH_NOISE -> <NOISE>spoken words</NOISE> (Rule B)
+ *   - otherwise             -> CLEAR_SPEECH -> plain text (Rule A)
+ *   - the FIRST spoken cue that starts AFTER the acoustic (VAD speech) onset —
+ *     i.e. an intro BGM/music-only head precedes the first Sarvam word anchor —
+ *     is split at the actual voice onset (see below).
  *
- * Never mutates an existing cue's text or timestamps; tags come entirely from
- * the existing applyTaggingRule (Rules A-F). If the audio cannot be analyzed,
- * the original speech cues are returned unchanged (no invented tags).
+ * Approved tagging rules (2026-09-27, rev 2):
+ *   A. clear voice only            -> plain text
+ *   B. voice + BGM/noise           -> <NOISE>spoken words</NOISE>
+ *   C. BGM/music/noise only        -> <NOISE></NOISE>
+ *   5. <SIL> must NOT be auto-generated
+ *   6. <MB> must NEVER be generated
+ * Intro split (rev 2): the BGM-only intro head is preserved as its OWN
+ * NOISE_ONLY cue exposing <NOISE></NOISE> (Rule C), and the spoken cue starts
+ * at the first Sarvam word anchor (the actual voice onset) wrapping its real
+ * words (Rule B) or staying plain (Rule A). The head is NEVER trimmed away;
+ * mid-track BGM-only gaps with no spoken cue over them still produce no
+ * subtitle. No cue text is mutated and no VAD threshold or Sarvam timestamp is
+ * changed. If the audio cannot be analyzed, the original cues are returned
+ * unchanged (no invented tags).
  */
 export async function applyAudioAnalysisTags(
   audioBuffer: Buffer,
@@ -217,158 +431,86 @@ export async function applyAudioAnalysisTags(
     return sortSegments(speechSegments);
   }
 
-  const duration = Math.max(durationSeconds, parsed.duration);
-
-  // BGM/noise intervals detected on the exact uploaded audio. A spoken-word cue
-  // whose span overlaps one of these has BGM/noise playing underneath its
-  // speech -> classify it SPEECH_WITH_NOISE so the exported SRT wraps the real
-  // words as <NOISE>words</NOISE> (Rule B), never plain text and never <MB>.
+  // BGM/noise intervals detected on the exact uploaded audio, from two sources:
+  //   1) VAD 'noise' regions (music-only swells, noise crests, audible backdrop
+  //      loud enough to be non-speech),
+  //   2) ADDITIVE BGM-under-voice intervals (`detectBgmUnderVoiceIntervals`):
+  //      backdrop music hidden inside VAD 'speech' windows because it sits
+  //      below voiceFloor.
   const noiseIntervals = regions
     .filter((r) => r.type === 'noise')
     .map((r) => ({ start: r.start, end: r.end }));
-  const overlapsNoise = (start: number, end: number): boolean => {
+  const bgmIntervals =
+    parsed && parsed.duration > 0
+      ? detectBgmUnderVoiceIntervals(parsed.mono, parsed.sampleRate)
+      : [];
+  const overlapsSource = (start: number, end: number): boolean => {
     for (const n of noiseIntervals) {
+      if (Math.min(end, n.end) - Math.max(start, n.start) >= 0.5) return true;
+    }
+    for (const n of bgmIntervals) {
       if (Math.min(end, n.end) - Math.max(start, n.start) >= 0.5) return true;
     }
     return false;
   };
+  // A spoken-word cue overlapping BGM/noise underneath its speech (>= 0.5s) is
+  // SPEECH_WITH_NOISE so the exported SRT wraps the real words as
+  // <NOISE>words</NOISE> (Rule B); otherwise it stays CLEAR_SPEECH (plain text,
+  // Rule A). Text and timestamps are never touched.
   const classifiedSpeech = speechSegments.map((s) =>
-    overlapsNoise(s.startSeconds, s.endSeconds)
+    overlapsSource(s.startSeconds, s.endSeconds)
       ? { ...s, classification: 'SPEECH_WITH_NOISE' as const }
       : s
   );
 
-  // Coverage = union of existing speech-cue spans (real spoken words).
-  const coverage = speechSegments.map((s) => ({ start: s.startSeconds, end: s.endSeconds }));
-  const coveredBy = (start: number, end: number): number => {
-    let best = 0;
-    for (const c of coverage) {
-      const s = Math.max(start, c.start);
-      const e = Math.min(end, c.end);
-      if (e > s) best = Math.max(best, (e - s) / (end - start));
-    }
-    return best;
-  };
+  // Refresh each cue's taggedText from its (possibly updated) classification so
+  // the UI's Tagged Output Preview and active-cue display match the exported
+  // SRT. Classification and text are never changed here; only taggedText is
+  // recomputed via the exact same applyTaggingRule used by generateSrtContent.
+  const withTaggedText = classifiedSpeech.map((s) => ({
+    ...s,
+    taggedText: applyTaggingRule(
+      s.text,
+      s.classification,
+      s.endSeconds - s.startSeconds
+    ).taggedText,
+  }));
 
-  const nonSpeech: Array<{
-    start: number;
-    end: number;
-    classification: SubtitleSegment['classification'];
-  }> = [];
-
-  for (const r of regions) {
-    if (r.end - r.start < 0.5) continue;
-    if (r.end > duration + 0.05) continue;
-    const covered = coveredBy(r.start, r.end);
-    if (covered >= 0.4) continue;
-
-    if (r.type === 'noise') {
-      nonSpeech.push({ start: r.start, end: r.end, classification: 'NOISE_ONLY' });
-    } else if (r.type === 'silence' && r.end - r.start >= 2.0) {
-      nonSpeech.push({ start: r.start, end: r.end, classification: 'SILENCE' });
-    } else if (r.type === 'speech') {
-      // Speech heard by VAD but with no transcribed words -> Rule F <MB></MB>.
-      if (r.end - r.start >= 0.8) {
-        nonSpeech.push({ start: r.start, end: r.end, classification: 'UNINTELLIGIBLE_SPEECH' });
-      }
-    }
-  }
-
-  if (nonSpeech.length === 0) {
-    return sortSegments(classifiedSpeech);
-  }
-
-  // Resolve the timeline: speech cues keep their exact spans; non-speech cues
-  // are clipped against EVERY speech cue so a tag never sits on a real spoken
-  // word, then contiguous same-type non-speech cues are merged.
-  const speechSpans = classifiedSpeech
-    .slice()
-    .sort((a, b) => a.startSeconds - b.startSeconds || a.endSeconds - b.endSeconds)
-    .map((s) => ({
-      start: s.startSeconds,
-      end: s.endSeconds,
-      classification: s.classification,
-      text: s.text,
-      // Keep the real word-level timings so the max-3-word re-split downstream
-      // (generateSrtContent / enforceMaxWordsPerSegment) uses exact word times
-      // instead of subdividing the segment span.
-      wordTimings: s.wordTimings,
-    }));
-
-  const nonSpeechSpans = nonSpeech.slice().sort((a, b) => a.start - b.start || a.end - b.end);
-
-  const resolved: typeof speechSpans = [];
-
-  // 1) Place all speech cues first.
-  for (const sp of speechSpans) resolved.push({ ...sp });
-
-  // 2) Clip + insert non-speech cues, then merge contiguous same-type ones.
-  for (const n of nonSpeechSpans) {
-    let start = n.start;
-    let end = n.end;
-    // Clip against every speech cue.
-    for (const sp of speechSpans) {
-      if (sp.text.trim().length === 0) continue;
-      if (sp.end > start && sp.start < end) {
-        // Overlap < 0.3s is ignored; larger overlap clips the non-speech span.
-        const overlap = Math.min(end, sp.end) - Math.max(start, sp.start);
-        if (overlap >= 0.3) {
-          if (sp.start <= start) {
-            start = sp.end;
-          } else {
-            // Speech cue in the middle: keep leading free part, resume after.
-            if (sp.start - start >= 0.3) {
-              resolved.push({ start, end: sp.start, classification: n.classification, text: '', wordTimings: undefined });
-            }
-            start = sp.end;
-          }
-          if (start >= end) break;
-        }
-      }
-    }
-    if (end - start >= 0.3) {
-      resolved.push({ start, end, classification: n.classification, text: '', wordTimings: undefined });
+  // Intro split (Rule C, rev 2): if the first spoken cue starts AFTER the
+  // acoustic onset of the voice (VAD speech) region, the audio before its
+  // first word anchor is a BGM/music-only head. Instead of folding that head
+  // into the spoken cue, split the cue at the actual voice onset: the head
+  // becomes its own NOISE_ONLY cue emitting exactly <NOISE></NOISE> (the cue
+  // is NOT trimmed away), and the spoken cue keeps its Sarvam-anchored start
+  // (voice onset) with the real words wrapped per Rule B/A. No VAD threshold
+  // or Sarvam timestamp is changed and no cue text is mutated.
+  const MIN_BGM_ONLY_HEAD_SECONDS = 0.05;
+  let emitted = withTaggedText;
+  const firstSpeechStart = regions.reduce(
+    (m, r) => (r.type === 'speech' && r.start < m ? r.start : m),
+    Infinity
+  );
+  if (Number.isFinite(firstSpeechStart)) {
+    const firstCue = withTaggedText.reduce((a, b) =>
+      b.startSeconds < a.startSeconds ? b : a
+    );
+    const headEnd = firstCue.startSeconds;
+    if (headEnd - firstSpeechStart >= MIN_BGM_ONLY_HEAD_SECONDS) {
+      const head: SubtitleSegment = {
+        id: 0,
+        startSeconds: Number(firstSpeechStart.toFixed(3)),
+        endSeconds: headEnd,
+        startTimeFormatted: formatSrtTimestamp(firstSpeechStart),
+        endTimeFormatted: formatSrtTimestamp(headEnd),
+        text: '',
+        classification: 'NOISE_ONLY',
+        taggedText: '<NOISE></NOISE>',
+        confidence: 0.98,
+      };
+      emitted = [head, ...emitted];
     }
   }
-
-  // 3) Sort and merge contiguous same-type non-speech cues.
-  resolved.sort((a, b) => a.start - b.start || a.end - b.end);
-  const merged: typeof resolved = [];
-  for (const a of resolved) {
-    const last = merged[merged.length - 1];
-    const isNonSpeechA = a.text.trim().length === 0;
-    const isNonSpeechLast = last && last.text.trim().length === 0;
-    if (
-      last &&
-      isNonSpeechA &&
-      isNonSpeechLast &&
-      last.classification === a.classification &&
-      a.start <= last.end + 0.001
-    ) {
-      last.end = Math.max(last.end, a.end);
-    } else {
-      merged.push({ ...a });
-    }
-  }
-
-  const finalSegments: SubtitleSegment[] = merged.map((a, idx) => {
-    const duration = a.end - a.start;
-    const { taggedText } = applyTaggingRule(a.text, a.classification, duration);
-    return {
-      id: idx + 1,
-      startSeconds: Number(a.start.toFixed(3)),
-      endSeconds: Number(a.end.toFixed(3)),
-      startTimeFormatted: formatSrtTimestamp(a.start),
-      endTimeFormatted: formatSrtTimestamp(a.end),
-      text: a.text,
-      classification: a.classification,
-      taggedText,
-      confidence: 0.95,
-      ...(a.wordTimings && a.wordTimings.length > 0 ? { wordTimings: a.wordTimings } : {}),
-    };
-  });
-
-  return finalSegments;
+  return sortSegments(emitted);
 }
 
 /**
@@ -385,13 +527,24 @@ export const runJobPipeline: RunPipeline = async ({
   fileDurationSeconds,
 }) => {
   const rawTranscript = providerResult.transcript.trim();
+
+  // Real wall-clock duration of the uploaded audio (local ffmpeg decode),
+  // used instead of the provider-reported duration so queued jobs match the
+  // synchronous route and subtitle timing spans the actual audio.
+  const decodedAudioDuration = await measureAudioDurationSeconds(audioBuffer, mimeType || 'audio/wav');
   const durationForSrt =
-    provider === 'sarvam' && providerResult.durationSeconds > 0
-      ? providerResult.durationSeconds
-      : fileDurationSeconds || 0;
+    decodedAudioDuration > 0
+      ? decodedAudioDuration
+      : provider === 'sarvam' && providerResult.durationSeconds > 0
+        ? providerResult.durationSeconds
+        : fileDurationSeconds || 0;
+  const durScaling =
+    decodedAudioDuration > 0 && provider === 'sarvam' && providerResult.durationSeconds > 0
+      ? decodedAudioDuration / providerResult.durationSeconds
+      : 1;
   const wordTimings = provider === 'sarvam' ? providerResult.wordTimings : [];
   let segments: SubtitleSegment[] =
-    rawTranscript.length > 0 ? buildMax3WordSegments(rawTranscript, durationForSrt, wordTimings) : [];
+    rawTranscript.length > 0 ? buildMax3WordSegments(rawTranscript, durationForSrt, wordTimings, durScaling) : [];
   segments = await applyAudioAnalysisTags(audioBuffer, mimeType, segments, durationForSrt);
   const voiceRegions = await computeSpeechRegions(audioBuffer, mimeType || 'audio/wav');
   segments = alignSegmentsToSpeechRegions(segments, voiceRegions);
@@ -556,6 +709,39 @@ async function startServer() {
 
       console.log(`  language(request): ${requestedLanguage} -> ${languageCode} (${languageName})`);
 
+      // ------------------------------------------------------------------
+      // FREE-TRIAL USAGE LIMIT (server-side enforcement).
+      //   - A valid `x-user-token` resolves to a server-verified user identity.
+      //     The counter increments ONLY after a successful pipeline run below,
+      //     so failed uploads / API errors never consume a trial, and it lives
+      //     on the persisted user record so a browser refresh cannot reset it.
+      //   - UNLIMITED (operator/ADMIN) accounts and anonymous legacy callers
+      //     keep the pre-existing unrestricted behaviour.
+      // ------------------------------------------------------------------
+      const rawToken = extractToken(req);
+      let sessionUser: UserRecord | null = null;
+      if (rawToken) {
+        if (!isValidTokenShape(rawToken)) {
+          return res.status(401).json({ error: 'Missing or invalid bearer token. Create a session via POST /api/session.' });
+        }
+        const identity = users.getByToken(hashToken(rawToken));
+        if (!identity) {
+          return res.status(401).json({ error: 'Unknown or expired session. Create a session via POST /api/session.' });
+        }
+        sessionUser = identity;
+        users.touch(identity.id);
+      }
+      const freeTrialsUsed = freeTrialsUsedFor(sessionUser);
+      if (!isFreeTrialExempt(sessionUser) && isFreeTrialExhausted(freeTrialsUsed, config.freeTrialLimit)) {
+        nestedLog.info('free trial blocked', { userId: sessionUser?.id, used: freeTrialsUsed, limit: config.freeTrialLimit });
+        return res.status(403).json({
+          error: freeTrialBlockMessage(config.freeTrialLimit),
+          code: FREE_TRIAL_EXHAUSTED_CODE,
+          freeTrialsUsed,
+          freeTrialLimit: config.freeTrialLimit,
+        });
+      }
+
       const audioBuffer = Buffer.from(audioBase64, 'base64');
       const fileSizeBytes = audioBuffer.length;
       const sha256 = createHash('sha256').update(audioBuffer).digest('hex');
@@ -597,17 +783,29 @@ async function startServer() {
       // RAW transcription of the EXACT uploaded audio. We do NOT use any
       // canonical / cached / old / temp SRT, we do NOT apply spelling correction.
       const rawTranscript = rawText.text.trim();
+
+      // Real wall-clock duration of the uploaded audio (local ffmpeg decode),
+      // used instead of the provider-reported duration so subtitle timing spans
+      // the actual audio instead of running ahead.
+      const decodedAudioDuration = await measureAudioDurationSeconds(audioBuffer, mimeType);
       const durationForSrt =
-        provider === 'sarvam' && rawText.duration && rawText.duration > 0
-          ? rawText.duration
-          : fileDuration || 0;
+        decodedAudioDuration > 0
+          ? decodedAudioDuration
+          : provider === 'sarvam' && rawText.duration && rawText.duration > 0
+            ? rawText.duration
+            : fileDuration || 0;
+      const durScaling =
+        decodedAudioDuration > 0 && provider === 'sarvam' && rawText.duration > 0
+          ? decodedAudioDuration / rawText.duration
+          : 1;
 
       // Subtitle segmentation: split the RAW transcript into subtitles with a
       // strict maximum of 3 words each, preserving every spoken word in exact
       // order (no loss, no duplication, no invented words). Timing comes from
-      // Sarvam word timestamps when available, else the existing even
-      // distribution across the audio timeline. Tagging stays CLEAR_SPEECH
-      // (Rule A), untouched.
+      // Sarvam word timestamps when available (1:1), else from Sarvam
+      // phrase/segment anchors (words mapped to phrases by index, phrase gaps
+      // preserved), else the existing even distribution across the DECODED
+      // audio timeline. Tagging stays CLEAR_SPEECH (Rule A), untouched.
       const sarvamWordTimings =
         provider === 'sarvam'
           ? ((rawText.meta as any)?.chunks as Array<{
@@ -617,9 +815,14 @@ async function startServer() {
             }>) || []
           : [];
 
+      console.log(
+        `  [TIMING] decodedWav=${decodedAudioDuration.toFixed(3)}s sarvamDuration=${(rawText.duration || 0).toFixed(3)}s ` +
+          `providerChunks=${(provider === 'sarvam' ? ((rawText.meta as any)?.chunks || []).length : 0)} words=${rawTranscript.split(/\s+/).filter(Boolean).length}`
+      );
+
       let segments: SubtitleSegment[] =
         rawTranscript.length > 0
-          ? buildMax3WordSegments(rawTranscript, durationForSrt, sarvamWordTimings)
+          ? buildMax3WordSegments(rawTranscript, durationForSrt, sarvamWordTimings, durScaling)
           : [];
 
       // TAGGING: classify the timeline against the ACTUAL audio via the existing
@@ -740,6 +943,26 @@ async function startServer() {
         audioDiagnostics.rawText = g.rawText;
       }
 
+      // Free-trial accounting: this pipeline run succeeded -> consume one trial
+      // (server-side, persisted). Anonymous / UNLIMITED callers are never counted.
+      const usage: {
+        freeTrialsUsed: number;
+        freeTrialLimit: number;
+        freeTrialsRemaining: number;
+      } = {
+        freeTrialsUsed,
+        freeTrialLimit: config.freeTrialLimit,
+        freeTrialsRemaining: freeTrialsRemaining(freeTrialsUsed, config.freeTrialLimit),
+      };
+      if (sessionUser && !isFreeTrialExempt(sessionUser)) {
+        const incremented = users.incrementFreeTrialsUsed(sessionUser.id);
+        if (incremented !== null) {
+          usage.freeTrialsUsed = incremented;
+          usage.freeTrialsRemaining = freeTrialsRemaining(incremented, config.freeTrialLimit);
+          nestedLog.info('free trial used', { userId: sessionUser.id, used: incremented, limit: config.freeTrialLimit });
+        }
+      }
+
       return res.json({
         detectedLanguage: languageName,
         isOdia: languageCode === 'od-IN',
@@ -752,6 +975,7 @@ async function startServer() {
         segments,
         rawSrt: generateSrtContent(segments),
         stats: calculateTranscriptionStats(segments),
+        usage,
         notes: [
           provider === 'sarvam'
             ? `Sarvam Saaras (saaras:v4, ${languageCode}, verbatim) transcription of the exact uploaded audio. Subtitles split to max 3 words each and classified against the actual audio (NOISE/SILENCE/MB) so the exported SRT contains real tags. No spelling correction, no canonical/old SRT fallback.`
@@ -858,6 +1082,7 @@ async function startServer() {
       const token = issueToken();
       users.addToken(userId, hashToken(token));
       const user = users.getById(userId);
+      const freeTrialsUsed = freeTrialsUsedFor(user);
       res.json({
         userId,
         token,
@@ -865,6 +1090,9 @@ async function startServer() {
         role: user?.role ?? 'USER',
         creditMode: user?.creditMode ?? 'NORMAL',
         unlimited: (user?.creditMode ?? 'NORMAL') === 'UNLIMITED',
+        freeTrialsUsed,
+        freeTrialLimit: config.freeTrialLimit,
+        freeTrialsRemaining: freeTrialsRemaining(freeTrialsUsed, config.freeTrialLimit),
         provider: getAsrProviderName(),
         createdAt: user?.createdAt,
       });

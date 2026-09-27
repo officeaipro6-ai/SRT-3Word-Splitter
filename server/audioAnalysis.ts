@@ -393,6 +393,117 @@ export function detectSpeechRegions(mono: Float32Array, sampleRate: number): Spe
 }
 
 /**
+ * ADDITIVE BGM-under-voice interval detection (approved 2026-09-27).
+ *
+ * Independent of detectSpeechRegions: it never modifies the VAD or its
+ * thresholds. The VAD labels a frame "speech" when voice-level energy
+ * dominates, so background music that plays UNDER the narrator's voice leaves
+ * no separate "noise" region for the tagger to see; spoken-word cues over such
+ * BGM were therefore emitted as plain text. This detector scans the exact
+ * uploaded audio for intervals where an audible, steady backdrop (music bed)
+ * coexists with voice-level frames.
+ *
+ * Calibrated constants (measured on the real audio):
+ *  - the true-silence tail peaks at ~0.012 RMS (see TRUE_SILENCE_PEAK), so a
+ *    backdrop band floor of 0.015 marks "audible, above digital quiet";
+ *  - the audible backdrop sits at ~0.02-0.05 RMS while the narrator's voice
+ *    sits at ~0.09-0.18, so the band ceiling 0.055 keeps backdrop frames
+ *    firmly below voice level (the VAD voiceFloor is ~0.05, unchanged);
+ *  - periodic music has low zero-crossing rate (~0.03-0.1), unlike fan/static
+ *    noise and clicks, so backdrop frames are gated by a ZCR band.
+ *
+ * A ~0.5s window is flagged "BGM-under-voice" when it contains voice-level
+ * frames AND a persistent low-ZCR backdrop present in BOTH halves. Flagged
+ * windows are merged into runs; runs shorter than 0.5s are dropped so the
+ * caller's unified overlap rule (>= 0.5s) applies. Returns [] when the signal
+ * is unanalyzable. No tag text or timestamp is produced here.
+ */
+export function detectBgmUnderVoiceIntervals(
+  mono: Float32Array,
+  sampleRate: number
+): Array<{ start: number; end: number }> {
+  const frameMs = 25;
+  const frameSize = Math.max(1, Math.round((sampleRate * frameMs) / 1000));
+  const numFrames = Math.floor(mono.length / frameSize);
+  if (numFrames < 3) return [];
+
+  const rms = new Float32Array(numFrames);
+  const zcr = new Float32Array(numFrames);
+  for (let f = 0; f < numFrames; f++) {
+    const off = f * frameSize;
+    let sum = 0;
+    let crossings = 0;
+    let prev = mono[off];
+    for (let i = 0; i < frameSize; i++) {
+      const v = mono[off + i];
+      sum += v * v;
+      if (i > 0 && ((prev >= 0 && v < 0) || (prev < 0 && v >= 0))) crossings++;
+      prev = v;
+    }
+    rms[f] = Math.sqrt(sum / frameSize);
+    zcr[f] = crossings / frameSize;
+  }
+
+  // Backdrop-energy band and ZCR gate (calibrated, additive; VAD unchanged).
+  const BACKDROP_MIN_RMS = 0.015;
+  const BACKDROP_MAX_RMS = 0.055;
+  const VOICE_MIN_RMS = 0.05; // mirrors VAD voiceFloor (unchanged)
+  const BACKDROP_ZCR_MIN = 0.005;
+  const BACKDROP_ZCR_MAX = 0.35;
+
+  const winFrames = Math.max(4, Math.round(0.5 / (frameMs / 1000))); // ~0.5s
+  const stepFrames = Math.max(2, Math.round(0.25 / (frameMs / 1000))); // ~0.25s
+
+  const active = new Array<boolean>(numFrames).fill(false);
+  for (let w0 = 0; w0 + winFrames <= numFrames; w0 += stepFrames) {
+    const w1 = Math.min(numFrames, w0 + winFrames);
+    const n = w1 - w0;
+    const halfN = Math.floor(n / 2);
+    let voiceCount = 0;
+    let backCount = 0;
+    const backHalf = [0, 0];
+    for (let f = w0; f < w1; f++) {
+      if (rms[f] >= VOICE_MIN_RMS) voiceCount++;
+      if (
+        rms[f] >= BACKDROP_MIN_RMS &&
+        rms[f] < BACKDROP_MAX_RMS &&
+        zcr[f] >= BACKDROP_ZCR_MIN &&
+        zcr[f] <= BACKDROP_ZCR_MAX
+      ) {
+        backCount++;
+        if (f < w0 + halfN) backHalf[0]++;
+        else backHalf[1]++;
+      }
+    }
+    const minBack = Math.max(1, Math.round(n * 0.2));
+    const minVoice = Math.max(1, Math.round(n * 0.05));
+    if (
+      backCount >= minBack &&
+      voiceCount >= minVoice &&
+      backHalf[0] >= Math.max(1, Math.round(halfN * 0.1)) &&
+      backHalf[1] >= Math.max(1, Math.round(halfN * 0.1))
+    ) {
+      for (let f = w0; f < w1; f++) active[f] = true;
+    }
+  }
+
+  // Merge flagged windows into contiguous runs; drop runs under 0.5s.
+  const runs: Array<{ start: number; end: number }> = [];
+  let runStart = -1;
+  for (let f = 0; f <= numFrames; f++) {
+    const on = f < numFrames && active[f];
+    if (on && runStart < 0) runStart = f;
+    if (!on && runStart >= 0) {
+      const secStart = runStart * (frameMs / 1000);
+      const secEnd = f * (frameMs / 1000);
+      if (secEnd - secStart >= 0.5) runs.push({ start: secStart, end: secEnd });
+      runStart = -1;
+    }
+  }
+  return runs;
+}
+
+/**
  * Return the region type at an absolute time, or null if the time falls in a
  * gap (should not normally happen because regions are contiguous).
  */
