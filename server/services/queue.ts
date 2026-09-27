@@ -23,6 +23,11 @@ import {
 } from '../providers/types';
 import { type StorageProvider, srtKey } from './storage';
 import { type CreditService } from './creditService';
+import {
+  ProviderSpendingError,
+  assertProviderSpendingAllowed,
+  reportProviderQuotaExhausted,
+} from './providerSafety';
 
 export interface RunPipelineInput {
   audioBuffer: Buffer;
@@ -158,6 +163,11 @@ export class JobQueue {
   }
 
   private async processOne(job: JobRecord): Promise<RunPipelineResult> {
+    // Hard provider-spending protection: checked IMMEDIATELY before calling the
+    // provider so a job can never start an API call while the kill-switch is on
+    // or the provider is quarantined after exhausting its quota. Applies to
+    // every job, including jobs owned by ADMIN/UNLIMITED accounts.
+    assertProviderSpendingAllowed();
     const provider = this.getProvider(job.provider);
     const audioBuffer = await this.storage.get(job.input.storageKey);
     if (!audioBuffer) {
@@ -178,8 +188,19 @@ export class JobQueue {
   private async handleFailure(job: JobRecord, err: unknown): Promise<void> {
     const now = new Date().toISOString();
     const message = String((err as Error)?.message || err || 'Unknown error');
+    const lower = message.toLowerCase();
     const isProviderMissing = err instanceof ProviderNotConfiguredError;
-    const transient = isTransientError(err);
+    // Spending-protection blocks are TERMINAL: no retry loop may hammer the
+    // provider while the kill-switch is on or the quota is exhausted.
+    const isSpendingBlocked = err instanceof ProviderSpendingError;
+    // Provider reported exhausted quota ("no credits available" / 402): put the
+    // provider in quarantine so no further job starts until the operator
+    // recharges. No auto-retry, no auto-buy.
+    if (/402|insufficient_quota|no credits available/.test(lower)) {
+      reportProviderQuotaExhausted();
+      nestedLog.warn('provider quota exhausted — processing quarantined', { jobId: job.id, userId: job.userId });
+    }
+    const transient = !isSpendingBlocked && isTransientError(err);
 
     // Auto-retry transient failures (network/503) up to the configured cap.
     if (transient && job.retryCount < config.maxJobRetries) {
@@ -200,17 +221,24 @@ export class JobQueue {
     // Terminal failure: refund the charge so the user is never billed for a
     // job that did not produce an SRT.
     this.credits.refundFinishedJob(job.userId, job.id, 'refund_failed_job');
+    const errorCode = isProviderMissing
+      ? 'PROVIDER_NOT_CONFIGURED'
+      : isSpendingBlocked
+        ? 'PROVIDER_UNAVAILABLE'
+        : transient
+          ? 'TRANSIENT'
+          : 'TRANSCRIPTION_FAILED';
     this.repo.update(job.id, {
       status: 'FAILED',
       completedAt: now,
       lastError: message.slice(0, 2000),
-      errorCode: isProviderMissing ? 'PROVIDER_NOT_CONFIGURED' : transient ? 'TRANSIENT' : 'TRANSCRIPTION_FAILED',
+      errorCode,
       nextRetryAt: undefined,
     });
     nestedLog.error('job failed', {
       jobId: job.id,
       userId: job.userId,
-      errorCode: isProviderMissing ? 'PROVIDER_NOT_CONFIGURED' : transient ? 'TRANSIENT' : 'TRANSCRIPTION_FAILED',
+      errorCode,
     });
   }
 }

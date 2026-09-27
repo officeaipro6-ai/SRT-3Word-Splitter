@@ -26,7 +26,13 @@ export type CreditTransactionType =
   | 'DEBIT'
   | 'REFUND'
   | 'ADMIN_GRANT'
-  | 'ADMIN_DEBIT';
+  | 'ADMIN_DEBIT'
+  | 'FREE_TRIAL'
+  | 'PURCHASE'
+  | 'RESERVATION'
+  | 'USAGE'
+  | 'RELEASE'
+  | 'ADMIN_ADJUSTMENT';
 
 export interface UserRecord {
   id: string;

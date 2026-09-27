@@ -14,7 +14,8 @@ import { RuleComplianceAudit } from './components/RuleComplianceAudit';
 import { ExportToolbar } from './components/ExportToolbar';
 import { RulesGuideModal } from './components/RulesGuideModal';
 import { CreditsWidget } from './components/CreditsWidget';
-import { ensureSession } from './lib/sessionClient';
+import { ensureSession, type SessionInfo } from './lib/sessionClient';
+import { CreditPacksPanel } from './components/CreditPacksPanel';
 import { LanguageSelector } from './components/LanguageSelector';
 import { LandingPage } from './components/LandingPage';
 import { ResultSummary } from './components/ResultSummary';
@@ -79,11 +80,20 @@ export default function App() {
   // localStorage survives page refreshes, so the count cannot be reset).
   const [freeTrial, setFreeTrial] = useState<{ used: number; limit: number; remaining: number } | null>(null);
 
+  // Server-authoritative wallet (credits are NEVER read from the client; the
+  // server response after a run is the only thing that updates this).
+  const [wallet, setWallet] = useState<{ credits: number; unlimited: boolean } | null>(null);
+
+  const syncSession = (s: SessionInfo) => {
+    setFreeTrial({ used: s.freeTrialsUsed, limit: s.freeTrialLimit, remaining: s.freeTrialsRemaining });
+    setWallet({ credits: s.credits, unlimited: s.unlimited });
+  };
+
   useEffect(() => {
     let active = true;
     ensureSession()
       .then((s) => {
-        if (active) setFreeTrial({ used: s.freeTrialsUsed, limit: s.freeTrialLimit, remaining: s.freeTrialsRemaining });
+        if (active) syncSession(s);
       })
       .catch(() => {});
     return () => {
@@ -194,7 +204,7 @@ export default function App() {
       try {
         const session = await ensureSession();
         sessionToken = session.token;
-        setFreeTrial({ used: session.freeTrialsUsed, limit: session.freeTrialLimit, remaining: session.freeTrialsRemaining });
+        syncSession(session);
       } catch {
         // session unavailable — the pipeline call below surfaces the real error
       }
@@ -293,12 +303,17 @@ export default function App() {
       setTranscriptionResult(result);
       setSegments(result.segments);
       setServerDiag(result.audioDiagnostics || null);
-      // Refresh server-side free-trial usage after a successful run.
+      // Refresh server-side free-trial usage + wallet after a successful run.
       try {
-        const s = await ensureSession();
-        setFreeTrial({ used: s.freeTrialsUsed, limit: s.freeTrialLimit, remaining: s.freeTrialsRemaining });
+        syncSession(await ensureSession());
       } catch {
         /* non-critical */
+      }
+      if ((result as any).wallet) {
+        setWallet({
+          credits: (result as any).wallet.credits,
+          unlimited: Boolean((result as any).wallet.unlimited),
+        });
       }
       if (result.audioDiagnostics) {
         addLog(
@@ -505,6 +520,11 @@ export default function App() {
                 value={selectedLanguage}
                 onChange={setSelectedLanguage}
                 disabled={isProcessing}
+              />
+              <CreditPacksPanel
+                wallet={wallet}
+                freeTrialsRemaining={freeTrial ? freeTrial.remaining : null}
+                freeTrialLimit={freeTrial ? freeTrial.limit : 0}
               />
               <FileUpload
                 onFileSelected={(info) => setSelectedMedia(info)}

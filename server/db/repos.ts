@@ -149,19 +149,36 @@ export class CreditRepo {
   }
 
   debitForJob(userId: string, jobId: string): CreditTransactionRecord | null {
+    return this.forJobAndType(userId, jobId, 'DEBIT');
+  }
+
+  refundForJob(userId: string, jobId: string): CreditTransactionRecord | null {
+    return this.forJobAndType(userId, jobId, 'REFUND');
+  }
+
+  /** Generic lookup of the first transaction of `type` for a user+job. */
+  forJobAndType(
+    userId: string,
+    jobId: string,
+    type: CreditTransactionRecord['type']
+  ): CreditTransactionRecord | null {
     return (
       this.store.snapshot().transactions.find(
-        (t) => t.userId === userId && t.jobId === jobId && t.type === 'DEBIT'
+        (t) => t.userId === userId && t.jobId === jobId && t.type === type
       ) ?? null
     );
   }
 
-  refundForJob(userId: string, jobId: string): CreditTransactionRecord | null {
-    return (
-      this.store.snapshot().transactions.find(
-        (t) => t.userId === userId && t.jobId === jobId && t.type === 'REFUND'
-      ) ?? null
-    );
+  reservationForJob(userId: string, jobId: string): CreditTransactionRecord | null {
+    return this.forJobAndType(userId, jobId, 'RESERVATION');
+  }
+
+  usageForJob(userId: string, jobId: string): CreditTransactionRecord | null {
+    return this.forJobAndType(userId, jobId, 'USAGE');
+  }
+
+  releaseForJob(userId: string, jobId: string): CreditTransactionRecord | null {
+    return this.forJobAndType(userId, jobId, 'RELEASE');
   }
 
   listForUser(userId: string, limit = 50): CreditTransactionRecord[] {
@@ -193,7 +210,7 @@ export class CreditRepo {
     return txn ? structuredClone(txn) : null;
   }
 
-  /** Net granted credits (ADMIN_GRANT + initial CREDIT grants, positive). */
+  /** Net granted credits (ADMIN_GRANT + PURCHASE + initial CREDIT grants, positive). */
   sumGrants(userId: string): number {
     return this.store
       .snapshot()
@@ -201,16 +218,19 @@ export class CreditRepo {
         (t) =>
           t.userId === userId &&
           (t.type === 'ADMIN_GRANT' ||
+            t.type === 'PURCHASE' ||
             (t.type === 'CREDIT' && (t.reason === 'initial_grant' || t.reason === 'purchase')))
       )
       .reduce((sum, t) => sum + t.amount, 0);
   }
 
-  /** Net consumed credits (DEBIT + ADMIN_DEBIT, positive magnitude). */
+  /** Net consumed credits (final USAGE + DEBIT + ADMIN_DEBIT, positive magnitude). */
   sumUsed(userId: string): number {
     return this.store
       .snapshot()
-      .transactions.filter((t) => t.userId === userId && (t.type === 'DEBIT' || t.type === 'ADMIN_DEBIT'))
+      .transactions.filter(
+        (t) => t.userId === userId && (t.type === 'DEBIT' || t.type === 'ADMIN_DEBIT' || t.type === 'USAGE')
+      )
       .reduce((sum, t) => sum + t.amount, 0);
   }
 }

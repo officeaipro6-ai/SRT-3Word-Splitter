@@ -180,6 +180,24 @@ export async function debitCredits(opts: {
   return (await res.json()).transaction;
 }
 
+export interface CreditPack {
+  id: string;
+  name: string;
+  priceInr: number;
+  credits: number;
+  glyph: string;
+  annual?: boolean;
+  blurb?: string;
+}
+
+/** Public credit pack catalog. Display-only: no purchase endpoint exists yet. */
+export async function fetchCreditPacks(): Promise<CreditPack[]> {
+  const res = await fetch('/api/credits/packs');
+  if (!res.ok) throw new Error(`Failed to load credit packs (${res.status}).`);
+  const data = await res.json();
+  return data.packs ?? [];
+}
+
 export function makeIdempotencyKey(): string {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
   return `${Date.now()}-${Math.random().toString(36).slice(2)}`;

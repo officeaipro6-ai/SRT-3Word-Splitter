@@ -66,13 +66,16 @@ import {
   ProviderNotConfiguredError,
 } from './server/providers/types';
 import {
-  FREE_TRIAL_EXHAUSTED_CODE,
-  freeTrialBlockMessage,
   freeTrialsRemaining,
   freeTrialsUsedFor,
-  isFreeTrialExempt,
-  isFreeTrialExhausted,
 } from './server/services/freeTrialPolicy';
+import { CREDIT_PACKS } from './server/services/creditPolicy';
+import {
+  providerSpendingState,
+  reportProviderQuotaExhausted,
+  ProviderSpendingError,
+} from './server/services/providerSafety';
+import { decideAudioSpend } from './server/services/audioSpendGate';
 
 dotenv.config();
 
@@ -641,12 +644,19 @@ async function startServer() {
       hasOlive: isOliveConfigured(),
       hasApiKey,
       hasFallback,
+      providerSpendingProtection: config.providerSpendingProtection,
+      providerSpendingBlocked: providerSpendingState().blocked,
       timestamp: new Date().toISOString(),
     });
   });
 
   // Primary AI processing endpoint (accepts multipart file or JSON with base64 audio)
   app.post('/api/process-audio', upload.single('mediaFile'), async (req, res) => {
+    // Set when a paid request reserves credits BEFORE the provider call. Always
+    // settled on success and released on ANY error, so a failed/over-quota job
+    // can never consume the user's credits (no double-spend, no charge for
+    // unused processing). Declared outside the try so the catch can release it.
+    let paidReservation: { userId: string; jobId: string; requiredCredits: number } | null = null;
     try {
       let audioBase64 = '';
       let mimeType = 'audio/wav';
@@ -710,13 +720,15 @@ async function startServer() {
       console.log(`  language(request): ${requestedLanguage} -> ${languageCode} (${languageName})`);
 
       // ------------------------------------------------------------------
-      // FREE-TRIAL USAGE LIMIT (server-side enforcement).
+      // IDENTITY + FREE-TRIAL USAGE LIMIT (server-side enforcement).
       //   - A valid `x-user-token` resolves to a server-verified user identity.
-      //     The counter increments ONLY after a successful pipeline run below,
-      //     so failed uploads / API errors never consume a trial, and it lives
-      //     on the persisted user record so a browser refresh cannot reset it.
-      //   - UNLIMITED (operator/ADMIN) accounts and anonymous legacy callers
-      //     keep the pre-existing unrestricted behaviour.
+      //     The trial counter increments ONLY after a successful pipeline run
+      //     below, so failed uploads / API errors never consume a trial.
+      //   - Anonymous legacy callers keep the pre-existing unrestricted
+      //     behaviour (documented known limitation); the hard provider spending
+      //     protection still applies to them below.
+      //   - The monetization credit gate runs AFTER the duration is measured and
+      //     BEFORE any provider call (see below).
       // ------------------------------------------------------------------
       const rawToken = extractToken(req);
       let sessionUser: UserRecord | null = null;
@@ -732,15 +744,6 @@ async function startServer() {
         users.touch(identity.id);
       }
       const freeTrialsUsed = freeTrialsUsedFor(sessionUser);
-      if (!isFreeTrialExempt(sessionUser) && isFreeTrialExhausted(freeTrialsUsed, config.freeTrialLimit)) {
-        nestedLog.info('free trial blocked', { userId: sessionUser?.id, used: freeTrialsUsed, limit: config.freeTrialLimit });
-        return res.status(403).json({
-          error: freeTrialBlockMessage(config.freeTrialLimit),
-          code: FREE_TRIAL_EXHAUSTED_CODE,
-          freeTrialsUsed,
-          freeTrialLimit: config.freeTrialLimit,
-        });
-      }
 
       const audioBuffer = Buffer.from(audioBase64, 'base64');
       const fileSizeBytes = audioBuffer.length;
@@ -755,6 +758,73 @@ async function startServer() {
       console.log(`  duration(client): ${fileDuration}s`);
       console.log(`  sha256       : ${sha256}`);
       console.log('==========================================================');
+
+      // ------------------------------------------------------------------
+      // CREDIT GATE (server-side monetization, enforced BEFORE any provider
+      // call). Product rules:
+      //   - 1 credit = 1 minute of the SERVER-MEASURED upload duration, rounded
+      //     UP: 0-60s -> 1, 61-120s -> 2, 121-180s -> 3, ... The client-supplied
+      //     duration (req.body.duration) is NEVER used for pricing.
+      //   - Exactly 2 successful free trials per NORMAL user (failures never
+      //     consume). FREE_TRIAL_LIMIT=0 keeps the legacy "cap off" meaning.
+      //   - After the trials, credit balance must cover the required credits,
+      //     else 402 NOT_ENOUGH_CREDITS BEFORE the provider is contacted.
+      //   - Hard provider-spending protection applies to EVERY caller (incl.
+      //     UNLIMITED/anonymous) and can block processing entirely with the
+      //     "Processing temporarily unavailable" message.
+      //   - Requests blocked here NEVER reach the provider and NEVER touch the
+      //     wallet (except a PAID request, which reserves the exact amount so a
+      //     concurrent request cannot double-spend the same credits).
+      // ------------------------------------------------------------------
+      const decodedAudioDuration = await measureAudioDurationSeconds(audioBuffer, mimeType);
+      const spendDecision = decideAudioSpend({
+        user: sessionUser
+          ? {
+              id: sessionUser.id,
+              creditMode: sessionUser.creditMode,
+              freeTrialsUsed,
+              credits: sessionUser.credits,
+            }
+          : null,
+        measuredDurationSeconds: decodedAudioDuration,
+        freeTrialLimit: config.freeTrialLimit,
+      });
+      if (!spendDecision.ok) {
+        nestedLog.info('audio spend gated', {
+          userId: sessionUser?.id,
+          kind: spendDecision.kind,
+          code: spendDecision.code,
+        });
+        const body: Record<string, unknown> = {
+          error: spendDecision.message,
+          code: spendDecision.code,
+          freeTrialsUsed,
+          freeTrialLimit: config.freeTrialLimit,
+          freeTrialsRemaining: freeTrialsRemaining(freeTrialsUsed, config.freeTrialLimit),
+        };
+        if (spendDecision.requiredCredits !== undefined) body.requiredCredits = spendDecision.requiredCredits;
+        if (spendDecision.balance !== undefined) body.balance = spendDecision.balance;
+        return res.status(spendDecision.status ?? 500).json(body);
+      }
+      if (spendDecision.kind === 'PAID' && sessionUser) {
+        const jobId = newId();
+        credits.reserveJob({
+          userId: sessionUser.id,
+          jobId,
+          amount: spendDecision.requiredCredits as number,
+          reason: 'reserve_transcription',
+        });
+        paidReservation = {
+          userId: sessionUser.id,
+          jobId,
+          requiredCredits: spendDecision.requiredCredits as number,
+        };
+        nestedLog.info('credits reserved', {
+          userId: sessionUser.id,
+          amount: paidReservation.requiredCredits,
+          jobId,
+        });
+      }
 
       // Choose the ACTIVE transcription provider.
       //   - Sarvam (default): designed for Indian languages; forces Odia od-IN,
@@ -784,10 +854,10 @@ async function startServer() {
       // canonical / cached / old / temp SRT, we do NOT apply spelling correction.
       const rawTranscript = rawText.text.trim();
 
-      // Real wall-clock duration of the uploaded audio (local ffmpeg decode),
-      // used instead of the provider-reported duration so subtitle timing spans
-      // the actual audio instead of running ahead.
-      const decodedAudioDuration = await measureAudioDurationSeconds(audioBuffer, mimeType);
+      // Subtitle timing spans the actual audio timeline. `decodedAudioDuration`
+      // is the server-measured wall-clock duration of the uploaded audio (local
+      // ffmpeg decode), already computed by the pre-provider credit gate above;
+      // it is reused here so the gate and the SRT timeline always agree.
       const durationForSrt =
         decodedAudioDuration > 0
           ? decodedAudioDuration
@@ -943,8 +1013,13 @@ async function startServer() {
         audioDiagnostics.rawText = g.rawText;
       }
 
-      // Free-trial accounting: this pipeline run succeeded -> consume one trial
-      // (server-side, persisted). Anonymous / UNLIMITED callers are never counted.
+      // Success accounting: this pipeline run succeeded.
+      //   - PAID requests: convert the pre-request credit reservation into final
+      //     USAGE (the exact reserved amount; balance already blocked above, so
+      //     there is no double-spend).
+      //   - FREE_TRIAL requests for NORMAL users: consume exactly one trial and
+      //     append a zero-amount FREE_TRIAL ledger entry (server-side, persisted,
+      //     so a refresh cannot reset it). Anonymous / UNLIMITED never counted.
       const usage: {
         freeTrialsUsed: number;
         freeTrialLimit: number;
@@ -954,14 +1029,40 @@ async function startServer() {
         freeTrialLimit: config.freeTrialLimit,
         freeTrialsRemaining: freeTrialsRemaining(freeTrialsUsed, config.freeTrialLimit),
       };
-      if (sessionUser && !isFreeTrialExempt(sessionUser)) {
+      if (paidReservation) {
+        credits.settleJobReservation(paidReservation.userId, paidReservation.jobId, 'usage_transcription');
+        nestedLog.info('paid credits used', {
+          userId: paidReservation.userId,
+          amount: paidReservation.requiredCredits,
+          jobId: paidReservation.jobId,
+        });
+      } else if (sessionUser && spendDecision.kind === 'FREE_TRIAL') {
         const incremented = users.incrementFreeTrialsUsed(sessionUser.id);
         if (incremented !== null) {
           usage.freeTrialsUsed = incremented;
           usage.freeTrialsRemaining = freeTrialsRemaining(incremented, config.freeTrialLimit);
+          creditsRepo.add({
+            userId: sessionUser.id,
+            amount: 0,
+            type: 'FREE_TRIAL',
+            reason: 'free_trial_transcription',
+            jobId: undefined,
+            balanceAfter: users.getById(sessionUser.id)?.credits ?? 0,
+          });
           nestedLog.info('free trial used', { userId: sessionUser.id, used: incremented, limit: config.freeTrialLimit });
         }
       }
+
+      // Server-maintained wallet snapshot (credit balances are NEVER read from
+      // the client). Missing when the caller is anonymous (no identity).
+      const wallet =
+        sessionUser === null
+          ? null
+          : {
+              credits: credits.getBalance(sessionUser.id),
+              creditMode: sessionUser.creditMode,
+              unlimited: sessionUser.creditMode === 'UNLIMITED',
+            };
 
       return res.json({
         detectedLanguage: languageName,
@@ -976,6 +1077,11 @@ async function startServer() {
         rawSrt: generateSrtContent(segments),
         stats: calculateTranscriptionStats(segments),
         usage,
+        wallet,
+        charge: {
+          kind: spendDecision.kind,
+          requiredCredits: spendDecision.requiredCredits ?? 0,
+        },
         notes: [
           provider === 'sarvam'
             ? `Sarvam Saaras (saaras:v4, ${languageCode}, verbatim) transcription of the exact uploaded audio. Subtitles split to max 3 words each and classified against the actual audio (NOISE/SILENCE/MB) so the exported SRT contains real tags. No spelling correction, no canonical/old SRT fallback.`
@@ -987,10 +1093,35 @@ async function startServer() {
       });
     } catch (error: any) {
       console.error('[Odia Pipeline Error]:', error);
+
+      // A reserved-but-unfinished paid job must NEVER consume credits: return
+      // the reserved amount to the wallet and record a RELEASE ledger entry.
+      if (paidReservation) {
+        try {
+          credits.releaseJobReservation(paidReservation.userId, paidReservation.jobId, 'release_failed_job');
+          nestedLog.info('reservation released', {
+            userId: paidReservation.userId,
+            jobId: paidReservation.jobId,
+            amount: paidReservation.requiredCredits,
+          });
+        } catch (releaseErr) {
+          // Never mask the original pipeline error with a release failure.
+          nestedLog.error('reservation release failed', { userId: paidReservation.userId, error: String(releaseErr) });
+        }
+      }
+
       const rawMessage = error?.message || '';
       const lower = rawMessage.toLowerCase();
       const isRateLimited = lower.includes('429') || lower.includes('rate limit') || lower.includes('too many requests') || lower.includes('quota');
       const isUnavailable = lower.includes('503') || lower.includes('unavailable') || lower.includes('overloaded');
+
+      // Provider reported exhausted quota ("no credits available" / 402):
+      // quarantine the provider so no further jobs start until the operator
+      // recharges (hard spending protection; never auto-buys credits).
+      if (/402|insufficient_quota|no credits available/.test(lower)) {
+        const until = reportProviderQuotaExhausted();
+        nestedLog.warn('provider quota exhausted — processing quarantined', { until });
+      }
 
       let userFriendlyMessage = rawMessage || 'Failed to process audio with Odia transcription pipeline.';
       let statusCode = 500;
@@ -1121,6 +1252,17 @@ async function startServer() {
         const active = jobs.countActiveForUser(user.id);
         assertWithinActiveJobLimit(active);
 
+        // Hard provider-spending protection: when the kill-switch is on or the
+        // provider is quarantined after exhausting its quota, NO new API job is
+        // ever created — before charging or enqueueing anything. Applies to
+        // every caller, including ADMIN/UNLIMITED.
+        if (providerSpendingState().blocked) {
+          return res.status(503).json({
+            error: 'Processing temporarily unavailable. Please try again later.',
+            code: 'PROVIDER_UNAVAILABLE',
+          });
+        }
+
         const jobId = newId();
         const buffer = file.buffer;
         const sha256 = createHash('sha256').update(buffer).digest('hex');
@@ -1170,6 +1312,9 @@ async function startServer() {
           return res.status(402).json({ error: err.message, code: err.code });
         }
         if (err instanceof ProviderNotConfiguredError) {
+          return res.status(503).json({ error: err.message, code: err.code });
+        }
+        if (err instanceof ProviderSpendingError) {
           return res.status(503).json({ error: err.message, code: err.code });
         }
         nestedLog.error('job enqueue failed', { message: redact(err.message) });
@@ -1237,6 +1382,13 @@ async function startServer() {
       transactions: credits.getTransactions(user.id, 25),
       provider: getAsrProviderName(),
     });
+  });
+
+  // Credit PACK CATALOG (public). These are PRODUCT DEFINITIONS ONLY: there is
+  // no payment gateway yet, so every pack is a placeholder ("Coming Soon" in the
+  // UI) and no transaction can actually create credits. Prices are display-only.
+  app.get('/api/credits/packs', (_req, res) => {
+    res.json({ packs: CREDIT_PACKS });
   });
 
   // ---------------------------------------------------------------------------

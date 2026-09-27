@@ -69,6 +69,31 @@ export interface CreditService {
     jobId: string,
     reason: string
   ): { transaction: CreditTransactionRecord; charged: boolean } | null;
+  /**
+   * Reserve credits for a job WITHOUT spending them yet. The reserved amount is
+   * blocked from availability (so concurrent jobs cannot double-spend) and is
+   * recorded as a RESERVATION ledger entry. Idempotent per jobId.
+   */
+  reserveJob(input: ChargeInput): ChargeResult;
+  /**
+   * Convert a reservation into final consumption (USAGE). Balance is already
+   * blocked by the reservation; this only marks it spent. Idempotent; returns
+   * null when there is no reservation (UNLIMITED/anonymous/free path).
+   */
+  settleJobReservation(
+    userId: string,
+    jobId: string,
+    reason: string
+  ): { transaction: CreditTransactionRecord } | null;
+  /**
+   * Return an unsettled reservation to the available balance (RELEASE). Never
+   * releases a reservation that was converted to USAGE. Idempotent.
+   */
+  releaseJobReservation(
+    userId: string,
+    jobId: string,
+    reason: string
+  ): { transaction: CreditTransactionRecord } | null;
   getBalance(userId: string): number;
   isUnlimited(userId: string): boolean;
   getTransactions(userId: string, limit?: number): CreditTransactionRecord[];
@@ -82,6 +107,22 @@ export interface CreditService {
 }
 
 export class FileCreditService implements CreditService {
+  /** Transaction types that REDUCE the balance when applied. */
+  private static readonly REDUCING = new Set<CreditTransactionType>([
+    'DEBIT',
+    'ADMIN_DEBIT',
+    'RESERVATION',
+  ]);
+  /** Transaction types that INCREASE the balance when applied. */
+  private static readonly INCREASING = new Set<CreditTransactionType>([
+    'CREDIT',
+    'REFUND',
+    'RELEASE',
+    'PURCHASE',
+    'ADMIN_GRANT',
+    'ADMIN_ADJUSTMENT',
+  ]);
+
   constructor(
     private readonly users: UserRepo,
     private readonly credits: CreditRepo
@@ -128,6 +169,44 @@ export class FileCreditService implements CreditService {
     const refunded = this.credits.refundForJob(userId, jobId);
     if (refunded) return null; // Already refunded -> idempotent no-op.
     return this.apply(userId, 'REFUND', debit.amount, reason, jobId);
+  }
+
+  reserveJob(input: ChargeInput): ChargeResult {
+    if (this.isUnlimited(input.userId)) {
+      return { transaction: null, charged: false, unlimited: true };
+    }
+    const existing = this.credits.reservationForJob(input.userId, input.jobId);
+    if (existing) {
+      // Idempotent: never double-reserve a retried request.
+      return { transaction: existing, charged: false };
+    }
+    this.assertCanPay(input.userId, input.amount);
+    return this.apply(input.userId, 'RESERVATION', input.amount, input.reason, input.jobId);
+  }
+
+  settleJobReservation(
+    userId: string,
+    jobId: string,
+    reason: string
+  ): { transaction: CreditTransactionRecord } | null {
+    const reservation = this.credits.reservationForJob(userId, jobId);
+    if (!reservation) return null; // Nothing reserved (UNLIMITED/anonymous/free path).
+    const usage = this.credits.usageForJob(userId, jobId);
+    if (usage) return { transaction: usage }; // Already settled -> idempotent.
+    return { transaction: this.apply(userId, 'USAGE', reservation.amount, reason, jobId).transaction };
+  }
+
+  releaseJobReservation(
+    userId: string,
+    jobId: string,
+    reason: string
+  ): { transaction: CreditTransactionRecord } | null {
+    const reservation = this.credits.reservationForJob(userId, jobId);
+    if (!reservation) return null; // Nothing reserved.
+    if (this.credits.usageForJob(userId, jobId)) return null; // Consumed — never release.
+    const released = this.credits.releaseForJob(userId, jobId);
+    if (released) return null; // Already released -> idempotent.
+    return { transaction: this.apply(userId, 'RELEASE', reservation.amount, reason, jobId).transaction };
   }
 
   getBalance(userId: string): number {
@@ -222,12 +301,25 @@ export class FileCreditService implements CreditService {
     jobId: string | undefined,
     extra?: Partial<CreditTransactionRecord>
   ): { transaction: CreditTransactionRecord; charged: boolean } {
-    const signed = type === 'DEBIT' || type === 'ADMIN_DEBIT' ? -amount : amount;
+    if (!Number.isFinite(amount) || amount < 0) {
+      throw new CreditError('INVALID_AMOUNT', 'Amount must be a non-negative whole number.');
+    }
+    if (amount === 0 && type !== 'FREE_TRIAL') {
+      throw new CreditError('INVALID_AMOUNT', 'Only FREE_TRIAL ledger records may carry a zero amount.');
+    }
+    // Sign by type: reducing types block funds, increasing types add funds,
+    // zero types (USAGE / FREE_TRIAL) never move the balance (the reservation
+    // already blocked USAGE's funds; a free trial is worth 0 credits).
+    const signed = FileCreditService.REDUCING.has(type)
+      ? -amount
+      : FileCreditService.INCREASING.has(type)
+        ? amount
+        : 0;
     const balanceAfter = this.users.bumpCredits(userId, signed);
     if (balanceAfter === null) {
       throw new CreditError('NO_USER', 'Unknown user.');
     }
-    if ((type === 'DEBIT' || type === 'ADMIN_DEBIT') && balanceAfter < 0) {
+    if (FileCreditService.REDUCING.has(type) && balanceAfter < 0) {
       // Roll back the negative mutation so the ledger never goes negative.
       this.users.bumpCredits(userId, -signed);
       throw new CreditError('INSUFFICIENT_BALANCE', 'Insufficient credit balance.');

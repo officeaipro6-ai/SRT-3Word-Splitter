@@ -62,8 +62,8 @@ export const config = {
    */
   freeTrialLimit: envInt('FREE_TRIAL_LIMIT', 2),
 
-  /**
-   * OPTIONAL operator-only bootstrap secret. When a session is created with
+/**
+   * Optional operator-only bootstrap secret. When a session is created with
    * `adminBootstrapToken` matching this value, that user is granted the ADMIN
    * role + UNLIMITED credit mode (persisted server-side). Never returned to any
    * client; role is never read from the browser. Set it in .env, create your
@@ -73,6 +73,22 @@ export const config = {
     const v = (process.env.ADMIN_BOOTSTRAP_TOKEN || '').trim();
     return v.length >= 16 ? v : null;
   },
+
+  /**
+   * HARD provider-spending protection kill-switch. When true, NO provider job
+   * is ever started for ANY caller (including ADMIN/UNLIMITED). Purpose:
+   * prevent uncontrolled spending from the operator's ASR account while the app
+   * is not yet generating revenue. The user-facing copy is "Processing
+   * temporarily unavailable. Please try again later."
+   */
+  providerSpendingProtection: envBool('PROVIDER_SPENDING_PROTECTION', false),
+
+  /**
+   * Cooldown (ms) during which processing is quarantine-blocked after a
+   * provider reports exhausted quota (HTTP 402 "no credits available"), so no
+   * further API jobs start until the operator recharges.
+   */
+  providerQuotaCooldownMs: envInt('PROVIDER_QUOTA_COOLDOWN_MS', 10 * 60 * 1000),
 
   /** Credits charged per transcription job (server-side, never client-supplied). */
   creditsPerJob: envInt('CREDITS_PER_JOB', 1),
