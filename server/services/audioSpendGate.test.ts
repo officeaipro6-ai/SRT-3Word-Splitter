@@ -123,11 +123,11 @@ test('successful job: reservation is converted to USAGE and the balance is never
   // A late failure after success must never release a consumed job.
   assert.equal(service.releaseJobReservation(user.id, 'job-1', 'release_failed_job'), null);
   assert.equal(service.getBalance(user.id), 7);
+  // Both entries can share the same createdAt millisecond, so compare the set.
   const ledger = allTxns(service,user.id)
-    .slice()
-    .reverse() // getTransactions is newest-first -> chronological here
-    .map((t) => [t.type, t.amount, t.balanceAfter]);
-  assert.deepEqual(ledger, [['RESERVATION', 3, 7], ['USAGE', 3, 7]]);
+    .map((t) => [t.type, t.amount, t.balanceAfter].join('|'))
+    .sort();
+  assert.deepEqual(ledger, ['RESERVATION|3|7', 'USAGE|3|7']);
 });
 
 test('double-spend is impossible: a second job cannot reserve credits already reserved', async () => {
