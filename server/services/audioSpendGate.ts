@@ -6,7 +6,7 @@
  * credits (1 credit = 1 rounded-up minute) from the user's SERVER-side wallet.
  *
  * Order of checks (mirrors the product spec):
- *   1. provider spending protection (hard layer — no caller is exempt)
+ *   1. provider safety gate (hard layer — no caller is exempt)
  *   2. identity / free-trial eligibility (exactly 2 successful free trials)
  *   3. required credits from the SERVER-MEASURED duration
  *   4. available balance (server value only — client-supplied values never used)
@@ -22,7 +22,6 @@ import {
   NOT_ENOUGH_CREDITS_MESSAGE,
   PROVIDER_UNAVAILABLE_MESSAGE,
 } from './creditPolicy';
-import { providerSpendingState } from './providerSafety';
 import type { UserRecord } from '../db/types';
 
 export type SpendKind =
@@ -40,6 +39,12 @@ export interface AudioSpendContext {
   /** SERVER-measured decoded wall-clock duration (seconds) of the upload. */
   measuredDurationSeconds: number;
   freeTrialLimit: number;
+  /**
+   * TRUE when the locally stored provider safety state is BLOCKED (402 /
+   * insufficient quota / operator kill-switch). Supplied by the caller from the
+   * persisted state, which keeps this decision function pure and testable.
+   */
+  providerBlocked?: boolean;
 }
 
 export interface SpendDecision {
@@ -67,8 +72,8 @@ function baseUsage(used: number, limit: number) {
 
 /** Pure decision — no wallet mutation. Never calls the provider. */
 export function decideAudioSpend(ctx: AudioSpendContext): SpendDecision {
-  const safety = providerSpendingState();
-  if (safety.blocked) {
+  // Provider safety gate first: no caller is exempt, and no credit is touched.
+  if (ctx.providerBlocked === true) {
     return {
       ok: false,
       kind: 'PROVIDER_UNAVAILABLE',
@@ -79,13 +84,13 @@ export function decideAudioSpend(ctx: AudioSpendContext): SpendDecision {
   }
 
   // Anonymous legacy callers keep the pre-existing unrestricted behaviour
-  // (documented known limitation). The provider spending protection above
-  // still applies to them, so the operator's kill-switch stops ALL spending.
+  // (documented known limitation). The provider safety gate above still applies
+  // to them, so a blocked provider stops ALL spending.
   if (!ctx.user) return { ok: true, kind: 'ANONYMOUS' };
 
   const used = freeTrialsUsedFor(ctx.user);
   // Operator/UNLIMITED accounts are exempt from trial + credit accounting but
-  // never bypass the provider spending protection checked above.
+  // never bypass the provider safety gate checked above.
   if (ctx.user.creditMode === 'UNLIMITED') {
     return { ok: true, kind: 'UNLIMITED', ...baseUsage(used, ctx.freeTrialLimit) };
   }

@@ -16,7 +16,13 @@
 import fsp from 'fs/promises';
 import path from 'path';
 import { randomUUID } from 'crypto';
-import { type DbShape, type UserRecord, emptyDbShape } from './types';
+import {
+  DB_VERSION,
+  type DbShape,
+  type ProviderSafetyRecord,
+  type UserRecord,
+  emptyDbShape,
+} from './types';
 
 function normalizeUser(u: any): UserRecord {
   return {
@@ -24,6 +30,39 @@ function normalizeUser(u: any): UserRecord {
     role: u.role === 'ADMIN' ? 'ADMIN' : 'USER',
     creditMode: u.creditMode === 'UNLIMITED' ? 'UNLIMITED' : 'NORMAL',
     freeTrialsUsed: Number.isInteger(u.freeTrialsUsed) && (u.freeTrialsUsed as number) >= 0 ? (u.freeTrialsUsed as number) : 0,
+    ownerEmail: typeof u.ownerEmail === 'string' && u.ownerEmail.trim() ? u.ownerEmail.trim().toLowerCase() : undefined,
+  };
+}
+
+/**
+ * Provider safety state written by an older build (or hand-edited) must never
+ * crash the API: anything unrecognised is normalised to a safe AVAILABLE record
+ * with `balance.known = false` (we never invent a balance).
+ */
+export function normalizeProviderSafety(value: any, provider: string): ProviderSafetyRecord {
+  const status = value?.status === 'BLOCKED' || value?.status === 'WARNING' ? value.status : 'AVAILABLE';
+  const reason = status === 'BLOCKED' ? (value?.reason === 'QUOTA_EXHAUSTED' ? 'QUOTA_EXHAUSTED' : 'KILL_SWITCH') : null;
+  const percent = Number(value?.balance?.percent);
+  return {
+    provider: typeof value?.provider === 'string' && value.provider.trim() ? value.provider : provider,
+    status,
+    reason,
+    lastError: typeof value?.lastError === 'string' ? value.lastError.slice(0, 400) : undefined,
+    lastHttpStatus: Number.isInteger(value?.lastHttpStatus) ? value.lastHttpStatus : undefined,
+    lastErrorAt: typeof value?.lastErrorAt === 'string' ? value.lastErrorAt : undefined,
+    blockedAt: typeof value?.blockedAt === 'string' ? value.blockedAt : undefined,
+    updatedAt: typeof value?.updatedAt === 'string' ? value.updatedAt : new Date().toISOString(),
+    consecutiveFailures: Number.isInteger(value?.consecutiveFailures) && value.consecutiveFailures > 0 ? value.consecutiveFailures : 0,
+    lastSuccessAt: typeof value?.lastSuccessAt === 'string' ? value.lastSuccessAt : undefined,
+    lastResetAt: typeof value?.lastResetAt === 'string' ? value.lastResetAt : undefined,
+    lastResetBy: typeof value?.lastResetBy === 'string' ? value.lastResetBy : undefined,
+    balance: {
+      known: value?.balance?.known === true && Number.isFinite(percent),
+      percent: value?.balance?.known === true && Number.isFinite(percent) ? percent : undefined,
+      unit: typeof value?.balance?.unit === 'string' ? value.balance.unit : undefined,
+      source: typeof value?.balance?.source === 'string' ? value.balance.source : undefined,
+      updatedAt: typeof value?.balance?.updatedAt === 'string' ? value.balance.updatedAt : undefined,
+    },
   };
 }
 
@@ -49,11 +88,14 @@ export class DataStore {
       try {
         const parsed = JSON.parse(raw) as Partial<DbShape>;
         this.current = {
-          version: parsed.version ?? 1,
+          version: typeof parsed.version === 'number' ? parsed.version : DB_VERSION,
           users: Array.isArray(parsed.users) ? parsed.users.map(normalizeUser) : [],
           jobs: Array.isArray(parsed.jobs) ? parsed.jobs : [],
           transactions: Array.isArray(parsed.transactions) ? parsed.transactions : [],
         };
+        if (parsed.providerSafety) {
+          this.current.providerSafety = normalizeProviderSafety(parsed.providerSafety, 'sarvam');
+        }
       } catch {
         // Corrupt file: preserve it for inspection, start fresh.
         const backup = `${this.filePath}.corrupt-${Date.now()}`;

@@ -13,6 +13,55 @@ export type JobStatus = 'QUEUED' | 'PROCESSING' | 'COMPLETED' | 'FAILED' | 'CANC
 export type UserRole = 'USER' | 'ADMIN';
 
 /**
+ * Provider safety state.
+ *  - AVAILABLE: the provider may be called.
+ *  - WARNING   : recent provider failures were observed; calls are still allowed.
+ *  - BLOCKED   : the provider reported an exhausted balance/quota (HTTP 402) or
+ *                the operator kill-switch is on. NO ASR call may be made and no
+ *                automatic recharge/retry/fallback is ever attempted. Cleared
+ *                only by an explicit admin reset.
+ */
+export type ProviderSafetyStatus = 'AVAILABLE' | 'WARNING' | 'BLOCKED';
+
+/** Why the provider is currently gated (auditable, operator-visible). */
+export type ProviderBlockReason = 'KILL_SWITCH' | 'QUOTA_EXHAUSTED' | null;
+
+/** Provider balance information — only ever populated from a REAL source. */
+export interface ProviderBalanceInfo {
+  /**
+   * Remaining balance/quota as a percentage, ONLY when a verified provider
+   * balance/quota API exists. `known: false` means "unknown": we display no
+   * number rather than inventing one (see notifications.PROVIDER_BALANCE_THRESHOLDS).
+   */
+  known: boolean;
+  percent?: number;
+  unit?: string;
+  source?: string;
+  updatedAt?: string;
+}
+
+export interface ProviderSafetyRecord {
+  provider: string;
+  status: ProviderSafetyStatus;
+  reason: ProviderBlockReason;
+  /** Redacted last provider error text (never a secret, truncated). */
+  lastError?: string;
+  lastHttpStatus?: number;
+  lastErrorAt?: string;
+  /** ISO timestamp of the last AVAILABLE -> BLOCKED transition. */
+  blockedAt?: string;
+  /** ISO timestamp of the last state change. */
+  updatedAt: string;
+  /** Consecutive observed provider failures (drives AVAILABLE <-> WARNING). */
+  consecutiveFailures: number;
+  lastSuccessAt?: string;
+  /** ISO timestamp of the last admin reset to AVAILABLE. */
+  lastResetAt?: string;
+  lastResetBy?: string;
+  balance: ProviderBalanceInfo;
+}
+
+/**
  * How credit charging behaves for a user account.
  *  - NORMAL: every job is charged `creditsPerJob` against the balance.
  *  - UNLIMITED: charges are bypassed server-side for the authorised ADMIN
@@ -54,6 +103,13 @@ export interface UserRecord {
    * / API errors never consume a trial and a browser refresh cannot reset it.
    */
   freeTrialsUsed?: number;
+  /**
+   * Server-verified owner email backing an ADMIN role (canonical, lower-cased,
+   * checked against the server-side allowlist on every admin request). Never
+   * read from the browser as proof of anything; a client claim is only accepted
+   * together with the server-held admin secret (see server/authz.ts).
+   */
+  ownerEmail?: string;
 }
 
 export interface CreditTransactionRecord {
@@ -75,6 +131,14 @@ export interface CreditTransactionRecord {
   createdAt: string;
   /** Balance after applying this transaction — audit-friendly ledger. */
   balanceAfter: number;
+  /** Balance immediately before this transaction (audit-friendly ledger). */
+  balanceBefore?: number;
+  /**
+   * Server-verified owner email that performed an ADMIN_ADJUSTMENT /
+   * ADMIN_GRANT / ADMIN_DEBIT. Denormalised from the admin's account so the
+   * audit trail survives role changes. Never a browser-supplied value.
+   */
+  adminEmail?: string;
   /** PAYMENT-READY (future only; never populated by this implementation):
    * are used for real-payment purchases later. */
   paymentId?: string;
@@ -128,9 +192,14 @@ export interface DbShape {
   users: UserRecord[];
   jobs: JobRecord[];
   transactions: CreditTransactionRecord[];
+  /**
+   * Locally stored provider safety state. Optional so databases written before
+   * this feature keep loading unchanged; `store.ts` normalises it on load.
+   */
+  providerSafety?: ProviderSafetyRecord;
 }
 
-export const DB_VERSION = 1;
+export const DB_VERSION = 2;
 
 export function emptyDbShape(): DbShape {
   return { version: DB_VERSION, users: [], jobs: [], transactions: [] };

@@ -37,7 +37,7 @@ import {
 import { config } from './server/config';
 import { nestedLog, redact } from './server/logger';
 import { DataStore } from './server/db/store';
-import { UserRepo, JobRepo, CreditRepo, newId } from './server/db/repos';
+import { UserRepo, JobRepo, CreditRepo, ProviderSafetyRepo, newId } from './server/db/repos';
 import { type JobRecord, type UserRecord, isJobStatus } from './server/db/types';
 import { FileCreditService, CreditError } from './server/services/creditService';
 import {
@@ -69,13 +69,22 @@ import {
   freeTrialsRemaining,
   freeTrialsUsedFor,
 } from './server/services/freeTrialPolicy';
-import { CREDIT_PACKS } from './server/services/creditPolicy';
+import { CREDIT_PACKS, PROVIDER_UNAVAILABLE_MESSAGE } from './server/services/creditPolicy';
 import {
-  providerSpendingState,
-  reportProviderQuotaExhausted,
+  ProviderSafetyService,
   ProviderSpendingError,
+  classifyProviderFailure,
+  type ProviderSafetyView,
 } from './server/services/providerSafety';
 import { decideAudioSpend } from './server/services/audioSpendGate';
+import { createOwnerNotifier, type OwnerNotifier } from './server/services/notifications';
+import {
+  authorizeOwnerSession,
+  isVerifiedOwner,
+  ownerRejectionMessage,
+  normalizeEmail,
+  type OwnerRejection,
+} from './server/authz';
 
 dotenv.config();
 
@@ -572,14 +581,41 @@ async function startServer() {
   const users = new UserRepo(store);
   const creditsRepo = new CreditRepo(store);
   const jobs = new JobRepo(store);
+  const providerSafetyRepo = new ProviderSafetyRepo(store);
   const credits = new FileCreditService(users, creditsRepo);
   const storage = new LocalFileStorageProvider(config.storageDir);
+
+  /**
+   * Owner notifications. NO transport is configured: alerts are rendered,
+   * recorded locally and logged only. This is deliberate — there is no WhatsApp
+   * (or any other messaging) integration in this project and none was invented.
+   * A future transport is added by passing it here, nothing else changes.
+   */
+  const notifier: OwnerNotifier = createOwnerNotifier({ log: nestedLog });
+
+  /**
+   * Provider safety: a LOCALLY STORED state machine (AVAILABLE / WARNING /
+   * BLOCKED) persisted in the data store, so a restart can never silently
+   * re-enable a provider that reported an exhausted balance. Checked
+   * immediately before every ASR call.
+   */
+  const providerSafety = new ProviderSafetyService({
+    provider: getAsrProviderName(),
+    get: () => providerSafetyRepo.get(getAsrProviderName()),
+    patch: (patch) => providerSafetyRepo.patch(getAsrProviderName(), patch),
+    setStatus: (provider, status, reason, patch) =>
+      providerSafetyRepo.setStatus(provider, status, reason, patch),
+    notifyOwner: (payload) => notifier.notifyOwner(payload),
+    log: nestedLog,
+  });
+
   const queue = new JobQueue({
     repo: jobs,
     storage,
     credits,
     getProvider: getProviderStrict as (name: string) => TranscriptionProvider,
     runPipeline: runJobPipeline,
+    providerSafety,
   });
   const uploadLimiter = new SlidingWindowLimiter(config.uploadRateLimitWindowMs, config.uploadRateLimitMax);
 
@@ -645,7 +681,11 @@ async function startServer() {
       hasApiKey,
       hasFallback,
       providerSpendingProtection: config.providerSpendingProtection,
-      providerSpendingBlocked: providerSpendingState().blocked,
+      providerSafety: providerSafety.view(),
+      // Backward-compatible flag names for existing clients.
+      providerSpendingBlocked: providerSafety.isBlocked(),
+      providerSafetyStatus: providerSafety.view().status,
+      providerBalanceKnown: providerSafety.view().balance.known,
       timestamp: new Date().toISOString(),
     });
   });
@@ -769,9 +809,10 @@ async function startServer() {
       //     consume). FREE_TRIAL_LIMIT=0 keeps the legacy "cap off" meaning.
       //   - After the trials, credit balance must cover the required credits,
       //     else 402 NOT_ENOUGH_CREDITS BEFORE the provider is contacted.
-      //   - Hard provider-spending protection applies to EVERY caller (incl.
-      //     UNLIMITED/anonymous) and can block processing entirely with the
-      //     "Processing temporarily unavailable" message.
+      //   - The provider safety gate applies to EVERY caller (incl. UNLIMITED and
+      //     anonymous) and blocks processing entirely with the "Processing
+      //     temporarily unavailable" message while the locally stored state is
+      //     BLOCKED (402 / insufficient quota / kill-switch).
       //   - Requests blocked here NEVER reach the provider and NEVER touch the
       //     wallet (except a PAID request, which reserves the exact amount so a
       //     concurrent request cannot double-spend the same credits).
@@ -788,6 +829,7 @@ async function startServer() {
           : null,
         measuredDurationSeconds: decodedAudioDuration,
         freeTrialLimit: config.freeTrialLimit,
+        providerBlocked: providerSafety.isBlocked(),
       });
       if (!spendDecision.ok) {
         nestedLog.info('audio spend gated', {
@@ -1112,22 +1154,40 @@ async function startServer() {
 
       const rawMessage = error?.message || '';
       const lower = rawMessage.toLowerCase();
-      const isRateLimited = lower.includes('429') || lower.includes('rate limit') || lower.includes('too many requests') || lower.includes('quota');
+      const isRateLimited = lower.includes('429') || lower.includes('rate limit') || lower.includes('too many requests');
       const isUnavailable = lower.includes('503') || lower.includes('unavailable') || lower.includes('overloaded');
 
-      // Provider reported exhausted quota ("no credits available" / 402):
-      // quarantine the provider so no further jobs start until the operator
-      // recharges (hard spending protection; never auto-buys credits).
-      if (/402|insufficient_quota|no credits available/.test(lower)) {
-        const until = reportProviderQuotaExhausted();
-        nestedLog.warn('provider quota exhausted — processing quarantined', { until });
+      // Classify the provider failure and let the LOCALLY STORED state machine
+      // decide. A reliable 402 (insufficient_quota / "no credits available")
+      // transitions the provider to BLOCKED: the next request is rejected
+      // before any API call, no retry is scheduled, no automatic recharge is
+      // attempted and no paid fallback provider is used. The owner is alerted
+      // through notifyOwner(). Only an admin reset returns it to AVAILABLE.
+      const providerFailure = classifyProviderFailure({ message: rawMessage });
+      let safetyView: ProviderSafetyView | null = null;
+      // A ProviderSpendingError is our own gate decision, not a provider
+      // failure, so it is never counted as one.
+      if (providerFailure.kind !== 'UNKNOWN' && !(error instanceof ProviderSpendingError)) {
+        safetyView = providerSafety.reportFailure(providerFailure);
+      }
+      if (safetyView?.status === 'BLOCKED') {
+        nestedLog.warn('provider BLOCKED — no further provider calls until an admin reset', {
+          provider: safetyView.provider,
+          reason: safetyView.reason,
+          lastHttpStatus: safetyView.lastHttpStatus,
+        });
       }
 
       let userFriendlyMessage = rawMessage || 'Failed to process audio with Odia transcription pipeline.';
       let statusCode = 500;
       let isTransient = false;
 
-      if (isRateLimited) {
+      if (safetyView?.status === 'BLOCKED') {
+        // Existing temporary-unavailable response — exactly the same copy the
+        // pre-call gate returns, so blocked users always see one message.
+        statusCode = 503;
+        userFriendlyMessage = PROVIDER_UNAVAILABLE_MESSAGE;
+      } else if (isRateLimited) {
         statusCode = 429;
         userFriendlyMessage = 'Transcription provider rate limit exceeded. Please wait a moment and try again.';
       } else if (isUnavailable) {
@@ -1175,16 +1235,30 @@ async function startServer() {
 
   // Create a session: returns an opaque bearer token (stored server-side as a
   // hash) plus the user's server-maintained credit balance.
-  // Admin bootstrap: if the request body includes `adminBootstrapToken` equal to
-  // the operator's env secret, the resulting user is granted role ADMIN +
-  // creditMode UNLIMITED. This is the ONLY server-side path that assigns roles;
-  // client-supplied role/creditMode fields are never trusted.
+  //
+  // ADMIN/owner bootstrap: the request must present BOTH
+  //   1. `adminBootstrapToken` equal to the server-held env secret, AND
+  //   2. `ownerEmail` that is on the SERVER-SIDE allowlist (OWNER_EMAILS,
+  //      default: officeaipro6@gmail.com, sumitchinara@gmail.com).
+  // Both are verified server-side (see server/authz.ts); the email claim alone
+  // grants nothing, and an allowlisted email without the secret is REFUSED with
+  // 403. This is the ONLY path that assigns a role — client-supplied
+  // role/creditMode fields are never read.
   app.post('/api/session', (req, res) => {
     try {
       const existing = extractToken(req);
-      const bootstrap = typeof req.body?.adminBootstrapToken === 'string' ? req.body.adminBootstrapToken.trim() : '';
-      const isAdminBootstrap = Boolean(config.adminBootstrapToken && bootstrap && config.adminBootstrapToken.length === bootstrap.length) &&
-        timingSafeEqual(Buffer.from(config.adminBootstrapToken as string, 'utf8'), Buffer.from(bootstrap, 'utf8'));
+      const ownerAttempt = authorizeOwnerSession({
+        bootstrapToken: req.body?.adminBootstrapToken,
+        claimedEmail: req.body?.ownerEmail,
+      });
+      const isAdminBootstrap = ownerAttempt.ok;
+      if (!isAdminBootstrap && req.body?.adminBootstrapToken) {
+        // An owner claim that failed verification is never silently downgraded
+        // to a normal session: report why, without echoing the secret.
+        const code = (ownerAttempt as { code: OwnerRejection }).code;
+        nestedLog.warn('admin bootstrap refused', { code, hasEmail: Boolean(normalizeEmail(req.body?.ownerEmail)) });
+        return res.status(403).json({ error: ownerRejectionMessage(code), code });
+      }
       let userId: string;
       if (existing && isValidTokenShape(existing)) {
         const user = users.getByToken(hashToken(existing));
@@ -1200,15 +1274,21 @@ async function startServer() {
             type: 'CREDIT',
             reason: 'initial_grant',
             jobId: undefined,
+            balanceBefore: 0,
             balanceAfter: user.credits,
           });
         }
         userId = user.id;
       }
       if (isAdminBootstrap) {
+        // Persist the CANONICAL allowlisted email (not the raw claim).
         users.setRole(userId, 'ADMIN');
         users.setCreditMode(userId, 'UNLIMITED');
-        nestedLog.info('admin role granted via bootstrap token', { userId });
+        users.setOwnerEmail(userId, ownerAttempt.ownerEmail);
+        nestedLog.info('admin role granted via verified owner bootstrap', {
+          userId,
+          ownerEmail: ownerAttempt.ownerEmail,
+        });
       }
       const token = issueToken();
       users.addToken(userId, hashToken(token));
@@ -1252,14 +1332,19 @@ async function startServer() {
         const active = jobs.countActiveForUser(user.id);
         assertWithinActiveJobLimit(active);
 
-        // Hard provider-spending protection: when the kill-switch is on or the
-        // provider is quarantined after exhausting its quota, NO new API job is
-        // ever created — before charging or enqueueing anything. Applies to
-        // every caller, including ADMIN/UNLIMITED.
-        if (providerSpendingState().blocked) {
+        // Provider safety gate: while the LOCALLY STORED state is BLOCKED (a
+        // reliable 402 / insufficient-quota report, or the operator
+        // kill-switch), NO new provider job is ever created — before charging or
+        // enqueueing anything. Applies to every caller, including
+        // ADMIN/UNLIMITED. There is no auto-recharge, no retry and no fallback.
+        if (providerSafety.isBlocked()) {
           return res.status(503).json({
-            error: 'Processing temporarily unavailable. Please try again later.',
+            error: PROVIDER_UNAVAILABLE_MESSAGE,
             code: 'PROVIDER_UNAVAILABLE',
+            providerSafety: {
+              status: providerSafety.view().status,
+              reason: providerSafety.view().reason,
+            },
           });
         }
 
@@ -1392,14 +1477,27 @@ async function startServer() {
   });
 
   // ---------------------------------------------------------------------------
-  // ADMIN API (role-checked server-side; never trusts a client-supplied role).
-  // Every route here runs auth() + requireAdmin(), so a non-admin session gets
-  // 401 (no auth) or 403 (authenticated but not admin).
+  // ADMIN API — server-side owner verification.
+  //
+  // Two independent checks, both AFTER bearer-token authentication:
+  //   1. the session's stored role is ADMIN (only ever assigned server-side when
+  //      the admin bootstrap secret was presented), and
+  //   2. the session's stored ownerEmail is still on the SERVER-SIDE allowlist
+  //      (OWNER_EMAILS, default: the two product-owner addresses).
+  // A browser-supplied email/role in any request body or header is ignored, so a
+  // normal user can never reach a credit, balance, trial or history mutation.
   // ---------------------------------------------------------------------------
   const requireAdmin = (req: express.Request, res: express.Response, next: express.NextFunction) => {
     const user = res.locals.user;
-    if (!user || user.role !== 'ADMIN') {
-      return res.status(403).json({ error: 'Forbidden: admin role required.', code: 'FORBIDDEN' });
+    if (!user) {
+      return res.status(401).json({ error: 'Authentication required.', code: 'UNAUTHENTICATED' });
+    }
+    if (user.role !== 'ADMIN' || !isVerifiedOwner(user)) {
+      nestedLog.warn('admin request refused', { userId: user.id, hasOwnerEmail: Boolean(user.ownerEmail) });
+      return res.status(403).json({
+        error: 'Forbidden: a verified owner account is required for admin access.',
+        code: 'FORBIDDEN',
+      });
     }
     next();
   };
@@ -1420,6 +1518,9 @@ async function startServer() {
       totalUsed: credits.sumUsed(userId),
       createdAt: u.createdAt,
       lastSeenAt: u.lastSeenAt ?? null,
+      // Only verified owner accounts carry an email; it is shown to admins so an
+      // owner can find their own account. It is never a search key for others.
+      ownerEmail: u.ownerEmail ?? null,
     };
   }
 
@@ -1446,10 +1547,12 @@ async function startServer() {
   }
 
   // List all users with balance + lifetime aggregates (admin dashboard).
+  // `?q=` searches by user id or by a verified owner email (server-side match).
   app.get('/api/admin/users', auth(), requireAdmin, (req, res) => {
     const limit = Math.min(Number(req.query.limit) || 100, 500);
-    const usersList = users.listUsers().slice(0, limit).map((u) => adminUserView(u.id));
-    res.json({ users: usersList });
+    const query = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    const list = query ? users.searchUsers(query, limit) : users.listUsers().slice(0, limit);
+    res.json({ users: list.map((u) => adminUserView(u.id)), query });
   });
 
   // Single user detail incl. recent ledger (admin dashboard).
@@ -1477,31 +1580,61 @@ async function startServer() {
     res.json({ jobs: list.map(adminJobView) });
   });
 
-  // Admin credit grant (idempotent via idempotencyKey; reason mandatory).
-  app.post('/api/admin/credits/grant', auth(), requireAdmin, (req, res) => {
+  /**
+   * CANONICAL manual credit adjustment.
+   *
+   * Always records ONE ledger entry of type ADMIN_ADJUSTMENT (never PURCHASE,
+   * because no payment was taken) containing: amount added, balance before,
+   * balance after, the acting admin (id + server-verified email), the mandatory
+   * reason, the timestamp and the transaction id. Idempotent via
+   * idempotencyKey. The admin's email is taken from res.locals (their own
+   * verified account), never from the request body.
+   */
+  const applyAdminAdjustment = (req: express.Request, res: express.Response) => {
+    const admin = res.locals.user;
     try {
-      const result = credits.adminGrantCredits({
-        adminUserId: res.locals.user.id,
+      const result = credits.adminAdjustCredits({
+        adminUserId: admin.id,
+        adminEmail: admin.ownerEmail,
         userId: String(req.body?.userId || ''),
         amount: Number(req.body?.amount),
         reason: String(req.body?.reason || ''),
         idempotencyKey: req.body?.idempotencyKey,
       });
-      res.json({ transaction: result.transaction, applied: result.applied });
+      nestedLog.info('admin credit adjustment applied', {
+        adminUserId: admin.id,
+        adminEmail: admin.ownerEmail,
+        targetUserId: result.transaction.userId,
+        amount: result.transaction.amount,
+        balanceBefore: result.transaction.balanceBefore,
+        balanceAfter: result.transaction.balanceAfter,
+        type: result.transaction.type,
+      });
+      res.json({
+        transaction: result.transaction,
+        applied: result.applied,
+        user: adminUserView(result.transaction.userId),
+      });
     } catch (err: any) {
       if (err instanceof CreditError) {
         return res.status(err.code === 'NO_USER' ? 404 : 400).json({ error: err.message, code: err.code });
       }
-      nestedLog.error('admin grant failed', { message: redact(err.message) });
-      res.status(500).json({ error: 'Failed to grant credits.' });
+      nestedLog.error('admin credit adjustment failed', { message: redact(err.message) });
+      res.status(500).json({ error: 'Failed to apply the credit adjustment.' });
     }
-  });
+  };
+
+  app.post('/api/admin/credits/adjust', auth(), requireAdmin, applyAdminAdjustment);
+
+  // Legacy alias: still a manual adjustment, so it also records ADMIN_ADJUSTMENT.
+  app.post('/api/admin/credits/grant', auth(), requireAdmin, applyAdminAdjustment);
 
   // Admin credit debit (idempotent via idempotencyKey; reason mandatory; never negative).
   app.post('/api/admin/credits/debit', auth(), requireAdmin, (req, res) => {
     try {
       const result = credits.adminDebitCredits({
         adminUserId: res.locals.user.id,
+        adminEmail: res.locals.user.ownerEmail,
         userId: String(req.body?.userId || ''),
         amount: Number(req.body?.amount),
         reason: String(req.body?.reason || ''),
@@ -1515,6 +1648,47 @@ async function startServer() {
       nestedLog.error('admin debit failed', { message: redact(err.message) });
       res.status(500).json({ error: 'Failed to debit credits.' });
     }
+  });
+
+  // Provider safety state: status, reason, timestamps, last error, balance
+  // honesty flag. Read-only; includes the local state-change history.
+  app.get('/api/admin/provider/safety', auth(), requireAdmin, (_req, res) => {
+    res.json({ providerSafety: providerSafety.view() });
+  });
+
+  /**
+   * Manual operator reset to AVAILABLE. The ONLY way out of BLOCKED, and the
+   * documented workflow: the operator adds credits to the provider account
+   * FIRST, then resets here. This endpoint never charges anything, never calls
+   * the provider and never touches user credit balances — it only re-opens the
+   * gate, with the acting admin's email recorded in the audit trail.
+   */
+  app.post('/api/admin/provider/safety/reset', auth(), requireAdmin, (req, res) => {
+    const admin = res.locals.user;
+    const view = providerSafety.resetToAvailable(admin.ownerEmail as string);
+    nestedLog.warn('provider safety reset to AVAILABLE by admin', {
+      adminUserId: admin.id,
+      adminEmail: admin.ownerEmail,
+      previousStatus: view.history[0]?.from ?? view.status,
+    });
+    res.json({ providerSafety: view });
+  });
+
+  // Recent owner alerts (recorded locally; no delivery channel is configured).
+  app.get('/api/admin/alerts', auth(), requireAdmin, (req, res) => {
+    const limit = Math.min(Number(req.query.limit) || 20, 50);
+    res.json({
+      alerts: notifier.recent(limit),
+      // Explicitly reported so the UI never implies a working WhatsApp link.
+      delivery: {
+        transports: notifier.transportNames(),
+        connected: notifier.transportNames().length > 0,
+        note:
+          notifier.transportNames().length === 0
+            ? 'No notification channel is configured. Alerts are recorded locally only (WhatsApp is NOT connected).'
+            : null,
+      },
+    });
   });
 
   // Mount Vite middleware for development

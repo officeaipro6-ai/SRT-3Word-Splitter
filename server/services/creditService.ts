@@ -6,9 +6,14 @@
  *   - A job can be DEBITED at most once (idempotency key = jobId).
  *   - A job can be REFUNDED at most once, and only if it was charged.
  *   - Never negative: charge fails with INSUFFICIENT_BALANCE if balance < amount.
- *   - Every mutation appends a ledger entry with balanceAfter (audit trail).
+ *   - Every mutation appends a ledger entry with balanceBefore + balanceAfter
+ *     (audit trail).
  *   - Admin grants/debits record adminUserId + idempotencyKey and never
  *     double-apply on duplicate keys.
+ *   - Manual admin credit changes go through `adminAdjustCredits` and ALWAYS
+ *     write type ADMIN_ADJUSTMENT (never a fake PURCHASE), carrying the
+ *     server-verified admin email, amount added, balance before/after and the
+ *     mandatory reason.
  *   - An account with creditMode UNLIMITED (server-assigned, authorised ADMIN
  *     only) bypasses charges entirely: chargeJob produces NO DEBIT transaction
  *     and writes NO fake sentinel balance value.
@@ -56,6 +61,11 @@ export interface AdminCreditInput {
   amount: number;
   reason: string;
   idempotencyKey?: string;
+  /**
+   * Server-verified owner email of the acting admin. Resolved from the admin's
+   * own stored account, never from the request body.
+   */
+  adminEmail?: string;
 }
 
 export interface CreditService {
@@ -97,7 +107,16 @@ export interface CreditService {
   getBalance(userId: string): number;
   isUnlimited(userId: string): boolean;
   getTransactions(userId: string, limit?: number): CreditTransactionRecord[];
-  /** Admin grant; idempotent by idempotencyKey. */
+  /**
+   * THE canonical manual-credit path (admin UI "add credits"). Always writes a
+   * single ADMIN_ADJUSTMENT ledger entry recording: amount added, balance before,
+   * balance after, the acting admin (id + verified email), a mandatory reason
+   * and the timestamp. Never a PURCHASE. Idempotent by idempotencyKey.
+   */
+  adminAdjustCredits(
+    input: AdminCreditInput
+  ): { transaction: CreditTransactionRecord; applied: boolean };
+  /** Legacy admin grant; now recorded as ADMIN_ADJUSTMENT. */
   adminGrantCredits(input: AdminCreditInput): { transaction: CreditTransactionRecord; applied: boolean };
   /** Admin debit; idempotent by idempotencyKey; never negative. */
   adminDebitCredits(input: AdminCreditInput): { transaction: CreditTransactionRecord; applied: boolean };
@@ -229,10 +248,26 @@ export class FileCreditService implements CreditService {
     return this.credits.sumUsed(userId);
   }
 
+  /**
+   * Manual credit adjustment. `amount` is the number of credits ADDED (a
+   * deduction is an explicit, separate adminDebitCredits call, so an adjustment
+   * can never be mistaken for a purchase or a refund).
+   */
+  adminAdjustCredits(input: AdminCreditInput): { transaction: CreditTransactionRecord; applied: boolean } {
+    const key = (input.idempotencyKey || '').trim();
+    if (key) {
+      const prior = this.credits.findByIdempotencyKey(key, input.userId);
+      if (prior) return { transaction: prior, applied: false };
+    }
+    if (!this.users.getById(input.userId)) {
+      throw new CreditError('NO_USER', 'Unknown target user.');
+    }
+    return this.applyAdmin(input, 'ADMIN_ADJUSTMENT');
+  }
+
+  /** Legacy alias kept so older admin clients keep working; records ADMIN_ADJUSTMENT. */
   adminGrantCredits(input: AdminCreditInput): { transaction: CreditTransactionRecord; applied: boolean } {
-    const existing = this.checkIdempotency(input, 'ADMIN_GRANT');
-    if (existing) return { transaction: existing, applied: false };
-    return this.applyAdmin(input, 'ADMIN_GRANT');
+    return this.adminAdjustCredits(input);
   }
 
   adminDebitCredits(input: AdminCreditInput): { transaction: CreditTransactionRecord; applied: boolean } {
@@ -257,12 +292,12 @@ export class FileCreditService implements CreditService {
   ): CreditTransactionRecord | null {
     const key = (input.idempotencyKey || '').trim();
     if (!key) return null;
-    return this.credits.findByIdempotencyKey(key, input.userId);
+    return this.credits.findByIdempotencyKey(key, input.userId, type);
   }
 
   private applyAdmin(
     input: AdminCreditInput,
-    type: 'ADMIN_GRANT' | 'ADMIN_DEBIT'
+    type: 'ADMIN_ADJUSTMENT' | 'ADMIN_DEBIT'
   ): { transaction: CreditTransactionRecord; applied: boolean } {
     const amount = Math.floor(Number(input.amount));
     if (!Number.isFinite(amount) || amount <= 0) {
@@ -274,11 +309,11 @@ export class FileCreditService implements CreditService {
     }
     const key = (input.idempotencyKey || '').trim().slice(0, 200) || undefined;
     if (key) {
-      const prior = this.credits.findByIdempotencyKey(key, input.userId);
+      const prior = this.credits.findByIdempotencyKey(key, input.userId, type);
       if (prior) return { transaction: prior, applied: false };
     }
-    // Token hash of the operator's own session (never a secret to them; this is
-    // persisted for audit only). Store the admin's user id, not their token.
+    // The acting admin's id and server-verified owner email are recorded for
+    // audit. The email is taken from the admin's own account, not the request.
     const txn = this.apply(
       input.userId,
       type,
@@ -287,10 +322,18 @@ export class FileCreditService implements CreditService {
       undefined,
       {
         adminUserId: input.adminUserId,
+        adminEmail: this.adminEmailFor(input.adminUserId, input.adminEmail),
         idempotencyKey: key,
       }
     );
     return { transaction: txn.transaction, applied: true };
+  }
+
+  /** Verified owner email of an admin account (falls back to the stored value). */
+  private adminEmailFor(adminUserId: string, claimed?: string): string | undefined {
+    const stored = this.users.getById(adminUserId)?.ownerEmail;
+    if (stored) return stored;
+    return claimed && claimed.trim() ? claimed.trim().toLowerCase() : undefined;
   }
 
   private apply(
@@ -315,6 +358,7 @@ export class FileCreditService implements CreditService {
       : FileCreditService.INCREASING.has(type)
         ? amount
         : 0;
+    const balanceBefore = this.users.getById(userId)?.credits ?? 0;
     const balanceAfter = this.users.bumpCredits(userId, signed);
     if (balanceAfter === null) {
       throw new CreditError('NO_USER', 'Unknown user.');
@@ -330,6 +374,7 @@ export class FileCreditService implements CreditService {
       type,
       reason,
       jobId,
+      balanceBefore,
       balanceAfter,
       ...(extra || {}),
     });

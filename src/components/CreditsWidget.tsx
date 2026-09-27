@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import { Coins, ShieldCheck, UserRound } from 'lucide-react';
-import { ensureSession, type SessionInfo } from '../lib/sessionClient';
+import { Coins, ShieldCheck, UserRound, KeyRound } from 'lucide-react';
+import { ensureSession, signInAsOwner, type SessionInfo } from '../lib/sessionClient';
 import { AdminDashboard } from './AdminDashboard';
 
 /**
@@ -12,6 +12,11 @@ export const CreditsWidget: React.FC = () => {
   const [session, setSession] = useState<SessionInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showAdmin, setShowAdmin] = useState(false);
+  const [showOwnerForm, setShowOwnerForm] = useState(false);
+  const [ownerEmail, setOwnerEmail] = useState('');
+  const [ownerToken, setOwnerToken] = useState('');
+  const [ownerError, setOwnerError] = useState<string | null>(null);
+  const [ownerBusy, setOwnerBusy] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -26,6 +31,26 @@ export const CreditsWidget: React.FC = () => {
       cancelled = true;
     };
   }, []);
+
+  /**
+   * Owner sign-in. The bootstrap token is submitted once and immediately
+   * dropped from component state; it is never written to storage.
+   */
+  const submitOwnerSignIn = async () => {
+    setOwnerBusy(true);
+    setOwnerError(null);
+    try {
+      const next = await signInAsOwner({ adminBootstrapToken: ownerToken, ownerEmail });
+      setSession(next);
+      setOwnerToken('');
+      setOwnerEmail('');
+      setShowOwnerForm(false);
+    } catch (e: any) {
+      setOwnerError(e.message);
+    } finally {
+      setOwnerBusy(false);
+    }
+  };
 
   return (
     <>
@@ -67,9 +92,50 @@ export const CreditsWidget: React.FC = () => {
                   {showAdmin ? 'Hide' : 'Admin'}
                 </button>
               )}
+              {session.role !== 'ADMIN' && (
+                <button
+                  onClick={() => setShowOwnerForm((v) => !v)}
+                  title="Owner sign-in"
+                  className="px-2 py-1 rounded-lg text-xs font-semibold text-slate-500 hover:text-slate-800 transition-colors cursor-pointer inline-flex items-center gap-1"
+                >
+                  <KeyRound className="w-3 h-3" />
+                  Owner
+                </button>
+              )}
             </>
           )}
         </div>
+        {showOwnerForm && session?.role !== 'ADMIN' && (
+          <div className="bg-white/90 border-b border-slate-200">
+            <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-2 flex flex-wrap items-center gap-2 text-xs">
+              <input
+                type="email"
+                value={ownerEmail}
+                onChange={(e) => setOwnerEmail(e.target.value)}
+                placeholder="Owner email…"
+                className="px-2 py-1 rounded-lg border border-slate-200 outline-none focus:ring-2 focus:ring-indigo-200"
+              />
+              <input
+                type="password"
+                value={ownerToken}
+                onChange={(e) => setOwnerToken(e.target.value)}
+                placeholder="Admin bootstrap token…"
+                className="px-2 py-1 rounded-lg border border-slate-200 outline-none focus:ring-2 focus:ring-indigo-200"
+              />
+              <button
+                onClick={() => void submitOwnerSignIn()}
+                disabled={ownerBusy || !ownerEmail || !ownerToken}
+                className="px-3 py-1 rounded-lg text-xs font-semibold text-white bg-slate-800 hover:bg-slate-900 disabled:opacity-50 transition-colors cursor-pointer"
+              >
+                {ownerBusy ? 'Signing in…' : 'Sign in as owner'}
+              </button>
+              <span className="text-slate-400">
+                Verified against the server OWNER_EMAILS allowlist. The token is sent once and not stored.
+              </span>
+              {ownerError && <span className="text-rose-600">{ownerError}</span>}
+            </div>
+          </div>
+        )}
       </div>
 
       {showAdmin && session?.role === 'ADMIN' && <AdminDashboard />}

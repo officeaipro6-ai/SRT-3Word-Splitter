@@ -25,8 +25,8 @@ import { type StorageProvider, srtKey } from './storage';
 import { type CreditService } from './creditService';
 import {
   ProviderSpendingError,
-  assertProviderSpendingAllowed,
-  reportProviderQuotaExhausted,
+  type ProviderSafetyService,
+  classifyProviderFailure,
 } from './providerSafety';
 
 export interface RunPipelineInput {
@@ -52,6 +52,8 @@ export interface JobQueueDeps {
   credits: CreditService;
   getProvider: (name: string) => TranscriptionProvider;
   runPipeline: RunPipeline;
+  /** Persisted provider safety state: the pre-call gate + failure reporting. */
+  providerSafety: ProviderSafetyService;
   pollMs?: number;
 }
 
@@ -76,6 +78,7 @@ export class JobQueue {
   private readonly getProvider: (name: string) => TranscriptionProvider;
   private readonly runPipeline: RunPipeline;
   private readonly pollMs: number;
+  private readonly providerSafety: ProviderSafetyService;
   private timer: ReturnType<typeof setInterval> | null = null;
   private busy = false;
 
@@ -85,6 +88,7 @@ export class JobQueue {
     this.credits = deps.credits;
     this.getProvider = deps.getProvider;
     this.runPipeline = deps.runPipeline;
+    this.providerSafety = deps.providerSafety;
     this.pollMs = deps.pollMs ?? 2500;
   }
 
@@ -157,17 +161,20 @@ export class JobQueue {
         lastError: undefined,
       });
       nestedLog.info('job completed', { jobId: job.id, userId: job.userId });
+      // A successful provider call clears the transient failure counter (it can
+      // never clear a BLOCKED state — only an admin reset does that).
+      this.providerSafety.reportSuccess();
     } catch (err: any) {
       await this.handleFailure(job, err);
     }
   }
 
   private async processOne(job: JobRecord): Promise<RunPipelineResult> {
-    // Hard provider-spending protection: checked IMMEDIATELY before calling the
-    // provider so a job can never start an API call while the kill-switch is on
-    // or the provider is quarantined after exhausting its quota. Applies to
+    // Provider safety gate: checked IMMEDIATELY before calling the provider so a
+    // job can never start an API call while the locally stored state is BLOCKED
+    // (402 / insufficient quota) or the operator kill-switch is on. Applies to
     // every job, including jobs owned by ADMIN/UNLIMITED accounts.
-    assertProviderSpendingAllowed();
+    this.providerSafety.assertProviderSpendingAllowed();
     const provider = this.getProvider(job.provider);
     const audioBuffer = await this.storage.get(job.input.storageKey);
     if (!audioBuffer) {
@@ -188,19 +195,29 @@ export class JobQueue {
   private async handleFailure(job: JobRecord, err: unknown): Promise<void> {
     const now = new Date().toISOString();
     const message = String((err as Error)?.message || err || 'Unknown error');
-    const lower = message.toLowerCase();
     const isProviderMissing = err instanceof ProviderNotConfiguredError;
-    // Spending-protection blocks are TERMINAL: no retry loop may hammer the
-    // provider while the kill-switch is on or the quota is exhausted.
+    // A provider-safety block is TERMINAL: no retry loop may hammer the provider
+    // while the state is BLOCKED.
     const isSpendingBlocked = err instanceof ProviderSpendingError;
-    // Provider reported exhausted quota ("no credits available" / 402): put the
-    // provider in quarantine so no further job starts until the operator
-    // recharges. No auto-retry, no auto-buy.
-    if (/402|insufficient_quota|no credits available/.test(lower)) {
-      reportProviderQuotaExhausted();
-      nestedLog.warn('provider quota exhausted — processing quarantined', { jobId: job.id, userId: job.userId });
+    // Classify the failure and let the PERSISTED state machine decide. A
+    // reliable 402 (insufficient_quota / "no credits available") transitions the
+    // provider to BLOCKED: no further job may start an API call, there is no
+    // retry, no automatic recharge and no paid fallback provider. Only an admin
+    // reset returns it to AVAILABLE.
+    const failure = classifyProviderFailure({ message });
+    let state: ReturnType<ProviderSafetyService['view']> | null = null;
+    if (failure.kind !== 'UNKNOWN' || isSpendingBlocked) {
+      state = this.providerSafety.reportFailure(failure);
     }
-    const transient = !isSpendingBlocked && isTransientError(err);
+    const isNowBlocked = state?.blocked === true || isSpendingBlocked;
+    if (state?.status === 'BLOCKED') {
+      nestedLog.warn('provider BLOCKED — no further provider calls until an admin reset', {
+        jobId: job.id,
+        provider: state.provider,
+        reason: state.reason,
+      });
+    }
+    const transient = !isNowBlocked && !isSpendingBlocked && isTransientError(err);
 
     // Auto-retry transient failures (network/503) up to the configured cap.
     if (transient && job.retryCount < config.maxJobRetries) {
@@ -223,8 +240,8 @@ export class JobQueue {
     this.credits.refundFinishedJob(job.userId, job.id, 'refund_failed_job');
     const errorCode = isProviderMissing
       ? 'PROVIDER_NOT_CONFIGURED'
-      : isSpendingBlocked
-        ? 'PROVIDER_UNAVAILABLE'
+      : isSpendingBlocked || failure.kind === 'QUOTA_EXHAUSTED' || failure.kind === 'PAYMENT_REQUIRED'
+        ? 'PROVIDER_BLOCKED'
         : transient
           ? 'TRANSIENT'
           : 'TRANSCRIPTION_FAILED';

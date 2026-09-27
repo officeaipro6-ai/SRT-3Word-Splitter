@@ -84,11 +84,19 @@ export const config = {
   providerSpendingProtection: envBool('PROVIDER_SPENDING_PROTECTION', false),
 
   /**
-   * Cooldown (ms) during which processing is quarantine-blocked after a
-   * provider reports exhausted quota (HTTP 402 "no credits available"), so no
-   * further API jobs start until the operator recharges.
+   * Legacy cooldown window (ms) kept for backward compatibility of the env
+   * surface. The provider safety state is now PERSISTED: a 402 blocks the
+   * provider until an admin resets it, so no cooldown is required to keep the
+   * gate closed.
    */
   providerQuotaCooldownMs: envInt('PROVIDER_QUOTA_COOLDOWN_MS', 10 * 60 * 1000),
+
+  /**
+   * How many consecutive transient provider failures move the locally stored
+   * state from AVAILABLE to WARNING. WARNING still allows calls; only a reliable
+   * 402 (exhausted quota) blocks the provider.
+   */
+  providerWarningAfterFailures: envInt('PROVIDER_WARNING_AFTER_FAILURES', 2),
 
   /** Credits charged per transcription job (server-side, never client-supplied). */
   creditsPerJob: envInt('CREDITS_PER_JOB', 1),

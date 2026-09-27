@@ -6,7 +6,7 @@
  * the store), never the API/queue/credit callers.
  */
 import { randomUUID } from 'crypto';
-import { DataStore } from './store';
+import { DataStore, normalizeProviderSafety } from './store';
 import {
   type UserRecord,
   type JobRecord,
@@ -14,6 +14,8 @@ import {
   type JobStatus,
   type UserRole,
   type CreditMode,
+  type ProviderSafetyRecord,
+  type ProviderSafetyStatus,
 } from './types';
 
 export function newId(): string {
@@ -131,6 +133,79 @@ export class UserRepo {
       .sort((a, b) => (b.lastSeenAt || b.createdAt).localeCompare(a.lastSeenAt || a.createdAt))
       .map((u) => structuredClone(u));
   }
+
+  /**
+   * Admin user search: match on the user id prefix, a full id, or a server-side
+   * owner email. The email match uses the stored ownerEmail of verified admins
+   * only — normal users have no email field, so nothing else is searchable.
+   */
+  searchUsers(query: string, limit = 50): UserRecord[] {
+    const q = (query || '').trim().toLowerCase();
+    const all = this.listUsers();
+    if (!q) return all.slice(0, limit);
+    return all
+      .filter(
+        (u) =>
+          u.id.toLowerCase().includes(q) ||
+          (typeof u.ownerEmail === 'string' && u.ownerEmail.toLowerCase().includes(q))
+      )
+      .slice(0, limit);
+  }
+
+  /** Persist the server-verified owner email for an admin account. */
+  setOwnerEmail(userId: string, ownerEmail: string): boolean {
+    const email = ownerEmail.trim().toLowerCase();
+    if (!email) return false;
+    return this.store.mutate((db) => {
+      const user = db.users.find((u) => u.id === userId);
+      if (!user) return false;
+      user.ownerEmail = email;
+      return true;
+    });
+  }
+}
+
+/**
+ * Locally stored provider safety state (survives restarts so a BLOCKED provider
+ * stays blocked until an admin resets it — a process restart must never silently
+ * re-enable billing calls).
+ */
+export class ProviderSafetyRepo {
+  constructor(private readonly store: DataStore) {}
+
+  get(provider: string): ProviderSafetyRecord {
+    const current = this.store.snapshot().providerSafety;
+    if (!current) {
+      return {
+        provider,
+        status: 'AVAILABLE',
+        reason: null,
+        updatedAt: new Date(0).toISOString(),
+        consecutiveFailures: 0,
+        balance: { known: false },
+      };
+    }
+    return normalizeProviderSafety(current, provider);
+  }
+
+  /** Apply a partial state update and persist it. */
+  patch(provider: string, patch: Partial<ProviderSafetyRecord>): ProviderSafetyRecord {
+    return this.store.mutate((db) => {
+      const next = normalizeProviderSafety({ ...(db.providerSafety ?? {}), ...patch, provider }, provider);
+      db.providerSafety = next;
+      return structuredClone(next);
+    });
+  }
+
+  /** Convenience for the state machine: set status + reason together. */
+  setStatus(
+    provider: string,
+    status: ProviderSafetyStatus,
+    reason: ProviderSafetyRecord['reason'],
+    patch: Partial<ProviderSafetyRecord> = {}
+  ): ProviderSafetyRecord {
+    return this.patch(provider, { ...patch, status, reason });
+  }
 }
 
 export class CreditRepo {
@@ -200,24 +275,40 @@ export class CreditRepo {
       .map((t) => structuredClone(t));
   }
 
-  /** Find a prior transaction that already used this idempotency key. */
-  findByIdempotencyKey(key: string, userId?: string): CreditTransactionRecord | null {
+  /**
+   * Find a prior transaction that already used this idempotency key. When `type`
+   * is given, only that type matches, so reusing a key across operations
+   * (e.g. an adjustment and a debit) can never cross-apply.
+   */
+  findByIdempotencyKey(
+    key: string,
+    userId?: string,
+    type?: CreditTransactionRecord['type']
+  ): CreditTransactionRecord | null {
     const txn = this.store
       .snapshot()
       .transactions.find(
-        (t) => t.idempotencyKey === key && (!userId || t.userId === userId)
+        (t) =>
+          t.idempotencyKey === key &&
+          (!userId || t.userId === userId) &&
+          (!type || t.type === type)
       );
     return txn ? structuredClone(txn) : null;
   }
 
-  /** Net granted credits (ADMIN_GRANT + PURCHASE + initial CREDIT grants, positive). */
+  /**
+   * Net granted credits: manual ADMIN_ADJUSTMENT + ADMIN_GRANT + PURCHASE +
+   * initial CREDIT grants (positive only). Manual admin credits ARE lifetime
+   * grants, so they count here.
+   */
   sumGrants(userId: string): number {
     return this.store
       .snapshot()
       .transactions.filter(
         (t) =>
           t.userId === userId &&
-          (t.type === 'ADMIN_GRANT' ||
+          (t.type === 'ADMIN_ADJUSTMENT' ||
+            t.type === 'ADMIN_GRANT' ||
             t.type === 'PURCHASE' ||
             (t.type === 'CREDIT' && (t.reason === 'initial_grant' || t.reason === 'purchase')))
       )

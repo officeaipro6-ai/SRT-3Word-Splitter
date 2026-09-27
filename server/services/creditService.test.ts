@@ -59,13 +59,14 @@ test('every transaction carries the correct balanceAfter ledger value', async ()
   assert.deepEqual(ledger.map((t) => t.balanceAfter).sort(), [35, 50]); // DEBIT 35 then REFUND 50
 });
 
-test('admin grant records ADMIN_GRANT with adminUserId and increases balance', async () => {
+test('admin grant records ADMIN_ADJUSTMENT with adminUserId and increases balance', async () => {
   const { service, users, user } = await makeService(10);
   const admin = users.createUser('admin-hash', 0, 'ADMIN', 'UNLIMITED');
   const r = service.adminGrantCredits({ adminUserId: admin.id, userId: user.id, amount: 50, reason: 'audit_promo' });
   assert.equal(r.applied, true);
-  assert.equal(r.transaction.type, 'ADMIN_GRANT');
+  assert.equal(r.transaction.type, 'ADMIN_ADJUSTMENT');
   assert.equal(r.transaction.adminUserId, admin.id);
+  assert.equal(r.transaction.balanceBefore, 10);
   assert.equal(r.transaction.balanceAfter, 60);
   assert.equal(service.getBalance(user.id), 60);
 });
@@ -79,7 +80,7 @@ test('admin grant is idempotent by idempotencyKey (no double-credit on retry)', 
   assert.equal(second.applied, false); // duplicate key -> no second application
   assert.equal(second.transaction.id, first.transaction.id);
   assert.equal(service.getBalance(user.id), 20);
-  assert.equal(service.getTransactions(user.id).filter((t) => t.type === 'ADMIN_GRANT').length, 1);
+  assert.equal(service.getTransactions(user.id).filter((t) => t.type === 'ADMIN_ADJUSTMENT').length, 1);
 });
 
 test('admin debit requires a reason and never produces a negative balance', async () => {
@@ -128,13 +129,107 @@ test('UNLIMITED accounts bypass charges with no DEBIT and no sentinel balance', 
 test('admin aggregates: sumGrants / sumUsed / getAllTransactions', async () => {
   const { service, users, user } = await makeService(10);
   const admin = users.createUser('admin-hash', 0, 'ADMIN', 'UNLIMITED');
-  service.adminGrantCredits({ adminUserId: admin.id, userId: user.id, amount: 40, reason: 'promo' });
+  service.adminAdjustCredits({ adminUserId: admin.id, userId: user.id, amount: 40, reason: 'promo' });
   service.adminDebitCredits({ adminUserId: admin.id, userId: user.id, amount: 5, reason: 'fix' });
   service.chargeJob({ userId: user.id, jobId: 'agg-1', amount: 2, reason: 'charge_transcription' });
-  assert.equal(service.sumGrants(user.id), 40); // admin grant only (initial 10 has no ledger entry here)
+  assert.equal(service.sumGrants(user.id), 40); // manual adjustment only
   assert.equal(service.sumUsed(user.id), 7); // admin debit 5 + charge 2
   assert.equal(service.getBalance(user.id), 43);
   const all = service.getAllTransactions();
   assert.equal(all.length, 3);
-  assert.deepEqual(all.map((t) => t.type).sort(), ['ADMIN_DEBIT', 'ADMIN_GRANT', 'DEBIT']);
+  assert.deepEqual(all.map((t) => t.type).sort(), ['ADMIN_ADJUSTMENT', 'ADMIN_DEBIT', 'DEBIT']);
+});
+
+/**
+ * Manual credit adjustments are always ADMIN_ADJUSTMENT (never a fake
+ * PURCHASE) and must carry the full audit payload: admin account, target user,
+ * amount added, balance before/after, timestamp, reason and the transaction id.
+ */
+test('admin adjustment records a complete ADMIN_ADJUSTMENT audit entry', async () => {
+  const { service, users, user } = await makeService(150);
+  const admin = users.createUser('admin-hash', 0, 'ADMIN', 'UNLIMITED');
+  users.setOwnerEmail(admin.id, 'OfficeAIPro6@Gmail.com');
+
+  const before = new Date();
+  const result = service.adminAdjustCredits({
+    adminUserId: admin.id,
+    userId: user.id,
+    amount: 500,
+    reason: 'manual top-up',
+    idempotencyKey: 'adj-1',
+  });
+  const txn = result.transaction;
+
+  assert.equal(result.applied, true);
+  assert.equal(txn.type, 'ADMIN_ADJUSTMENT');
+  assert.notEqual(txn.type, 'PURCHASE');
+  assert.equal(txn.amount, 500); // credits ADDED
+  assert.equal(txn.userId, user.id); // target user
+  assert.equal(txn.adminUserId, admin.id); // acting admin account
+  assert.equal(txn.adminEmail, 'officeaipro6@gmail.com'); // canonical, not the raw claim
+  assert.equal(txn.balanceBefore, 150);
+  assert.equal(txn.balanceAfter, 650);
+  assert.equal(txn.reason, 'manual top-up');
+  assert.ok(txn.id && txn.id.length > 0); // transaction id
+  assert.ok(Date.parse(txn.createdAt) >= before.getTime() - 1000); // timestamp
+  assert.equal(service.getBalance(user.id), 650);
+
+  // Every ledger entry (not just adjustments) records balance before + after.
+  const adjustAgain = service.adminAdjustCredits({
+    adminUserId: admin.id,
+    userId: user.id,
+    amount: 10,
+    reason: 'second top-up',
+  });
+  assert.equal(adjustAgain.transaction.balanceBefore, 650);
+  assert.equal(adjustAgain.transaction.balanceAfter, 660);
+  for (const t of service.getTransactions(user.id, 20)) {
+    assert.equal(typeof t.balanceBefore, 'number');
+    assert.equal(typeof t.balanceAfter, 'number');
+  }
+
+  // Idempotent: the same key never double-applies.
+  const replay = service.adminAdjustCredits({
+    adminUserId: admin.id,
+    userId: user.id,
+    amount: 500,
+    reason: 'manual top-up',
+    idempotencyKey: 'adj-1',
+  });
+  assert.equal(replay.applied, false);
+  assert.equal(replay.transaction.id, txn.id);
+  assert.equal(service.getBalance(user.id), 660);
+
+  // A reason is mandatory and the amount must be a positive integer.
+  assert.throws(
+    () => service.adminAdjustCredits({ adminUserId: admin.id, userId: user.id, amount: 5, reason: '   ' }),
+    /reason is required/i
+  );
+  assert.throws(
+    () => service.adminAdjustCredits({ adminUserId: admin.id, userId: user.id, amount: 0, reason: 'zero' }),
+    /positive whole number/i
+  );
+  assert.throws(
+    () => service.adminAdjustCredits({ adminUserId: admin.id, userId: 'nope', amount: 5, reason: 'ghost' }),
+    /Unknown target user/i
+  );
+
+  // The legacy grant alias is recorded as the same manual-adjustment type.
+  const legacy = service.adminGrantCredits({
+    adminUserId: admin.id,
+    userId: user.id,
+    amount: 5,
+    reason: 'legacy path',
+  });
+  assert.equal(legacy.transaction.type, 'ADMIN_ADJUSTMENT');
+});
+
+test('no manual credit path can create a PURCHASE ledger entry', async () => {
+  const { service, users, user } = await makeService(0);
+  const admin = users.createUser('admin-hash', 0, 'ADMIN', 'UNLIMITED');
+  service.adminAdjustCredits({ adminUserId: admin.id, userId: user.id, amount: 500, reason: 'top-up' });
+  service.adminGrantCredits({ adminUserId: admin.id, userId: user.id, amount: 500, reason: 'grant alias' });
+  const types = service.getAllTransactions().map((t) => t.type);
+  assert.deepEqual(types, ['ADMIN_ADJUSTMENT', 'ADMIN_ADJUSTMENT']);
+  assert.equal(service.getBalance(user.id), 1000);
 });

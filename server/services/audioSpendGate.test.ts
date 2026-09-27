@@ -9,7 +9,8 @@ import type { CreditMode, UserRecord } from '../db/types.ts';
 import { FileCreditService, CreditError } from './creditService.ts';
 import { decideAudioSpend, type AudioSpendContext } from './audioSpendGate.ts';
 import { creditsForDuration, NOT_ENOUGH_CREDITS_MESSAGE, PROVIDER_UNAVAILABLE_MESSAGE, CANNOT_MEASURE_DURATION_MESSAGE } from './creditPolicy.ts';
-import { providerSpendingState, reportProviderQuotaExhausted, resetProviderSafetyForTests } from './providerSafety.ts';
+import { ProviderSafetyService, classifyProviderFailure } from './providerSafety.ts';
+import { ProviderSafetyRepo } from '../db/repos.ts';
 import { config } from '../config.ts';
 
 /** Minimal wallet harness on a throwaway DB file (no production data touched). */
@@ -49,7 +50,20 @@ function reserve(service: FileCreditService, user: UserRecord, jobId: string, am
   return service.reserveJob({ userId: user.id, jobId, amount, reason: 'reserve_transcription' });
 }
 
-test.beforeEach(() => resetProviderSafetyForTests());
+/** A ProviderSafetyService backed by a real throwaway data store. */
+async function makeSafety(): Promise<ProviderSafetyService> {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'odia-safety-'));
+  const store = new DataStore(path.join(dir, 'app.db.json'));
+  await store.init();
+  const repo = new ProviderSafetyRepo(store);
+  return new ProviderSafetyService({
+    provider: 'sarvam',
+    get: () => repo.get('sarvam'),
+    patch: (patch) => repo.patch('sarvam', patch),
+    setStatus: (provider, status, reason, patch) => repo.setStatus(provider, status, reason, patch),
+    notifyOwner: () => ({ delivered: false }),
+  });
+}
 
 /** Every ledger entry for a user (newest last), for assertions. */
 const allTxns = (service: FileCreditService, userId: string) => service.getTransactions(userId, 100);
@@ -193,8 +207,9 @@ test('free trials: #1 and #2 are allowed free, #3 requires credits (failures nev
 
 test('after 2 successful trials, credits are used and the ledger shows PURCHASE-style usage', async () => {
   const { service, user, users } = await makeWallet(12, { freeTrialsUsed: 2 });
-  // Operator grant (stands in for a future purchase): the ONLY credit source.
-  service.adminGrantCredits({
+  // Manual operator adjustment (stands in for a future purchase): the ONLY
+  // credit source, recorded as ADMIN_ADJUSTMENT (never a fake PURCHASE).
+  service.adminAdjustCredits({
     adminUserId: 'admin',
     userId: user.id,
     amount: 12,
@@ -209,9 +224,10 @@ test('after 2 successful trials, credits are used and the ledger shows PURCHASE-
   service.settleJobReservation(user.id, 'paid-1', 'usage_transcription');
   assert.equal(service.getBalance(user.id), 21);
   const types = allTxns(service, user.id).map((t) => t.type);
-  assert.ok(types.includes('ADMIN_GRANT'));
+  assert.ok(types.includes('ADMIN_ADJUSTMENT'));
   assert.ok(types.includes('RESERVATION'));
   assert.ok(types.includes('USAGE'));
+  assert.ok(!types.includes('PURCHASE'));
 });
 
 test('trials exhausted + unmeasurable duration -> 422, provider never called', () => {
@@ -247,7 +263,8 @@ test('UNLIMITED accounts never reserve credits', async () => {
   assert.equal(allTxns(service,user.id).length, 0);
 });
 
-test('kill switch blocks EVERY caller (no bypass) with the exact product message', () => {
+test('kill switch blocks EVERY caller (no bypass) with the exact product message', async () => {
+  const safety = await makeSafety();
   const previous = config.providerSpendingProtection;
   config.providerSpendingProtection = true;
   try {
@@ -256,45 +273,102 @@ test('kill switch blocks EVERY caller (no bypass) with the exact product message
       { id: 'e', creditMode: 'NORMAL', freeTrialsUsed: 2, credits: 100 } as UserRecord, // paid, enough credits
       { id: 'u', creditMode: 'UNLIMITED', freeTrialsUsed: 0, credits: 0 } as UserRecord, // admin/unlimited
     ]) {
-      const d = decideAudioSpend(ctx(user, 60));
+      const d = decideAudioSpend({ ...ctx(user, 60), providerBlocked: safety.isBlocked() });
       assert.equal(d.ok, false);
       assert.equal(d.kind, 'PROVIDER_UNAVAILABLE');
       assert.equal(d.status, 503);
       assert.equal(d.message, PROVIDER_UNAVAILABLE_MESSAGE);
     }
     // Anonymous callers are NOT exempt from the hard stop.
-    const anon = decideAudioSpend({ user: null, measuredDurationSeconds: 60, freeTrialLimit: 2 });
+    const anon = decideAudioSpend({
+      user: null,
+      measuredDurationSeconds: 60,
+      freeTrialLimit: 2,
+      providerBlocked: safety.isBlocked(),
+    });
     assert.equal(anon.ok, false);
     assert.equal(anon.kind, 'PROVIDER_UNAVAILABLE');
-    assert.equal(providerSpendingState().blocked, true);
-    assert.equal(providerSpendingState().reason, 'kill_switch');
+    const view = safety.view();
+    assert.equal(view.blocked, true);
+    assert.equal(view.status, 'BLOCKED');
+    assert.equal(view.reason, 'KILL_SWITCH');
   } finally {
     config.providerSpendingProtection = previous;
   }
 });
 
-test('quota quarantine blocks the next request, and expires on its own (no auto-recharge)', () => {
+test('a real 402 blocks the provider until an admin reset, and never auto-recharges', async () => {
+  const safety = await makeSafety();
   const w = { id: 'u', creditMode: 'NORMAL', freeTrialsUsed: 2, credits: 100 } as UserRecord;
   assert.equal(decideAudioSpend(ctx(w, 60)).ok, true);
-  // Provider reported "no credits available": quarantine for the cooldown.
-  const now = new Date().toISOString();
-  const until = reportProviderQuotaExhausted(now);
-  assert.equal(until, new Date(Date.parse(now) + config.providerQuotaCooldownMs).toISOString());
-  const blocked = decideAudioSpend(ctx(w, 60));
+  assert.equal(safety.isBlocked(), false);
+
+  // The provider really reported HTTP 402 insufficient_quota ("no credits available").
+  const failure = classifyProviderFailure({
+    message:
+      'Sarvam job initiate failed (HTTP 402): {"error":{"code":"insufficient_quota_error","message":"No credits available"}}',
+  });
+  assert.equal(failure.kind, 'QUOTA_EXHAUSTED');
+  assert.equal(failure.transient, false);
+  const blockedView = safety.reportFailure(failure);
+  assert.equal(blockedView.status, 'BLOCKED');
+  assert.equal(blockedView.reason, 'QUOTA_EXHAUSTED');
+  assert.equal(blockedView.lastHttpStatus, 402);
+  assert.equal(blockedView.lastErrorAt != null, true);
+  assert.equal(blockedView.blockedAt != null, true);
+  // No balance is invented: this provider has no verified balance/quota API.
+  assert.equal(blockedView.balance.known, false);
+  assert.equal(blockedView.balance.percent, null);
+  assert.equal(blockedView.balanceSourceAvailable, false);
+
+  // The gate now blocks the next request with the SAME product message, and the
+  // gate throws before any provider call.
+  const blocked = decideAudioSpend({ ...ctx(w, 60), providerBlocked: safety.isBlocked() });
   assert.equal(blocked.ok, false);
   assert.equal(blocked.kind, 'PROVIDER_UNAVAILABLE');
   assert.equal(blocked.status, 503);
   assert.equal(blocked.message, PROVIDER_UNAVAILABLE_MESSAGE);
-  assert.equal(providerSpendingState().reason, 'quota_cooldown');
-  // The cooldown is finite: once it has elapsed, processing resumes by itself
-  // (it never buys credits and never charges the user).
-  const stale = reportProviderQuotaExhausted(
-    new Date(Date.now() - config.providerQuotaCooldownMs - 1000).toISOString()
-  );
-  assert.ok(Date.parse(stale) < Date.now());
-  assert.equal(decideAudioSpend(ctx(w, 60)).ok, true);
-  resetProviderSafetyForTests();
-  assert.equal(decideAudioSpend(ctx(w, 60)).ok, true);
+  assert.throws(() => safety.assertProviderSpendingAllowed(), /temporarily unavailable/i);
+
+  // A restart must not silently re-enable the provider: the state is persisted.
+  const reloaded = await (async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'odia-safety-reload-'));
+    const file = path.join(dir, 'app.db.json');
+    const first = new DataStore(file);
+    await first.init();
+    const repo = new ProviderSafetyRepo(first);
+    const svc = new ProviderSafetyService({
+      provider: 'sarvam',
+      get: () => repo.get('sarvam'),
+      patch: (patch) => repo.patch('sarvam', patch),
+      setStatus: (p, status, reason, patch) => repo.setStatus(p, status, reason, patch),
+      notifyOwner: () => ({ delivered: false }),
+    });
+    svc.reportFailure(failure);
+    await new Promise((r) => setTimeout(r, 60));
+    const second = new DataStore(file);
+    await second.init();
+    const repo2 = new ProviderSafetyRepo(second);
+    return new ProviderSafetyService({
+      provider: 'sarvam',
+      get: () => repo2.get('sarvam'),
+      patch: (patch) => repo2.patch('sarvam', patch),
+      setStatus: (p, status, reason, patch) => repo2.setStatus(p, status, reason, patch),
+      notifyOwner: () => ({ delivered: false }),
+    });
+  })();
+  assert.equal(reloaded.view().status, 'BLOCKED');
+  assert.throws(() => reloaded.assertProviderSpendingAllowed(), /temporarily unavailable/i);
+
+  // Only an explicit admin reset (after the operator adds provider credits)
+  // returns the provider to AVAILABLE.
+  const reset = reloaded.resetToAvailable('officeaipro6@gmail.com');
+  assert.equal(reset.status, 'AVAILABLE');
+  assert.equal(reset.reason, null);
+  assert.equal(reset.blocked, false);
+  assert.equal(reset.lastResetBy, 'officeaipro6@gmail.com');
+  assert.equal(reset.lastResetAt != null, true);
+  assert.doesNotThrow(() => reloaded.assertProviderSpendingAllowed());
 });
 
 test('payment buttons cannot create credits (no purchase/checkout route exists)', () => {
