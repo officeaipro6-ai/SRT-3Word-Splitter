@@ -265,8 +265,10 @@ test('UNLIMITED accounts never reserve credits', async () => {
 
 test('kill switch blocks EVERY caller (no bypass) with the exact product message', async () => {
   const safety = await makeSafety();
-  const previous = config.providerSpendingProtection;
-  config.providerSpendingProtection = true;
+  // Drive the real env -> config path: the switch is a lazy getter, so it must be
+  // exercised through process.env rather than by assigning the config field.
+  const previous = process.env.PROVIDER_SPENDING_PROTECTION;
+  process.env.PROVIDER_SPENDING_PROTECTION = 'true';
   try {
     for (const user of [
       { id: 'n', creditMode: 'NORMAL', freeTrialsUsed: 0, credits: 100 } as UserRecord, // free trial
@@ -293,7 +295,8 @@ test('kill switch blocks EVERY caller (no bypass) with the exact product message
     assert.equal(view.status, 'BLOCKED');
     assert.equal(view.reason, 'KILL_SWITCH');
   } finally {
-    config.providerSpendingProtection = previous;
+    if (previous === undefined) delete process.env.PROVIDER_SPENDING_PROTECTION;
+    else process.env.PROVIDER_SPENDING_PROTECTION = previous;
   }
 });
 

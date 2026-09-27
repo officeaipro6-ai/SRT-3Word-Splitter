@@ -251,14 +251,19 @@ test('a BLOCKED state survives a full store reload (no silent re-enable on resta
 
 test('the kill switch forces BLOCKED even with a healthy stored state', () => {
   const { service } = makeService();
-  const previous = config.providerSpendingProtection;
-  config.providerSpendingProtection = true;
+  // Drive the REAL env -> config path (server.ts loads dotenv after imports, so
+  // the switch is a lazy getter; assigning the config field directly is no
+  // longer possible, and would not prove the .env value is honoured).
+  const previous = process.env.PROVIDER_SPENDING_PROTECTION;
+  process.env.PROVIDER_SPENDING_PROTECTION = 'true';
   try {
+    assert.equal(config.providerSpendingProtection, true);
     assert.equal(service.view().status, 'BLOCKED');
     assert.equal(service.view().reason, 'KILL_SWITCH');
     assert.throws(() => service.assertProviderSpendingAllowed(), ProviderSpendingError);
   } finally {
-    config.providerSpendingProtection = previous;
+    if (previous === undefined) delete process.env.PROVIDER_SPENDING_PROTECTION;
+    else process.env.PROVIDER_SPENDING_PROTECTION = previous;
   }
   assert.equal(service.view().status, 'AVAILABLE');
 });

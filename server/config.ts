@@ -80,8 +80,16 @@ export const config = {
    * prevent uncontrolled spending from the operator's ASR account while the app
    * is not yet generating revenue. The user-facing copy is "Processing
    * temporarily unavailable. Please try again later."
+   *
+   * This MUST stay a getter: `server.ts` calls `dotenv.config()` in its module
+   * body, which runs AFTER every static import has been evaluated. A static
+   * field would capture the value before `.env` was ever read, so the
+   * production setting in `.env` would be silently ignored. Reading it lazily
+   * also means the switch can never be "forgotten" by a load-order change.
    */
-  providerSpendingProtection: envBool('PROVIDER_SPENDING_PROTECTION', false),
+  get providerSpendingProtection(): boolean {
+    return envBool('PROVIDER_SPENDING_PROTECTION', false);
+  },
 
   /**
    * Legacy cooldown window (ms) kept for backward compatibility of the env
@@ -94,9 +102,12 @@ export const config = {
   /**
    * How many consecutive transient provider failures move the locally stored
    * state from AVAILABLE to WARNING. WARNING still allows calls; only a reliable
-   * 402 (exhausted quota) blocks the provider.
+   * 402 (exhausted quota) blocks the provider. Getter for the same load-order
+   * reason as `providerSpendingProtection`.
    */
-  providerWarningAfterFailures: envInt('PROVIDER_WARNING_AFTER_FAILURES', 2),
+  get providerWarningAfterFailures(): number {
+    return envInt('PROVIDER_WARNING_AFTER_FAILURES', 2);
+  },
 
   /** Credits charged per transcription job (server-side, never client-supplied). */
   creditsPerJob: envInt('CREDITS_PER_JOB', 1),
