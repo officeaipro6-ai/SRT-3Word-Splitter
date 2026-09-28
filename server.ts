@@ -80,6 +80,7 @@ import {
 } from './server/services/providerSafety';
 import { decideAudioSpend } from './server/services/audioSpendGate';
 import { createOwnerNotifier, type OwnerNotifier } from './server/services/notifications';
+import { verifyBootstrapTokenIntegrity } from './server/services/bootstrapTokenGuard';
 import {
   authorizeOwnerSession,
   isVerifiedOwner,
@@ -595,6 +596,35 @@ async function startServer() {
    * A future transport is added by passing it here, nothing else changes.
    */
   const notifier: OwnerNotifier = createOwnerNotifier({ log: nestedLog });
+
+  /**
+   * ADMIN_BOOTSTRAP_TOKEN integrity check.
+   *
+   * On every start the configured secret is read from the server-side .env,
+   * fingerprinted (HMAC-SHA256 over a locally generated pepper) and compared,
+   * in constant time, with the baseline recorded in the gitignored data dir.
+   * This is strictly READ-ONLY with respect to the secret: it is never
+   * generated, rotated, recovered, replaced or written back, its value is never
+   * logged or returned, and a mismatch or a missing value fails safely and waits
+   * for manual correction. Delivery is transport-neutral and no channel is
+   * configured, so an alert is recorded locally and the notification setup is
+   * reported as pending (WhatsApp is NOT connected).
+   */
+  const tokenGuard = await verifyBootstrapTokenIntegrity({
+    token: config.adminBootstrapToken,
+    stateFile: path.join(config.dataDir, 'bootstrap-token-guard.json'),
+    projectDir: process.cwd(),
+    log: nestedLog,
+  });
+  if (tokenGuard.status === 'CHANGED' || tokenGuard.status === 'MISSING') {
+    nestedLog.warn('bootstrap token integrity: manual correction required', {
+      status: tokenGuard.status,
+      code: tokenGuard.alert?.code,
+      delivered: tokenGuard.alert?.delivered ?? false,
+      notificationPending: tokenGuard.notificationPending,
+      action: 'No token was generated or replaced. Verify the server-side .env manually.',
+    });
+  }
 
   /**
    * Provider safety: a LOCALLY STORED state machine (AVAILABLE / WARNING /
