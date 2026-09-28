@@ -73,9 +73,17 @@ export const CreditsWidget: React.FC = () => {
                 </span>
               )}
               {session.unlimited ? (
-                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-900 text-slate-100 font-semibold">
+                <span
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-900 text-slate-100 font-semibold"
+                  title="Owner/UNLIMITED accounts bypass credit charges. Any balance shown here is a real, auditable test balance that is never consumed."
+                >
                   <Coins className="w-3.5 h-3.5 text-amber-300" />
                   Credits: Unlimited
+                  {session.credits > 0 && (
+                    <span className="px-1.5 py-0.5 rounded bg-slate-700 text-slate-100 text-[10px] font-bold">
+                      balance {session.credits}
+                    </span>
+                  )}
                 </span>
               ) : (
                 <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-100 text-slate-700 border border-slate-200 font-medium">
