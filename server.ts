@@ -39,14 +39,21 @@ import {
 import { config } from './server/config';
 import { nestedLog, redact } from './server/logger';
 import { DataStore } from './server/db/store';
-import { UserRepo, JobRepo, CreditRepo, ProviderSafetyRepo, newId } from './server/db/repos';
+import { UserRepo, JobRepo, CreditRepo, ProviderSafetyRepo, ModerationRepo, newId } from './server/db/repos';
 import { type JobRecord, type UserRecord, isJobStatus } from './server/db/types';
+import { type SupportCategory } from './server/db/types';
+import {
+  CommunityModerationService,
+  COMMUNITY_GUIDELINES,
+  TELEGRAM_MODERATION_NOTE,
+} from './server/services/communityModeration';
 import { FileCreditService, CreditError } from './server/services/creditService';
 import {
   LocalFileStorageProvider,
   uploadKey,
   srtKey,
   safeOriginalName,
+  extensionForMime,
 } from './server/services/storage';
 import { JobQueue, type RunPipeline } from './server/services/queue';
 import { extractToken, hashToken, issueToken, isValidTokenShape } from './server/services/auth';
@@ -95,6 +102,34 @@ dotenv.config();
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 100 * 1024 * 1024 }, // 100MB
+});
+
+/**
+ * COMMUNITY attachment upload — deliberately SEPARATE from the ASR upload
+ * middleware above.
+ *
+ * The transcription pipeline's `ALLOWED_MIME_TYPES` accepts audio/video only
+ * and must not be widened to make community screenshots work. So this uploader
+ * has its own allowlist (image, video, audio) and its own, smaller 25MB cap, and
+ * persists to a dedicated `community-attachments` directory that is only ever
+ * read back through an authenticated admin route.
+ */
+const COMMUNITY_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;
+
+const COMMUNITY_ATTACHMENT_MIME_PREFIXES = ['image/', 'video/', 'audio/'];
+
+const communityUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: COMMUNITY_ATTACHMENT_MAX_BYTES },
+  fileFilter: (_req, file, cb) => {
+    const mime = String(file.mimetype || '').toLowerCase();
+    if (COMMUNITY_ATTACHMENT_MIME_PREFIXES.some((p) => mime.startsWith(p))) {
+      cb(null, true);
+      return;
+    }
+    // Silently drop disallowed types rather than 500: the route reports why.
+    cb(null, false);
+  },
 });
 
 /**
@@ -586,8 +621,16 @@ async function startServer() {
   const creditsRepo = new CreditRepo(store);
   const jobs = new JobRepo(store);
   const providerSafetyRepo = new ProviderSafetyRepo(store);
+  const moderationRepo = new ModerationRepo(store);
   const credits = new FileCreditService(users, creditsRepo);
   const storage = new LocalFileStorageProvider(config.storageDir);
+  // Community & Support moderation. Additive: no existing pipeline, credit,
+  // provider-safety or auth path reads or writes these.
+  const moderation = new CommunityModerationService(moderationRepo);
+  // Attachments live in their own directory, never mixed with job uploads.
+  const communityAttachments = new LocalFileStorageProvider(
+    path.join(config.dataDir, 'community-attachments')
+  );
 
   /**
    * Owner notifications. NO transport is configured: alerts are rendered,
@@ -1587,6 +1630,163 @@ async function startServer() {
   });
 
   // ---------------------------------------------------------------------------
+  // COMMUNITY & SUPPORT (additive).
+  //
+  // Every moderation decision is made HERE, on the server. The client sends
+  // text (and optionally a file) and can never declare a verdict, a
+  // restriction, a start time, an expiry or a remaining duration — those are
+  // ignored/unrepresentable by construction. A restricted user is refused here
+  // even if they bypass or spoof the UI entirely.
+  // ---------------------------------------------------------------------------
+
+  const SUPPORT_CATEGORIES: SupportCategory[] = [
+    'TRANSCRIPTION',
+    'TIMING',
+    'TAGGING',
+    'SRT',
+    'CREDITS',
+    'LOGIN',
+    'OTHER',
+  ];
+
+  /** Display labels for the UI (the wire format stays the stable enum value). */
+  const SUPPORT_CATEGORY_LABELS: Record<SupportCategory, string> = {
+    TRANSCRIPTION: 'Transcription',
+    TIMING: 'Timing',
+    TAGGING: 'Tagging',
+    SRT: 'SRT',
+    CREDITS: 'Credits',
+    LOGIN: 'Login',
+    OTHER: 'Other',
+  };
+
+  /** Public, read-only guidance + support categories. Contains no user data. */
+  app.get('/api/community/guidelines', (_req, res) => {
+    res.json({
+      guidelines: COMMUNITY_GUIDELINES,
+      categories: SUPPORT_CATEGORIES,
+      categoryLabels: SUPPORT_CATEGORY_LABELS,
+      attachmentMaxBytes: COMMUNITY_ATTACHMENT_MAX_BYTES,
+      attachmentAccept: 'image/*, video/*, audio/*',
+      telegram: TELEGRAM_MODERATION_NOTE,
+    });
+  });
+
+  /** The signed-in user's own restriction state (server-computed). */
+  app.get('/api/community/status', auth(), (req, res) => {
+    const user = res.locals.user;
+    res.json({ userId: user.id, ...moderation.statusFor(user.id) });
+  });
+
+  /**
+   * Submit a community post or a support request.
+   *   POST /api/community/messages    kind=COMMUNITY|SUPPORT
+   *   POST /api/community/reports     kind=REPORT (a moderated problem report)
+   */
+  const submitCommunityMessage = (req: express.Request, res: express.Response) => {
+    const user = res.locals.user;
+    const body = typeof req.body?.body === 'string' ? req.body.body.trim() : '';
+    if (!body) {
+      return res.status(400).json({ error: 'A message is required.', code: 'EMPTY_MESSAGE' });
+    }
+    if (body.length > 5000) {
+      return res.status(400).json({ error: 'Message is too long (max 5000 characters).', code: 'MESSAGE_TOO_LONG' });
+    }
+
+    // Optional attachment: a user may send a screenshot / screen recording /
+    // audio clip with a support request. Only image|video|audio MIME types and
+    // only under the community cap are accepted (separate from the ASR policy).
+    let attachment: { name: string; mime: string; bytes: number; key: string } | undefined;
+    const file = (req.file ?? undefined) as Express.Multer.File | undefined;
+    if (file) {
+      if (file.size > COMMUNITY_ATTACHMENT_MAX_BYTES) {
+        return res.status(413).json({
+          error: 'Attachment is too large.',
+          code: 'ATTACHMENT_TOO_LARGE',
+        });
+      }
+      const mime = String(file.mimetype || '').toLowerCase();
+      if (!COMMUNITY_ATTACHMENT_MIME_PREFIXES.some((p) => mime.startsWith(p))) {
+        return res.status(415).json({
+          error: 'Attachment must be an image, video or audio file.',
+          code: 'ATTACHMENT_TYPE_NOT_ALLOWED',
+        });
+      }
+      attachment = {
+        name: safeOriginalName(file.originalname || 'attachment'),
+        mime,
+        bytes: file.size,
+        key: `${user.id}/${newId()}${extensionForMime(mime)}`,
+      };
+    }
+
+    const requestedCategory = typeof req.body?.category === 'string' ? req.body.category : undefined;
+    const category =
+      requestedCategory && (SUPPORT_CATEGORIES as string[]).includes(requestedCategory)
+        ? (requestedCategory as SupportCategory)
+        : undefined;
+
+    // The kind comes from the ROUTE, never from the body, so a user cannot
+    // submit a "community post" through the support endpoint or vice versa.
+    const kind: 'COMMUNITY' | 'SUPPORT' | 'REPORT' = (res.locals.communityKind ?? 'COMMUNITY') as
+      | 'COMMUNITY'
+      | 'SUPPORT'
+      | 'REPORT';
+    const storeKind: 'COMMUNITY' | 'SUPPORT' = kind === 'COMMUNITY' ? 'COMMUNITY' : 'SUPPORT';
+
+    // Store the attachment bytes BEFORE moderation so a flagged-but-reviewed
+    // report keeps its evidence. Storage is private to the server.
+    const attachPromise = attachment && file
+      ? communityAttachments.put(attachment.key, file.buffer)
+      : Promise.resolve();
+
+    attachPromise
+      .then(() => {
+        const result = moderation.reviewSubmission({
+          userId: user.id,
+          kind: storeKind,
+          body,
+          category,
+          attachment,
+        });
+        res.status(result.status).json({
+          outcome: result.outcome,
+          message: result.message,
+          accepted: result.accepted,
+          messageId: result.messageId,
+          restriction: result.restriction,
+          case: result.case
+            ? {
+                id: result.case.id,
+                action: result.case.action,
+                category: result.case.category,
+                createdAt: result.case.createdAt,
+              }
+            : undefined,
+        });
+      })
+      .catch((err) => {
+        nestedLog.error('community submission failed', { error: String(err) });
+        res.status(500).json({ error: 'Could not save the submission. Please try again.', code: 'SAVE_FAILED' });
+      });
+  };
+
+  app.post('/api/community/messages', auth(), communityUpload.single('attachment'), (req, res) => {
+    res.locals.communityKind = 'COMMUNITY';
+    submitCommunityMessage(req, res);
+  });
+
+  app.post('/api/community/reports', auth(), communityUpload.single('attachment'), (req, res) => {
+    res.locals.communityKind = 'REPORT';
+    submitCommunityMessage(req, res);
+  });
+
+  app.post('/api/community/support', auth(), communityUpload.single('attachment'), (req, res) => {
+    res.locals.communityKind = 'SUPPORT';
+    submitCommunityMessage(req, res);
+  });
+
+  // ---------------------------------------------------------------------------
   // ADMIN API — server-side owner verification.
   //
   // Two independent checks, both AFTER bearer-token authentication:
@@ -1804,6 +2004,134 @@ async function startServer() {
       },
     });
   });
+
+  /**
+   * Admin-only moderation view. Requires a verified owner account exactly like
+   * every other admin route (auth() + requireAdmin).
+   */
+  app.get('/api/admin/moderation', auth(), requireAdmin, (req, res) => {
+    const now = Date.now();
+    res.json({
+      activeRestrictions: moderationRepo.activeRestrictions(now).map((r) => ({
+        userId: r.userId,
+        email: users.getById(r.userId)?.email ?? null,
+        ownerEmail: users.getById(r.userId)?.ownerEmail ?? null,
+        startedAt: r.startedAt,
+        expiresAt: r.expiresAt,
+        extendedCount: r.extendedCount,
+        automatic: r.automatic,
+      })),
+      cases: moderationRepo.listCases(200).map((c) => ({
+        id: c.id,
+        userId: c.userId,
+        email: users.getById(c.userId)?.email ?? null,
+        ownerEmail: users.getById(c.userId)?.ownerEmail ?? null,
+        category: c.category,
+        action: c.action,
+        confidence: c.confidence,
+        automatic: c.automatic,
+        createdAt: c.createdAt,
+        reason: c.reason,
+        excerpt: c.excerpt,
+        adminNote: c.adminNote ?? null,
+        reviewedAt: c.reviewedAt ?? null,
+        restrictionStartedAt: c.restrictionStartedAt ?? null,
+        restrictionExpiresAt: c.restrictionExpiresAt ?? null,
+      })),
+      messages: moderationRepo.listMessages(200).map((m) => ({
+        id: m.id,
+        userId: m.userId,
+        kind: m.kind,
+        category: m.category ?? null,
+        body: m.body,
+        accepted: m.accepted,
+        createdAt: m.createdAt,
+        attachmentName: m.attachmentName ?? null,
+        attachmentMime: m.attachmentMime ?? null,
+        attachmentBytes: m.attachmentBytes ?? null,
+        attachmentKey: m.attachmentKey ?? null,
+      })),
+      telegram: TELEGRAM_MODERATION_NOTE,
+    });
+  });
+
+  /** Mark a moderation case reviewed. */
+  app.post('/api/admin/moderation/cases/:id/review', auth(), requireAdmin, (req, res) => {
+    const user = res.locals.user;
+    const out = moderation.reviewCase({
+      caseId: req.params.id,
+      adminUserId: user.id,
+      adminEmail: user.email ?? user.ownerEmail,
+      note: typeof req.body?.note === 'string' ? req.body.note.slice(0, 500) : undefined,
+    });
+    if (!out.ok) return res.status(404).json({ error: out.reason, code: 'NOT_FOUND' });
+    res.json({ ok: true, case: out.case });
+  });
+
+  /** Manually extend an active restriction (server-bounded duration). */
+  app.post('/api/admin/moderation/restrictions/extend', auth(), requireAdmin, (req, res) => {
+    const user = res.locals.user;
+    const targetId = typeof req.body?.userId === 'string' ? req.body.userId : '';
+    if (!targetId) {
+      return res.status(400).json({ error: 'userId is required.', code: 'MISSING_USER_ID' });
+    }
+    const out = moderation.extendRestriction({
+      userId: targetId,
+      additionalMs: Number(req.body?.additionalMs ?? Number(req.body?.additionalHours ?? 0) * 3600_000),
+      adminUserId: user.id,
+      adminEmail: user.email ?? user.ownerEmail,
+      note: typeof req.body?.note === 'string' ? req.body.note.slice(0, 500) : undefined,
+    });
+    if (!out.ok) {
+      return res.status(out.reason?.includes('positive') ? 400 : 404).json({
+        error: out.reason,
+        code: 'EXTEND_FAILED',
+      });
+    }
+    res.json({ ok: true, restriction: out.restriction, case: out.case });
+  });
+
+  /** Release a restriction early. */
+  app.post('/api/admin/moderation/restrictions/release', auth(), requireAdmin, (req, res) => {
+    const user = res.locals.user;
+    const targetId = typeof req.body?.userId === 'string' ? req.body.userId : '';
+    if (!targetId) {
+      return res.status(400).json({ error: 'userId is required.', code: 'MISSING_USER_ID' });
+    }
+    const out = moderation.releaseRestriction({
+      userId: targetId,
+      adminUserId: user.id,
+      adminEmail: user.email ?? user.ownerEmail,
+      note: typeof req.body?.note === 'string' ? req.body.note.slice(0, 500) : undefined,
+    });
+    if (!out.ok) return res.status(404).json({ error: out.reason, code: 'RELEASE_FAILED' });
+    res.json({ ok: true, restriction: out.restriction, case: out.case });
+  });
+
+  /**
+   * Private, admin-authenticated attachment retrieval. Attachments are never
+   * publicly addressable: no user can read another user's screenshot.
+   */
+  app.get('/api/admin/moderation/attachments/:userId/*key', auth(), requireAdmin, async (req, res) => {
+    const { userId } = req.params;
+    const rawKey = Array.isArray(req.params.key) ? req.params.key.join('/') : String(req.params.key);
+    // The key is looked up against stored records, never trusted from the URL.
+    const record = moderationRepo.messageByAttachmentKey(userId, rawKey);
+    if (!record?.attachmentKey) {
+      return res.status(404).json({ error: 'Attachment not found.', code: 'NOT_FOUND' });
+    }
+    const bytes = await communityAttachments.get(record.attachmentKey).catch(() => null);
+    if (!bytes) return res.status(404).json({ error: 'Attachment not found.', code: 'NOT_FOUND' });
+    res.setHeader('Content-Type', record.attachmentMime ?? 'application/octet-stream');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader(
+      'Content-Disposition',
+      `inline; filename="${record.attachmentName ?? 'attachment'}"`.replace(/"/g, '')
+    );
+    res.send(bytes);
+  });
+
+  // ---------------------------------------------------------------------------
 
   // ---------------------------------------------------------------------
   // CANONICAL PRODUCTION ROUTES

@@ -95,3 +95,20 @@ export function safeOriginalName(name: string): string {
   const base = path.basename(String(name || 'audio').replace(/[^\w.\- ]/g, '_'));
   return base || 'audio';
 }
+
+/** Conservative extension for a community attachment, from its MIME type. */
+export function extensionForMime(mime: string): string {
+  const m = String(mime || '').toLowerCase();
+  if (m === 'image/png') return '.png';
+  if (m === 'image/jpeg' || m === 'image/jpg') return '.jpg';
+  if (m === 'image/gif') return '.gif';
+  if (m === 'image/webp') return '.webp';
+  if (m === 'video/mp4') return '.mp4';
+  if (m === 'video/webm') return '.webm';
+  if (m === 'audio/mpeg' || m === 'audio/mp3') return '.mp3';
+  if (m === 'audio/wav' || m === 'audio/x-wav') return '.wav';
+  if (m === 'audio/webm') return '.weba';
+  if (m === 'audio/ogg') return '.ogg';
+  // Never trust the client filename for the stored extension.
+  return '';
+}

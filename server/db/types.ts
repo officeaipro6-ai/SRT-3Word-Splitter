@@ -70,6 +70,93 @@ export interface ProviderSafetyRecord {
  */
 export type CreditMode = 'NORMAL' | 'UNLIMITED';
 
+// ---------------------------------------------------------------------------
+// Community & Support moderation (server-side enforcement only)
+//
+// Privacy: these records deliberately store a user id, a category, a decision
+// and a short truncated excerpt. They never store IP addresses, device data or
+// any credential, and a user's private details are only ever exposed through
+// the already-protected admin surface.
+// ---------------------------------------------------------------------------
+
+/** Violation families the community rules cover. */
+export type ViolationCategory = 'ABUSIVE' | 'VULGAR' | 'INSULT' | 'HARASSMENT' | 'THREAT' | 'HATEFUL';
+
+/** What the server decided to do. Always server-decided, never client-supplied. */
+export type ModerationAction = 'WARNING' | 'RESTRICTED' | 'ADMIN_REVIEW' | 'RESTRICTION_EXTENDED' | 'RESTRICTION_RELEASED';
+
+/**
+ * Classifier confidence. UNCERTAIN never punishes: it is routed to an admin
+ * instead, which is the false-positive protection.
+ */
+export type ModerationConfidence = 'CONFIRMED' | 'UNCERTAIN';
+
+/** User-facing support/report buckets. */
+export type SupportCategory = 'TRANSCRIPTION' | 'TIMING' | 'TAGGING' | 'SRT' | 'CREDITS' | 'LOGIN' | 'OTHER';
+
+export interface ModerationCaseRecord {
+  id: string;
+  /** Account the decision applies to. */
+  userId: string;
+  category: ViolationCategory;
+  action: ModerationAction;
+  /** CONFIRMED = server is sure; UNCERTAIN = routed to an admin, not punished. */
+  confidence: ModerationConfidence;
+  /** True when the system decided this without a human. */
+  automatic: boolean;
+  createdAt: string;
+  /** Present only when the action involved an active restriction. */
+  restrictionStartedAt?: string;
+  restrictionExpiresAt?: string;
+  /** Admin who reviewed/manually acted, and what they did. */
+  adminUserId?: string;
+  /** Server-verified owner email of the acting admin (never client-supplied). */
+  adminEmail?: string;
+  adminNote?: string;
+  reviewedAt?: string;
+  reviewedBy?: string;
+  /**
+   * Short, truncated excerpt of the submitted text so an admin can judge the
+   * case. Never the full message, and never any credential.
+   */
+  excerpt?: string;
+  /** Why the classifier decided this (category-level, not a raw word list). */
+  reason?: string;
+}
+
+export interface CommunityRestrictionRecord {
+  userId: string;
+  startedAt: string;
+  expiresAt: string;
+  /** Server-maintained count of CONFIRMED violations behind this restriction. */
+  violationCount: number;
+  /** True when applied automatically, false when an admin applied it. */
+  automatic: boolean;
+  /** How many times an admin has extended it. */
+  extendedCount: number;
+  releasedAt?: string;
+  releasedBy?: string;
+}
+
+export interface CommunityMessageRecord {
+  id: string;
+  userId: string;
+  kind: 'COMMUNITY' | 'SUPPORT';
+  category?: SupportCategory;
+  /** Full submitted text, stored server-side and only surfaced to admins. */
+  body: string;
+  createdAt: string;
+  /** False when the server withheld it (warning, restriction or admin review). */
+  accepted: boolean;
+  moderationCaseId?: string;
+  /** Attachment metadata only; bytes live in the community storage dir. */
+  attachmentName?: string;
+  attachmentMime?: string;
+  attachmentBytes?: number;
+  /** Private storage key. Only ever readable through an admin-authenticated route. */
+  attachmentKey?: string;
+}
+
 export type CreditTransactionType =
   | 'CREDIT'
   | 'DEBIT'
@@ -209,9 +296,17 @@ export interface DbShape {
    * this feature keep loading unchanged; `store.ts` normalises it on load.
    */
   providerSafety?: ProviderSafetyRecord;
+  /**
+   * Community moderation state. All optional so databases written before this
+   * feature keep loading unchanged; `store.ts` normalises them on load.
+   * These tables are independent of jobs/credits/provider safety.
+   */
+  moderationCases?: ModerationCaseRecord[];
+  communityRestrictions?: CommunityRestrictionRecord[];
+  communityMessages?: CommunityMessageRecord[];
 }
 
-export const DB_VERSION = 3;
+export const DB_VERSION = 4;
 
 export function emptyDbShape(): DbShape {
   return { version: DB_VERSION, users: [], jobs: [], transactions: [] };

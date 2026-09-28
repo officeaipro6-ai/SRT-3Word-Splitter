@@ -443,3 +443,216 @@ export function makeIdempotencyKey(): string {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
   return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
+
+// ---------------------------------------------------------------------------
+// Community & Support
+//
+// IMPORTANT: these are thin transport wrappers only. Nothing here decides
+// whether a message is acceptable, computes a restriction, or supplies a
+// duration/timestamp — every moderation fact comes back from the server.
+// ---------------------------------------------------------------------------
+
+export type SupportCategory =
+  | 'TRANSCRIPTION'
+  | 'TIMING'
+  | 'TAGGING'
+  | 'SRT'
+  | 'CREDITS'
+  | 'LOGIN'
+  | 'OTHER';
+
+export type ModerationOutcome = 'ACCEPTED' | 'WARNING' | 'RESTRICTED' | 'ADMIN_REVIEW' | 'BLOCKED';
+
+export interface CommunityGuidelines {
+  guidelines: string;
+  categories: SupportCategory[];
+  categoryLabels: Record<SupportCategory, string>;
+  attachmentMaxBytes: number;
+  attachmentAccept: string;
+  telegram: string;
+}
+
+export interface RestrictionStatus {
+  restricted: boolean;
+  startedAt?: string;
+  expiresAt?: string;
+  remainingMs: number;
+  extendedCount: number;
+  automatic: boolean;
+}
+
+export interface CommunitySubmissionResult {
+  outcome: ModerationOutcome;
+  message: string;
+  accepted: boolean;
+  messageId?: string;
+  restriction?: RestrictionStatus;
+  case?: { id: string; action: string; category: string; createdAt: string };
+}
+
+export async function fetchCommunityGuidelines(): Promise<CommunityGuidelines> {
+  // Public: contains no user data, so a plain fetch is correct here.
+  const res = await fetch('/api/community/guidelines');
+  if (!res.ok) throw new Error('Failed to load community guidelines.');
+  return res.json();
+}
+
+export async function fetchCommunityStatus(): Promise<RestrictionStatus> {
+  const res = await authFetch('/api/community/status');
+  if (!res.ok) throw new Error('Failed to load community status.');
+  const data = (await res.json()) as RestrictionStatus;
+  return data;
+}
+
+/**
+ * Submit a message. `kind` picks the endpoint; the server uses the ROUTE to
+ * decide the kind, so a client cannot mislabel a support request as a post.
+ * A 403/422 is a valid moderation answer, not a transport error, so the
+ * server's message is surfaced to the user instead of throwing.
+ */
+async function submitCommunity(
+  endpoint: string,
+  opts: { body: string; category?: SupportCategory; attachment?: File | null }
+): Promise<CommunitySubmissionResult> {
+  const form = new FormData();
+  form.append('body', opts.body);
+  if (opts.category) form.append('category', opts.category);
+  if (opts.attachment) form.append('attachment', opts.attachment);
+  const res = await authFetch(endpoint, { method: 'POST', body: form });
+  const data = (await res.json().catch(() => ({}))) as Partial<CommunitySubmissionResult> & {
+    error?: string;
+  };
+  if (!res.ok && !data.outcome) {
+    throw new Error(data.error || 'Could not send your message.');
+  }
+  return {
+    outcome: data.outcome ?? 'ACCEPTED',
+    message: data.message || data.error || '',
+    accepted: data.accepted === true,
+    messageId: data.messageId,
+    restriction: data.restriction,
+    case: data.case,
+  };
+}
+
+export function sendCommunityMessage(opts: {
+  body: string;
+  attachment?: File | null;
+}): Promise<CommunitySubmissionResult> {
+  return submitCommunity('/api/community/messages', opts);
+}
+
+export function sendSupportRequest(opts: {
+  body: string;
+  category?: SupportCategory;
+  attachment?: File | null;
+}): Promise<CommunitySubmissionResult> {
+  return submitCommunity('/api/community/support', opts);
+}
+
+export function reportProblem(opts: {
+  body: string;
+  attachment?: File | null;
+}): Promise<CommunitySubmissionResult> {
+  return submitCommunity('/api/community/reports', opts);
+}
+
+// ---- Admin moderation (owner-only; the server enforces that, not the UI) ----
+
+export interface AdminModerationCase {
+  id: string;
+  userId: string;
+  email: string | null;
+  ownerEmail: string | null;
+  category: string;
+  action: string;
+  confidence: string;
+  automatic: boolean;
+  createdAt: string;
+  reason: string | null;
+  excerpt: string | null;
+  adminNote: string | null;
+  reviewedAt: string | null;
+  restrictionStartedAt: string | null;
+  restrictionExpiresAt: string | null;
+}
+
+export interface AdminActiveRestriction {
+  userId: string;
+  email: string | null;
+  ownerEmail: string | null;
+  startedAt: string;
+  expiresAt: string;
+  extendedCount: number;
+  automatic: boolean;
+}
+
+export interface AdminModerationMessage {
+  id: string;
+  userId: string;
+  kind: string;
+  category: string | null;
+  body: string;
+  accepted: boolean;
+  createdAt: string;
+  attachmentName: string | null;
+  attachmentMime: string | null;
+  attachmentBytes: number | null;
+  attachmentKey: string | null;
+}
+
+export async function fetchAdminModeration(): Promise<{
+  activeRestrictions: AdminActiveRestriction[];
+  cases: AdminModerationCase[];
+  messages: AdminModerationMessage[];
+  telegram: string;
+}> {
+  const res = await authFetch('/api/admin/moderation');
+  if (!res.ok) throw new Error('Failed to load moderation.');
+  return res.json();
+}
+
+export async function markModerationCaseReviewed(
+  caseId: string,
+  note?: string
+): Promise<{ ok: true }> {
+  const res = await authFetch(
+    `/api/admin/moderation/cases/${encodeURIComponent(caseId)}/review`,
+    { method: 'POST', body: JSON.stringify({ note }) }
+  );
+  if (!res.ok) throw new Error('Failed to mark the case reviewed.');
+  return { ok: true };
+}
+
+export async function extendRestriction(
+  userId: string,
+  additionalMs: number,
+  note?: string
+): Promise<{ ok: true }> {
+  const res = await authFetch('/api/admin/moderation/restrictions/extend', {
+    method: 'POST',
+    body: JSON.stringify({ userId, additionalMs, note }),
+  });
+  if (!res.ok) throw new Error('Failed to extend the restriction.');
+  return { ok: true };
+}
+
+export async function releaseRestriction(
+  userId: string,
+  note?: string
+): Promise<{ ok: true }> {
+  const res = await authFetch('/api/admin/moderation/restrictions/release', {
+    method: 'POST',
+    body: JSON.stringify({ userId, note }),
+  });
+  if (!res.ok) throw new Error('Failed to release the restriction.');
+  return { ok: true };
+}
+
+/** Admin-only, authenticated attachment URL. Never linkable by a normal user. */
+export function adminAttachmentUrl(userId: string, key: string): string {
+  return `/api/admin/moderation/attachments/${encodeURIComponent(userId)}/${key
+    .split('/')
+    .map(encodeURIComponent)
+    .join('/')}`;
+}

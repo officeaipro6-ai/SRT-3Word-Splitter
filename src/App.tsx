@@ -14,6 +14,7 @@ import { RuleComplianceAudit } from './components/RuleComplianceAudit';
 import { ExportToolbar } from './components/ExportToolbar';
 import { RulesGuideModal } from './components/RulesGuideModal';
 import { CreditsWidget } from './components/CreditsWidget';
+import { CommunitySupport } from './components/CommunitySupport';
 import { AccountPanel } from './components/AccountPanel';
 import { ensureSession, AUTH_CHANGED_EVENT, type SessionInfo } from './lib/sessionClient';
 import { CreditPacksPanel } from './components/CreditPacksPanel';
@@ -491,6 +492,9 @@ export default function App() {
 
       {/* Normal user account strip (email/password, separate from admin auth) */}
       <AccountPanel />
+
+      {/* Community & Support (additive; all moderation is decided server-side) */}
+      <CommunitySupport />
 
       {/* Top Header */}
       <Header

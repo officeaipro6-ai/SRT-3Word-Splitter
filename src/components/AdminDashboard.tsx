@@ -12,6 +12,7 @@ import {
   Bell,
   RotateCcw,
   AlertTriangle,
+  ShieldAlert,
 } from 'lucide-react';
 import {
   fetchAdminUsers,
@@ -24,14 +25,22 @@ import {
   fetchProviderSafety,
   resetProviderSafety,
   fetchAdminAlerts,
+  fetchAdminModeration,
+  markModerationCaseReviewed,
+  extendRestriction,
+  releaseRestriction,
+  adminAttachmentUrl,
   type AdminUserView,
   type AdminTxn,
   type AdminJob,
   type ProviderSafety,
   type OwnerAlert,
+  type AdminModerationCase,
+  type AdminActiveRestriction,
+  type AdminModerationMessage,
 } from '../lib/sessionClient';
 
-type Section = 'users' | 'transactions' | 'jobs' | 'provider';
+type Section = 'users' | 'transactions' | 'jobs' | 'provider' | 'moderation';
 
 interface PendingOp {
   mode: 'grant' | 'debit';
@@ -61,6 +70,10 @@ export const AdminDashboard: React.FC = () => {
   const [jobs, setJobs] = useState<AdminJob[]>([]);
   const [safety, setSafety] = useState<ProviderSafety | null>(null);
   const [alerts, setAlerts] = useState<OwnerAlert[]>([]);
+  const [modCases, setModCases] = useState<AdminModerationCase[]>([]);
+  const [modRestrictions, setModRestrictions] = useState<AdminActiveRestriction[]>([]);
+  const [modMessages, setModMessages] = useState<AdminModerationMessage[]>([]);
+  const [modNote, setModNote] = useState<Record<string, string>>({});
   const [alertDelivery, setAlertDelivery] = useState<{ transports: string[]; connected: boolean; note: string | null } | null>(null);
   const [resetting, setResetting] = useState(false);
   const [loading, setLoading] = useState<string | null>(null);
@@ -102,7 +115,13 @@ export const AdminDashboard: React.FC = () => {
     try {
       if (s === 'transactions') setTxns(await fetchAdminTransactions());
       else if (s === 'jobs') setJobs(await fetchAdminJobs());
-      else if (s === 'provider') {
+      else if (s === 'moderation') {
+        setLoading('moderation');
+        const mod = await fetchAdminModeration();
+        setModCases(mod.cases);
+        setModRestrictions(mod.activeRestrictions);
+        setModMessages(mod.messages);
+      } else if (s === 'provider') {
         setSafety(await fetchProviderSafety());
         const alertData = await fetchAdminAlerts();
         setAlerts(alertData.alerts);
@@ -209,6 +228,62 @@ export const AdminDashboard: React.FC = () => {
     }
   };
 
+  /**
+   * Community moderation actions. Every one of these is a server call: this UI
+   * cannot extend or release a restriction by itself, and the server re-checks
+   * the verified-owner session on each request.
+   */
+  const reloadModeration = async () => {
+    const mod = await fetchAdminModeration();
+    setModCases(mod.cases);
+    setModRestrictions(mod.activeRestrictions);
+    setModMessages(mod.messages);
+  };
+
+  const doReviewCase = async (id: string) => {
+    setLoading('op');
+    try {
+      await markModerationCaseReviewed(id, modNote[id]?.trim() || undefined);
+      flash('Case marked as reviewed.');
+      await reloadModeration();
+    } catch (e: any) {
+      flash(e.message);
+    } finally {
+      setLoading(null);
+    }
+  };
+
+  const doExtend = async (userId: string, hours: number) => {
+    const label = hours === 24 ? 'another 24 hours' : `another ${hours} hour(s)`;
+    if (!window.confirm(`Extend this restriction by ${label}?\n\nThe new expiry is calculated by the server.`)) {
+      return;
+    }
+    setLoading('op');
+    try {
+      await extendRestriction(userId, hours * 60 * 60 * 1000, modNote[userId]?.trim() || undefined);
+      flash('Restriction extended.');
+      await reloadModeration();
+    } catch (e: any) {
+      flash(e.message);
+    } finally {
+      setLoading(null);
+    }
+  };
+
+  const doRelease = async (userId: string) => {
+    if (!window.confirm('Release this restriction now? The user will be able to post immediately.')) return;
+    setLoading('op');
+    try {
+      await releaseRestriction(userId, modNote[userId]?.trim() || undefined);
+      flash('Restriction released.');
+      await reloadModeration();
+    } catch (e: any) {
+      flash(e.message);
+    } finally {
+      setLoading(null);
+    }
+  };
+
   const filteredUsers = users.filter((u) => {
     const q = query.trim().toLowerCase();
     if (!q) return true;
@@ -267,6 +342,9 @@ export const AdminDashboard: React.FC = () => {
             </button>
             <button className={tabCls(section === 'provider')} onClick={() => void loadSection('provider')}>
               <span className="inline-flex items-center gap-1"><Activity className="w-3.5 h-3.5" /> Provider</span>
+            </button>
+            <button className={tabCls(section === 'moderation')} onClick={() => void loadSection('moderation')}>
+              <span className="inline-flex items-center gap-1"><ShieldAlert className="w-3.5 h-3.5" /> Moderation</span>
             </button>
           </div>
         </div>
@@ -610,7 +688,175 @@ export const AdminDashboard: React.FC = () => {
       </div>
 
       {/* ── Confirm modal (grant/deduct) ─────────────────────────────────── */}
-      {pending && (
+        {/* ── Moderation section (community & support) ─────────────────── */}
+        {section === 'moderation' && (
+          <div className="grid grid-cols-1 gap-4">
+            <div className="rounded-xl bg-white border border-slate-200 p-4 space-y-3">
+              <div className="flex items-center gap-2">
+                <ShieldAlert className="w-4 h-4 text-amber-600" />
+                <div className="text-sm font-bold text-slate-800">Active restrictions</div>
+              </div>
+              <div className="text-[10px] text-slate-400">
+                An automatic restriction lasts 2 hours. You can extend it for serious or repeated
+                abuse, or release it early. Both actions are audited against your verified email.
+              </div>
+              {modRestrictions.length === 0 ? (
+                <div className="text-xs text-slate-400 italic">No active restrictions.</div>
+              ) : (
+                modRestrictions.map((r) => (
+                  <div key={r.userId} className="rounded-lg border border-slate-200 p-3 space-y-2">
+                    <div className="text-xs text-slate-700">
+                      <div>
+                        <span className="font-semibold">
+                          {r.email ?? r.ownerEmail ?? r.userId}
+                        </span>{' '}
+                        <span className="font-mono text-[10px] text-slate-400">{r.userId}</span>
+                      </div>
+                      <div className="text-[11px] text-slate-500">
+                        Expires: {new Date(r.expiresAt).toLocaleString()} · started{' '}
+                        {new Date(r.startedAt).toLocaleString()} ·{' '}
+                        {r.automatic ? 'automatic' : 'manual'} · extended {r.extendedCount}×
+                      </div>
+                    </div>
+                    <input
+                      value={modNote[r.userId] ?? ''}
+                      onChange={(e) => setModNote((n) => ({ ...n, [r.userId]: e.target.value }))}
+                      placeholder="Note for the audit trail (optional)"
+                      className="w-full rounded-lg border border-slate-300 px-2 py-1 text-xs"
+                    />
+                    <div className="flex flex-wrap gap-2">
+                      <button
+                        onClick={() => void doExtend(r.userId, 1)}
+                        className="px-2.5 py-1 rounded-lg text-xs font-semibold text-amber-700 bg-amber-50 border border-amber-200 hover:bg-amber-100 cursor-pointer"
+                      >
+                        Extend 1h
+                      </button>
+                      <button
+                        onClick={() => void doExtend(r.userId, 24)}
+                        className="px-2.5 py-1 rounded-lg text-xs font-semibold text-amber-700 bg-amber-50 border border-amber-200 hover:bg-amber-100 cursor-pointer"
+                      >
+                        Extend 24h
+                      </button>
+                      <button
+                        onClick={() => void doRelease(r.userId)}
+                        className="px-2.5 py-1 rounded-lg text-xs font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 hover:bg-emerald-100 cursor-pointer"
+                      >
+                        Release now
+                      </button>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <div className="rounded-xl bg-white border border-slate-200 p-4 space-y-3">
+              <div className="text-sm font-bold text-slate-800">Moderation cases</div>
+              <div className="text-[10px] text-slate-400">
+                First confirmed violation = warning only. A repeat = 2-hour restriction.
+                ADMIN_REVIEW cases are ambiguous and were never punished automatically — read the
+                context and mark them reviewed.
+              </div>
+              {modCases.length === 0 ? (
+                <div className="text-xs text-slate-400 italic">No moderation cases recorded.</div>
+              ) : (
+                modCases.map((c) => (
+                  <div key={c.id} className="rounded-lg border border-slate-200 p-3 space-y-2">
+                    <div className="flex flex-wrap items-center gap-2 text-[11px]">
+                      <span className="font-semibold text-slate-800">{c.action}</span>
+                      <span className="px-1.5 py-0.5 rounded bg-slate-100 text-slate-600">{c.category}</span>
+                      <span
+                        className={`px-1.5 py-0.5 rounded ${
+                          c.confidence === 'UNCERTAIN'
+                            ? 'bg-amber-100 text-amber-800'
+                            : 'bg-rose-100 text-rose-800'
+                        }`}
+                      >
+                        {c.confidence}
+                      </span>
+                      <span className="text-slate-400">{c.automatic ? 'automatic' : 'manual'}</span>
+                      <span className="ml-auto text-slate-400">
+                        {new Date(c.createdAt).toLocaleString()}
+                      </span>
+                    </div>
+                    <div className="text-[11px] text-slate-600">
+                      <span className="font-mono">{c.email ?? c.ownerEmail ?? c.userId}</span>
+                    </div>
+                    {c.reason && <div className="text-[11px] text-slate-500">{c.reason}</div>}
+                    {c.excerpt && (
+                      <div className="text-[11px] text-slate-700 bg-slate-50 border border-slate-200 rounded px-2 py-1 italic">
+                        “{c.excerpt}”
+                      </div>
+                    )}
+                    {c.restrictionExpiresAt && (
+                      <div className="text-[10px] text-slate-500">
+                        Restriction window: {new Date(c.restrictionStartedAt!).toLocaleString()} →{' '}
+                        {new Date(c.restrictionExpiresAt).toLocaleString()}
+                      </div>
+                    )}
+                    {c.reviewedAt ? (
+                      <div className="text-[10px] text-emerald-700">Reviewed {new Date(c.reviewedAt).toLocaleString()}</div>
+                    ) : (
+                      <div className="flex items-center gap-2">
+                        <input
+                          value={modNote[c.id] ?? ''}
+                          onChange={(e) => setModNote((n) => ({ ...n, [c.id]: e.target.value }))}
+                          placeholder="Review note (optional)"
+                          className="flex-1 rounded-lg border border-slate-300 px-2 py-1 text-xs"
+                        />
+                        <button
+                          onClick={() => void doReviewCase(c.id)}
+                          className="px-2.5 py-1 rounded-lg text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 cursor-pointer"
+                        >
+                          Mark reviewed
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                ))
+              )}
+            </div>
+
+            <div className="rounded-xl bg-white border border-slate-200 p-4 space-y-2">
+              <div className="text-sm font-bold text-slate-800">Submitted messages</div>
+              <div className="text-[10px] text-slate-400">
+                Private — only you can see this. Attachments open through an owner-only route.
+              </div>
+              {modMessages.length === 0 ? (
+                <div className="text-xs text-slate-400 italic">No messages yet.</div>
+              ) : (
+                modMessages.map((m) => (
+                  <div key={m.id} className="rounded-lg border border-slate-200 p-3 space-y-1">
+                    <div className="flex flex-wrap items-center gap-2 text-[10px] text-slate-400">
+                      <span className="font-semibold text-slate-600">{m.kind}</span>
+                      {m.category && <span className="px-1.5 py-0.5 rounded bg-slate-100">{m.category}</span>}
+                      <span
+                        className={`px-1.5 py-0.5 rounded ${
+                          m.accepted ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-200 text-slate-700'
+                        }`}
+                      >
+                        {m.accepted ? 'accepted' : 'withheld'}
+                      </span>
+                      <span className="ml-auto">{new Date(m.createdAt).toLocaleString()}</span>
+                    </div>
+                    <div className="text-xs text-slate-700 whitespace-pre-wrap break-words">{m.body}</div>
+                    {m.attachmentKey && (
+                      <a
+                        href={adminAttachmentUrl(m.userId, m.attachmentKey)}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-block text-[10px] font-semibold text-indigo-700 underline"
+                      >
+                        {m.attachmentName} ({m.attachmentMime})
+                      </a>
+                    )}
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        )}
+
+        {pending && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm p-4">
           <div className="rounded-2xl bg-white w-full max-w-sm p-5 space-y-3 shadow-xl">
             <div className="text-sm font-bold text-slate-800">

@@ -16,6 +16,13 @@ import {
   type CreditMode,
   type ProviderSafetyRecord,
   type ProviderSafetyStatus,
+  type CommunityMessageRecord,
+  type CommunityRestrictionRecord,
+  type ModerationCaseRecord,
+  type ModerationAction,
+  type ModerationConfidence,
+  type SupportCategory,
+  type ViolationCategory,
 } from './types';
 
 export function newId(): string {
@@ -472,5 +479,220 @@ export class JobRepo {
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
       .slice(0, limit)
       .map((j) => structuredClone(j));
+  }
+}
+/**
+ * Community & Support moderation persistence.
+ *
+ * Deliberately separate from jobs/credits/provider safety: moderation state is
+ * additive and optional, and nothing in the transcription, timing, tagging,
+ * SRT, credit or provider-safety paths reads or writes it.
+ */
+export class ModerationRepo {
+  constructor(private readonly store: DataStore) {}
+
+  // ---- Cases (the audit trail) ------------------------------------------------
+
+  addCase(input: {
+    userId: string;
+    category: ViolationCategory;
+    action: ModerationAction;
+    confidence: ModerationConfidence;
+    automatic: boolean;
+    reason?: string;
+    excerpt?: string;
+    restrictionStartedAt?: string;
+    restrictionExpiresAt?: string;
+    adminUserId?: string;
+    adminEmail?: string;
+    adminNote?: string;
+  }): ModerationCaseRecord {
+    return this.store.mutate((db) => {
+      const record: ModerationCaseRecord = {
+        id: newId(),
+        userId: input.userId,
+        category: input.category,
+        action: input.action,
+        confidence: input.confidence,
+        automatic: input.automatic,
+        createdAt: new Date().toISOString(),
+        reason: input.reason,
+        excerpt: input.excerpt,
+        restrictionStartedAt: input.restrictionStartedAt,
+        restrictionExpiresAt: input.restrictionExpiresAt,
+        adminUserId: input.adminUserId,
+        adminEmail: input.adminEmail,
+        adminNote: input.adminNote,
+      };
+      db.moderationCases = db.moderationCases ?? [];
+      db.moderationCases.push(record);
+      return structuredClone(record);
+    });
+  }
+
+  casesForUser(userId: string): ModerationCaseRecord[] {
+    return (this.store.snapshot().moderationCases ?? [])
+      .filter((c) => c.userId === userId)
+      .map((c) => structuredClone(c));
+  }
+
+  /** CONFIRMED (i.e. punishable) cases only - UNCERTAIN ones never count. */
+  confirmedCaseCount(userId: string): number {
+    return (this.store.snapshot().moderationCases ?? []).filter(
+      (c) => c.userId === userId && c.confidence === 'CONFIRMED'
+    ).length;
+  }
+
+  listCases(limit = 200): ModerationCaseRecord[] {
+    return (this.store.snapshot().moderationCases ?? [])
+      .slice()
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .slice(0, limit)
+      .map((c) => structuredClone(c));
+  }
+
+  getCase(id: string): ModerationCaseRecord | null {
+    const found = (this.store.snapshot().moderationCases ?? []).find((c) => c.id === id);
+    return found ? structuredClone(found) : null;
+  }
+
+  /** Mark a case reviewed by an admin. */
+  markReviewed(id: string, admin: { adminUserId: string; adminEmail?: string; note?: string }): ModerationCaseRecord | null {
+    return this.store.mutate((db) => {
+      const found = (db.moderationCases ?? []).find((c) => c.id === id);
+      if (!found) return null;
+      found.reviewedAt = new Date().toISOString();
+      found.reviewedBy = admin.adminUserId;
+      found.adminUserId = admin.adminUserId;
+      found.adminEmail = admin.adminEmail;
+      if (admin.note) found.adminNote = admin.note;
+      return structuredClone(found);
+    });
+  }
+
+  // ---- Restrictions -----------------------------------------------------------
+
+  /** The current restriction for a user, or null when none / already expired. */
+  activeRestriction(userId: string, now = Date.now()): CommunityRestrictionRecord | null {
+    const found = (this.store.snapshot().communityRestrictions ?? []).find(
+      (r) => r.userId === userId && !r.releasedAt && new Date(r.expiresAt).getTime() > now
+    );
+    return found ? structuredClone(found) : null;
+  }
+
+  applyRestriction(input: {
+    userId: string;
+    durationMs: number;
+    violationCount: number;
+    automatic: boolean;
+  }, now = Date.now()): CommunityRestrictionRecord {
+    return this.store.mutate((db) => {
+      const record: CommunityRestrictionRecord = {
+        userId: input.userId,
+        startedAt: new Date(now).toISOString(),
+        expiresAt: new Date(now + input.durationMs).toISOString(),
+        violationCount: input.violationCount,
+        automatic: input.automatic,
+        extendedCount: 0,
+      };
+      db.communityRestrictions = db.communityRestrictions ?? [];
+      db.communityRestrictions.push(record);
+      return structuredClone(record);
+    });
+  }
+
+  /** Admin extension. Duration is computed server-side, never accepted raw. */
+  extendRestriction(userId: string, additionalMs: number, now = Date.now()): CommunityRestrictionRecord | null {
+    return this.store.mutate((db) => {
+      const found = (db.communityRestrictions ?? []).find(
+        (r) => r.userId === userId && !r.releasedAt && new Date(r.expiresAt).getTime() > now
+      );
+      if (!found) return null;
+      found.expiresAt = new Date(new Date(found.expiresAt).getTime() + additionalMs).toISOString();
+      found.extendedCount = (found.extendedCount ?? 0) + 1;
+      return structuredClone(found);
+    });
+  }
+
+  /** Admin release: the restriction stops applying immediately. */
+  releaseRestriction(userId: string, releasedBy: string): CommunityRestrictionRecord | null {
+    return this.store.mutate((db) => {
+      const found = (db.communityRestrictions ?? []).find((r) => r.userId === userId && !r.releasedAt);
+      if (!found) return null;
+      found.releasedAt = new Date().toISOString();
+      found.releasedBy = releasedBy;
+      return structuredClone(found);
+    });
+  }
+
+  activeRestrictions(now = Date.now()): CommunityRestrictionRecord[] {
+    return (this.store.snapshot().communityRestrictions ?? [])
+      .filter((r) => !r.releasedAt && new Date(r.expiresAt).getTime() > now)
+      .map((r) => structuredClone(r));
+  }
+
+  restrictionsForUser(userId: string): CommunityRestrictionRecord[] {
+    return (this.store.snapshot().communityRestrictions ?? [])
+      .filter((r) => r.userId === userId)
+      .map((r) => structuredClone(r));
+  }
+
+  // ---- Submitted messages -----------------------------------------------------
+
+  addMessage(input: {
+    userId: string;
+    kind: 'COMMUNITY' | 'SUPPORT';
+    category?: SupportCategory;
+    body: string;
+    accepted: boolean;
+    moderationCaseId?: string;
+    attachmentName?: string;
+    attachmentMime?: string;
+    attachmentBytes?: number;
+    attachmentKey?: string;
+  }): CommunityMessageRecord {
+    return this.store.mutate((db) => {
+      const record: CommunityMessageRecord = {
+        id: newId(),
+        userId: input.userId,
+        kind: input.kind,
+        category: input.category,
+        body: input.body,
+        accepted: input.accepted,
+        createdAt: new Date().toISOString(),
+        moderationCaseId: input.moderationCaseId,
+        attachmentName: input.attachmentName,
+        attachmentMime: input.attachmentMime,
+        attachmentBytes: input.attachmentBytes,
+        attachmentKey: input.attachmentKey,
+      };
+      db.communityMessages = db.communityMessages ?? [];
+      db.communityMessages.push(record);
+      return structuredClone(record);
+    });
+  }
+
+  messagesForUser(userId: string, limit = 50): CommunityMessageRecord[] {
+    return (this.store.snapshot().communityMessages ?? [])
+      .filter((m) => m.userId === userId)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .slice(0, limit)
+      .map((m) => structuredClone(m));
+  }
+
+  /** Find a stored attachment by its exact private key (admin-only retrieval). */
+  messageByAttachmentKey(userId: string, key: string): CommunityMessageRecord | null {
+    const found = (this.store.snapshot().communityMessages ?? []).find(
+      (m) => m.userId === userId && m.attachmentKey === key
+    );
+    return found ? structuredClone(found) : null;
+  }
+
+  listMessages(limit = 200): CommunityMessageRecord[] {
+    return (this.store.snapshot().communityMessages ?? [])
+      .slice()
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .slice(0, limit)
+      .map((m) => structuredClone(m));
   }
 }

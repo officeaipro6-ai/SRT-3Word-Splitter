@@ -18,7 +18,10 @@ import path from 'path';
 import { randomUUID } from 'crypto';
 import {
   DB_VERSION,
+  type CommunityMessageRecord,
+  type CommunityRestrictionRecord,
   type DbShape,
+  type ModerationCaseRecord,
   type ProviderSafetyRecord,
   type UserRecord,
   emptyDbShape,
@@ -69,6 +72,55 @@ export function normalizeProviderSafety(value: any, provider: string): ProviderS
   };
 }
 
+/**
+ * Community moderation tables are optional: a database written before this
+ * feature has none of them, and a hand-edited/partial file must still load. Any
+ * unusable entry is dropped rather than trusted.
+ */
+function normalizeModerationCases(value: any): ModerationCaseRecord[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter(
+      (c) =>
+        c && typeof c.id === 'string' && typeof c.userId === 'string' && typeof c.createdAt === 'string'
+    )
+    .map((c) => ({
+      ...c,
+      automatic: c.automatic === true,
+      confidence: c.confidence === 'UNCERTAIN' ? ('UNCERTAIN' as const) : ('CONFIRMED' as const),
+    })) as ModerationCaseRecord[];
+}
+
+function normalizeRestrictions(value: any): CommunityRestrictionRecord[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter(
+      (r) =>
+        r &&
+        typeof r.userId === 'string' &&
+        typeof r.startedAt === 'string' &&
+        typeof r.expiresAt === 'string'
+    )
+    .map((r) => ({
+      ...r,
+      automatic: r.automatic === true,
+      extendedCount: Number.isInteger(r.extendedCount) && r.extendedCount > 0 ? r.extendedCount : 0,
+      violationCount: Number.isInteger(r.violationCount) && r.violationCount > 0 ? r.violationCount : 1,
+    }));
+}
+
+function normalizeCommunityMessages(value: any): CommunityMessageRecord[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((m) => m && typeof m.id === 'string' && typeof m.userId === 'string' && typeof m.createdAt === 'string')
+    .map((m) => ({
+      ...m,
+      kind: m.kind === 'SUPPORT' ? 'SUPPORT' : 'COMMUNITY',
+      accepted: m.accepted === true,
+      body: typeof m.body === 'string' ? m.body : '',
+    }));
+}
+
 export class DataStore {
   private readonly filePath: string;
   private current: DbShape;
@@ -99,6 +151,9 @@ export class DataStore {
         if (parsed.providerSafety) {
           this.current.providerSafety = normalizeProviderSafety(parsed.providerSafety, 'sarvam');
         }
+        this.current.moderationCases = normalizeModerationCases(parsed.moderationCases);
+        this.current.communityRestrictions = normalizeRestrictions(parsed.communityRestrictions);
+        this.current.communityMessages = normalizeCommunityMessages(parsed.communityMessages);
       } catch {
         // Corrupt file: preserve it for inspection, start fresh.
         const backup = `${this.filePath}.corrupt-${Date.now()}`;
