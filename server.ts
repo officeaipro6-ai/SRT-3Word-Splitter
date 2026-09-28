@@ -1,5 +1,7 @@
 import express from 'express';
 import path from 'path';
+import fs from 'fs';
+import { execSync } from 'child_process';
 import { createHash, timingSafeEqual } from 'crypto';
 import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
@@ -1691,7 +1693,17 @@ async function startServer() {
     });
   });
 
-  // Mount Vite middleware for development
+  // ---------------------------------------------------------------------
+  // CANONICAL PRODUCTION ROUTES
+  //
+  //   /            -> the new multilingual Odia SRT application
+  //   /admin[/...] -> the secure Admin Dashboard ONLY
+  //   anything else-> 404, so no stale/legacy URL can ever render a surface
+  //
+  // The shared resolver lives in src/routeTarget.ts and is imported by the
+  // client entry too, so the server and the browser can never disagree about
+  // which surface a URL shows.
+  // ---------------------------------------------------------------------
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -1700,9 +1712,56 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+    const indexHtml = path.join(distPath, 'index.html');
+
+    // Hashed build assets are safe to cache forever; everything that can change
+    // which app you get is revalidated every time. This is what stops a browser
+    // from pinning an old UI shell after a redeploy.
+    app.use(
+      express.static(distPath, {
+        index: false,
+        etag: true,
+        caseSensitive: true,
+        setHeaders: (res, filePath) => {
+          if (filePath.includes(`${path.sep}assets${path.sep}`)) {
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+          } else {
+            res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+          }
+        },
+      }),
+    );
+
+    const sendShell = (req: express.Request, res: express.Response) => {
+      res.setHeader('Cache-Control', 'no-store, must-revalidate');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.sendFile(indexHtml);
+    };
+
+    // A dedicated case-sensitive router: Express matches routes
+    // case-insensitively by default, which would let `/Admin` serve the admin
+    // shell and put the server out of step with the client resolver.
+    const uiRouter = express.Router({ caseSensitive: true });
+
+    // `/admin` must never be indexed or prefetched as the transcription app.
+    const sendAdminShell = (req: express.Request, res: express.Response) => {
+      res.setHeader('X-Robots-Tag', 'noindex, nofollow');
+      sendShell(req, res);
+    };
+    uiRouter.get('/admin', sendAdminShell);
+    uiRouter.get('/admin/*', sendAdminShell);
+    uiRouter.get('/', sendShell);
+    uiRouter.get('/index.html', sendShell);
+    app.use(uiRouter);
+
+    // Everything else is a hard 404. Previously `app.get('*')` returned
+    // index.html for every path, which is how a legacy URL could end up
+    // displaying the transcription UI.
+    app.use((req, res) => {
+      if (req.path.startsWith('/api/')) {
+        return res.status(404).json({ error: 'Not found' });
+      }
+      res.status(404).type('text/plain').send('404 Not Found');
     });
   }
 
@@ -1717,8 +1776,63 @@ async function startServer() {
     next(err);
   });
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[Server] ODIA AUDIO/VIDEO → TAGGED SRT running on http://0.0.0.0:${PORT}`);
+  // ---------------------------------------------------------------------
+  // STARTUP GUARDS
+  //
+  // These exist because a stale copy of this project (a non-git export in the
+  // Downloads folder) had silently taken port 3000, and the browser kept
+  // showing that old build while this server refused to start. Failing loudly
+  // and early is the only reliable fix.
+  // ---------------------------------------------------------------------
+  if (process.env.NODE_ENV === 'production') {
+    const distPath = path.join(process.cwd(), 'dist');
+    const indexHtml = path.join(distPath, 'index.html');
+    if (!fs.existsSync(indexHtml)) {
+      console.error(
+        `[Server] REFUSING TO START: no production build at ${indexHtml}.\n` +
+          `        Build from the current Git HEAD first:  npm run build`,
+      );
+      process.exit(1);
+    }
+
+    // Refuse to serve a dist/ that predates the current Git HEAD, so an old
+    // build folder can never be mistaken for the current application.
+    try {
+      const head = execSync('git rev-parse HEAD', { stdio: ['ignore', 'pipe', 'ignore'] })
+        .toString()
+        .trim();
+      const headDate = new Date(
+        execSync('git show -s --format=%cI HEAD', { stdio: ['ignore', 'pipe', 'ignore'] })
+          .toString()
+          .trim(),
+      );
+      const builtAt = fs.statSync(indexHtml).mtime;
+      if (head && !Number.isNaN(headDate.getTime()) && builtAt.getTime() < headDate.getTime()) {
+        const msg =
+          `[Server] REFUSING TO START: dist/ is older than the current Git HEAD.\n` +
+          `        HEAD   : ${head} (${headDate.toISOString()})\n` +
+          `        built  : ${builtAt.toISOString()}\n` +
+          `        Rebuild:  npm run build      (or set ALLOW_STALE_DIST=1 to override)`;
+        if (process.env.ALLOW_STALE_DIST === '1') {
+          console.warn(`[Server] WARNING: ${msg}`);
+        } else {
+          console.error(msg);
+          process.exit(1);
+        }
+      } else {
+        console.log(`[Server] production build matches Git HEAD ${head || '(unknown)'}`);
+      }
+    } catch {
+      console.warn('[Server] could not verify dist/ against Git HEAD (not a git checkout?)');
+    }
+  }
+
+  const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(
+      `[Server] Odia SRT — Audio/Video → Tagged SRT  |  http://localhost:${PORT}/\n` +
+        `[Server] Admin Dashboard (owner only)         |  http://localhost:${PORT}/admin\n` +
+        `[Server] serving: ${process.cwd()}`,
+    );
     if (config.enableJobQueue) {
       queue.rehydrate();
       queue.start();
@@ -1726,6 +1840,25 @@ async function startServer() {
     } else {
       nestedLog.warn('job queue disabled (ENABLE_JOB_QUEUE=false) job endpoints will not process work');
     }
+  });
+
+  // A port collision is the exact failure that hid the real app behind a stale
+  // one. Report WHO owns the port and refuse to continue.
+  server.on('error', (err: NodeJS.ErrnoException) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(
+        `\n[Server] FATAL: port ${PORT} is already in use.\n` +
+          `        This process will NOT start, and the server already on the port is NOT\n` +
+          `        necessarily this application — it may be a stale copy or an unrelated dev\n` +
+          `        server, which is how an old UI can be served at http://localhost:${PORT}/.\n` +
+          `        Find it with:  Get-NetTCPConnection -State Listen -LocalPort ${PORT}\n` +
+          `        Stop it with:  Stop-Process -Id <pid>\n` +
+          `        Or run this app on another port:  $env:PORT=3001; npm start\n`,
+      );
+      process.exit(1);
+    }
+    console.error('[Server] fatal listen error', err);
+    process.exit(1);
   });
 }
 

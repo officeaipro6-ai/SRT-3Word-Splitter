@@ -1,7 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { Coins, ShieldCheck, UserRound, KeyRound } from 'lucide-react';
 import { ensureSession, signInAsOwner, type SessionInfo } from '../lib/sessionClient';
-import { AdminDashboard } from './AdminDashboard';
 
 /**
  * Additive UI: shows the user's credit status (server-authoritative) and, for
@@ -11,7 +10,6 @@ import { AdminDashboard } from './AdminDashboard';
 export const CreditsWidget: React.FC = () => {
   const [session, setSession] = useState<SessionInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [showAdmin, setShowAdmin] = useState(false);
   const [showOwnerForm, setShowOwnerForm] = useState(false);
   const [ownerEmail, setOwnerEmail] = useState('');
   const [ownerToken, setOwnerToken] = useState('');
@@ -85,12 +83,13 @@ export const CreditsWidget: React.FC = () => {
                 <span className="sr-only">(opaque account id)</span>
               </span>
               {session.role === 'ADMIN' && (
-                <button
-                  onClick={() => setShowAdmin((v) => !v)}
-                  className="px-3 py-1 rounded-lg text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-700 transition-colors cursor-pointer"
+                <a
+                  href="/admin"
+                  className="px-3 py-1 rounded-lg text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-700 transition-colors inline-flex items-center gap-1"
                 >
-                  {showAdmin ? 'Hide' : 'Admin'}
-                </button>
+                  <ShieldCheck className="w-3 h-3" />
+                  Admin
+                </a>
               )}
               {session.role !== 'ADMIN' && (
                 <button
@@ -137,8 +136,6 @@ export const CreditsWidget: React.FC = () => {
           </div>
         )}
       </div>
-
-      {showAdmin && session?.role === 'ADMIN' && <AdminDashboard />}
     </>
   );
 };

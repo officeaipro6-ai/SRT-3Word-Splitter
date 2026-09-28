@@ -23,6 +23,17 @@ export const FileUpload: React.FC<FileUploadProps> = ({
   const [extractionProgress, setExtractionProgress] = useState({ progress: 0, text: '' });
   const [loadingPresetId, setLoadingPresetId] = useState<string | null>(null);
 
+  /**
+   * The "Instant Rule Verification Presets" panel is a hand-verification tool,
+   * not a product feature, so it is excluded from production builds. DEV is a
+   * build-time constant: `npm run build` (NODE_ENV=production) makes this
+   * statically false and tree-shakes the entire block out of dist/.
+   * SHOW_TEST_PRESETS=true forces it on locally for rule re-verification.
+   */
+  const showTestPresets =
+    import.meta.env.DEV || import.meta.env.VITE_SHOW_TEST_PRESETS === 'true';
+
+
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
     setIsDragging(true);
@@ -234,19 +245,29 @@ export const FileUpload: React.FC<FileUploadProps> = ({
         </div>
       )}
 
-      {/* Sample Audio Presets for Instant Rule Verification */}
-      <div className="space-y-3 pt-2">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <Sparkles className="w-4 h-4 text-indigo-600" />
-            <h4 className="text-xs font-bold uppercase tracking-wider text-slate-700">
-              Instant Rule Verification Presets (1-Click Test Audio)
-            </h4>
+      {/*
+        LEGACY TEST SURFACE — "Instant Rule Verification Presets".
+
+        These are 1-click synthetic sample clips that exist to re-verify the
+        segmentation/tagging rules by hand. They are NOT part of the product, so
+        they are compiled out of the production bundle entirely (not merely
+        hidden with CSS): the whole block is behind `import.meta.env.DEV`, so
+        Vite drops it from `npm run build` and it can never appear on a
+        production route. Set SHOW_TEST_PRESETS=true to re-enable it locally.
+      */}
+      {showTestPresets && (
+        <div className="space-y-3 pt-2">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Sparkles className="w-4 h-4 text-indigo-600" />
+              <h4 className="text-xs font-bold uppercase tracking-wider text-slate-700">
+                Instant Rule Verification Presets (1-Click Test Audio)
+              </h4>
+            </div>
+            <span className="text-[11px] text-slate-400">
+              Synthesized with speech, music, noise, fillers &amp; calibrated silence
+            </span>
           </div>
-          <span className="text-[11px] text-slate-400">
-            Synthesized with speech, music, noise, fillers & calibrated silence
-          </span>
-        </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2.5">
           {SAMPLE_PRESETS.map((preset) => {
@@ -286,9 +307,10 @@ export const FileUpload: React.FC<FileUploadProps> = ({
                 </div>
               </button>
             );
-          })}
+            })}
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 };
