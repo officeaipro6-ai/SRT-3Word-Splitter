@@ -14,7 +14,8 @@ import { RuleComplianceAudit } from './components/RuleComplianceAudit';
 import { ExportToolbar } from './components/ExportToolbar';
 import { RulesGuideModal } from './components/RulesGuideModal';
 import { CreditsWidget } from './components/CreditsWidget';
-import { ensureSession, type SessionInfo } from './lib/sessionClient';
+import { AccountPanel } from './components/AccountPanel';
+import { ensureSession, AUTH_CHANGED_EVENT, type SessionInfo } from './lib/sessionClient';
 import { CreditPacksPanel } from './components/CreditPacksPanel';
 import { LanguageSelector } from './components/LanguageSelector';
 import { LandingPage } from './components/LandingPage';
@@ -91,13 +92,19 @@ export default function App() {
 
   useEffect(() => {
     let active = true;
-    ensureSession()
-      .then((s) => {
-        if (active) syncSession(s);
-      })
-      .catch(() => {});
+    const load = () => {
+      ensureSession()
+        .then((s) => {
+          if (active) syncSession(s);
+        })
+        .catch(() => {});
+    };
+    load();
+    // Re-sync the trial counter / wallet when a user signs in or out.
+    window.addEventListener(AUTH_CHANGED_EVENT, load);
     return () => {
       active = false;
+      window.removeEventListener(AUTH_CHANGED_EVENT, load);
     };
   }, []);
 
@@ -481,6 +488,9 @@ export default function App() {
 
       {/* Credits + Admin widget (additive, never part of the transcription flow) */}
       <CreditsWidget />
+
+      {/* Normal user account strip (email/password, separate from admin auth) */}
+      <AccountPanel />
 
       {/* Top Header */}
       <Header

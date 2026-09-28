@@ -87,6 +87,7 @@ import {
   normalizeEmail,
   type OwnerRejection,
 } from './server/authz';
+import { signupAccount, loginAccount, type AccountBroker } from './server/services/accountService';
 
 dotenv.config();
 
@@ -1308,10 +1309,87 @@ async function startServer() {
         freeTrialsRemaining: freeTrialsRemaining(freeTrialsUsed, config.freeTrialLimit),
         provider: getAsrProviderName(),
         createdAt: user?.createdAt,
+        email: user?.email ?? null,
+        account: Boolean(user?.email),
+        lastLoginAt: user?.lastLoginAt ?? null,
       });
     } catch (err: any) {
       nestedLog.error('session creation failed', { message: redact(err.message) });
       res.status(500).json({ error: 'Failed to create session.' });
+    }
+  });
+
+  // Normal email/password USER accounts — a separate auth surface from the
+  // ADMIN bootstrap (authorizeOwnerSession). Users never need the bootstrap
+  // token and signup always produces a plain USER account (never ADMIN).
+  const accountBroker: AccountBroker = { users, credits: creditsRepo };
+
+  // Shared session body so /api/session and the account endpoints stay in sync.
+  function sessionPayload(user: UserRecord | null | undefined, token: string) {
+    const freeTrialsUsed = freeTrialsUsedFor(user);
+    return {
+      userId: user?.id ?? '',
+      token,
+      credits: user?.credits ?? 0,
+      role: user?.role ?? 'USER',
+      creditMode: user?.creditMode ?? 'NORMAL',
+      unlimited: (user?.creditMode ?? 'NORMAL') === 'UNLIMITED',
+      freeTrialsUsed,
+      freeTrialLimit: config.freeTrialLimit,
+      freeTrialsRemaining: freeTrialsRemaining(freeTrialsUsed, config.freeTrialLimit),
+      provider: getAsrProviderName(),
+      createdAt: user?.createdAt,
+      email: user?.email ?? null,
+      account: Boolean(user?.email),
+      lastLoginAt: user?.lastLoginAt ?? null,
+    };
+  }
+
+  app.post('/api/account/signup', (req, res) => {
+    try {
+      const result = signupAccount(accountBroker, req.body ?? {}, config.initialCredits);
+      if (!result.ok || !result.user) {
+        const status = result.code === 'EMAIL_TAKEN' ? 409 : 400;
+        return res.status(status).json({ error: result.error, code: result.code ?? 'VALIDATION' });
+      }
+      const token = issueToken();
+      users.addToken(result.user.id, hashToken(token));
+      const user = users.getById(result.user.id);
+      return res.status(201).json(sessionPayload(user, token));
+    } catch (err: any) {
+      nestedLog.error('account signup failed', { message: redact(err.message) });
+      return res.status(500).json({ error: 'Failed to create account.' });
+    }
+  });
+
+  app.post('/api/account/login', (req, res) => {
+    try {
+      const result = loginAccount(accountBroker, req.body ?? {});
+      if (!result.ok || !result.user) {
+        return res.status(401).json({ error: result.error, code: result.code ?? 'INVALID_CREDENTIALS' });
+      }
+      const token = issueToken();
+      users.addToken(result.user.id, hashToken(token));
+      return res.json(sessionPayload(result.user, token));
+    } catch (err: any) {
+      nestedLog.error('account login failed', { message: redact(err.message) });
+      return res.status(500).json({ error: 'Failed to sign in.' });
+    }
+  });
+
+  // Logout: revoke the presented token server-side (the client also clears its
+  // stored token). Revocation is immediate — the token cannot be reused.
+  app.post('/api/account/logout', auth(), (req, res) => {
+    try {
+      const user = res.locals.user;
+      const raw = extractToken(req);
+      if (user && raw && isValidTokenShape(raw)) {
+        users.revokeToken(user.id, hashToken(raw));
+      }
+      return res.json({ ok: true });
+    } catch (err: any) {
+      nestedLog.error('account logout failed', { message: redact(err.message) });
+      return res.status(500).json({ error: 'Failed to sign out.' });
     }
   });
 
@@ -1523,6 +1601,10 @@ async function startServer() {
       // Only verified owner accounts carry an email; it is shown to admins so an
       // owner can find their own account. It is never a search key for others.
       ownerEmail: u.ownerEmail ?? null,
+      // Normal (email/password) account email + last login, shown to admins
+      // through the protected admin area only.
+      email: u.email ?? null,
+      lastLoginAt: u.lastLoginAt ?? null,
     };
   }
 

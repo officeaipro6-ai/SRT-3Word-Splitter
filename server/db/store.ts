@@ -31,6 +31,9 @@ function normalizeUser(u: any): UserRecord {
     creditMode: u.creditMode === 'UNLIMITED' ? 'UNLIMITED' : 'NORMAL',
     freeTrialsUsed: Number.isInteger(u.freeTrialsUsed) && (u.freeTrialsUsed as number) >= 0 ? (u.freeTrialsUsed as number) : 0,
     ownerEmail: typeof u.ownerEmail === 'string' && u.ownerEmail.trim() ? u.ownerEmail.trim().toLowerCase() : undefined,
+    email: typeof u.email === 'string' && u.email.trim() ? u.email.trim().toLowerCase() : undefined,
+    passwordHash: typeof u.passwordHash === 'string' && u.passwordHash.trim() ? u.passwordHash.trim() : undefined,
+    lastLoginAt: typeof u.lastLoginAt === 'string' ? u.lastLoginAt : undefined,
   };
 }
 

@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { Coins, ShieldCheck, UserRound, KeyRound } from 'lucide-react';
-import { ensureSession, signInAsOwner, type SessionInfo } from '../lib/sessionClient';
+import { ensureSession, signInAsOwner, AUTH_CHANGED_EVENT, type SessionInfo } from '../lib/sessionClient';
 
 /**
  * Additive UI: shows the user's credit status (server-authoritative) and, for
@@ -18,15 +18,21 @@ export const CreditsWidget: React.FC = () => {
 
   useEffect(() => {
     let cancelled = false;
-    ensureSession()
-      .then((s) => {
-        if (!cancelled) setSession(s);
-      })
-      .catch((e: Error) => {
-        if (!cancelled) setError(e.message);
-      });
+    const load = () => {
+      ensureSession()
+        .then((s) => {
+          if (!cancelled) setSession(s);
+        })
+        .catch((e: Error) => {
+          if (!cancelled) setError(e.message);
+        });
+    };
+    load();
+    // Keep credits/admin state in sync when a user signs in or out.
+    window.addEventListener(AUTH_CHANGED_EVENT, load);
     return () => {
       cancelled = true;
+      window.removeEventListener(AUTH_CHANGED_EVENT, load);
     };
   }, []);
 

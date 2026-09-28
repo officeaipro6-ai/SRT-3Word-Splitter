@@ -17,9 +17,26 @@ export interface SessionInfo {
   freeTrialLimit: number;
   freeTrialsRemaining: number;
   createdAt?: string;
+  /** Normalized account email when this session is an email/password account. */
+  email?: string | null;
+  /** True when the session is backed by a persisted email/password account. */
+  account?: boolean;
+  /** ISO timestamp of the last successful email login on this account. */
+  lastLoginAt?: string | null;
 }
 
 const TOKEN_KEY = 'odia_srt_token';
+
+/** Fired after account sign-in / sign-out so widgets refresh server state. */
+export const AUTH_CHANGED_EVENT = 'odiasrt-auth-changed';
+
+export function notifyAuthChanged(): void {
+  try {
+    window.dispatchEvent(new Event(AUTH_CHANGED_EVENT));
+  } catch {
+    /* event dispatch unavailable (e.g. SSR/non-browser) */
+  }
+}
 
 export function getStoredToken(): string | null {
   try {
@@ -48,9 +65,14 @@ export async function ensureSession(): Promise<SessionInfo> {
   if (!res.ok) throw new Error(`Session creation failed (${res.status}).`);
   const data = await res.json();
   if (data.token) storeToken(data.token);
+  return parseSession(data, data.token || existing || '');
+}
+
+/** Map a server session body to the client shape (single source of truth). */
+function parseSession(data: any, token: string): SessionInfo {
   return {
     userId: data.userId,
-    token: data.token || existing || '',
+    token,
     credits: data.credits ?? 0,
     role: data.role === 'ADMIN' ? 'ADMIN' : 'USER',
     creditMode: data.creditMode === 'UNLIMITED' ? 'UNLIMITED' : 'NORMAL',
@@ -59,6 +81,9 @@ export async function ensureSession(): Promise<SessionInfo> {
     freeTrialLimit: data.freeTrialLimit ?? 0,
     freeTrialsRemaining: data.freeTrialsRemaining ?? data.freeTrialLimit ?? 0,
     createdAt: data.createdAt,
+    email: data.email ?? null,
+    account: Boolean(data.account),
+    lastLoginAt: data.lastLoginAt ?? null,
   };
 }
 
@@ -98,6 +123,64 @@ export async function signInAsOwner(opts: { adminBootstrapToken: string; ownerEm
   };
 }
 
+/**
+ * Normal USER email/password sign-up — a separate auth surface from the
+ * ADMIN bootstrap. Requires only an email + password; the server issues a
+ * session token exactly like /api/session. Sign-up never grants ADMIN.
+ */
+export async function signupAccount(opts: {
+  email: string;
+  password: string;
+  language?: string;
+}): Promise<SessionInfo> {
+  const res = await fetch('/api/account/signup', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      email: opts.email.trim().toLowerCase(),
+      password: opts.password,
+    }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || 'Account creation failed.');
+  storeToken(data.token);
+  return parseSession(data, data.token);
+}
+
+/** Sign in to an existing email/password account. */
+export async function loginAccount(opts: {
+  email: string;
+  password: string;
+  language?: string;
+}): Promise<SessionInfo> {
+  const res = await fetch('/api/account/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      email: opts.email.trim().toLowerCase(),
+      password: opts.password,
+    }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || 'Sign-in failed.');
+  storeToken(data.token);
+  return parseSession(data, data.token);
+}
+
+/** Sign out: revoke the current token server-side and clear it locally. */
+export async function logoutAccount(): Promise<void> {
+  const res = await authFetch('/api/account/logout', { method: 'POST' });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || 'Sign-out failed.');
+  }
+  try {
+    localStorage.removeItem(TOKEN_KEY);
+  } catch {
+    /* storage unavailable */
+  }
+}
+
 /** Authenticated fetch wrapper. */
 export async function authFetch(
   path: string,
@@ -126,6 +209,10 @@ export interface AdminUserView {
   lastSeenAt: string | null;
   /** Server-verified owner email (only verified owner accounts have one). */
   ownerEmail?: string | null;
+  /** Normal email/password account email (admin-visible only). */
+  email?: string | null;
+  /** ISO timestamp of the account's last email login (admin-visible only). */
+  lastLoginAt?: string | null;
 }
 
 export interface AdminTxn {

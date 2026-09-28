@@ -93,6 +93,18 @@ export interface UserRecord {
   creditMode: CreditMode;
   createdAt: string;
   lastSeenAt?: string;
+  /**
+   * Normalized account email (lower-cased, trimmed) for the optional
+   * email/password USER account layer. Normal users rely on this + the scrypt
+   * passwordHash; ADMIN accounts keep their separate, allowlist-backed
+   * `ownerEmail`. One user can carry both, but neither field derives from the
+   * other. Never user-searchable by non-admins.
+   */
+  email?: string;
+  /** scrypt hash (`scrypt$<saltB64>$<hashB64>`) backing email login. Never stored in plaintext. */
+  passwordHash?: string;
+  /** ISO timestamp of the last successful email/password login. */
+  lastLoginAt?: string;
   /** PAYMENT-READY (future only; never populated by this implementation):
    * lifetime purchased credits and lifetime bonus credits. */
   purchasedCredits?: number;
@@ -199,7 +211,7 @@ export interface DbShape {
   providerSafety?: ProviderSafetyRecord;
 }
 
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 export function emptyDbShape(): DbShape {
   return { version: DB_VERSION, users: [], jobs: [], transactions: [] };

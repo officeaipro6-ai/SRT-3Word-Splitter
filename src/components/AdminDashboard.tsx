@@ -214,6 +214,7 @@ export const AdminDashboard: React.FC = () => {
     if (!q) return true;
     return (
       u.id.toLowerCase().includes(q) ||
+      (typeof u.email === 'string' && u.email.toLowerCase().includes(q)) ||
       (typeof u.ownerEmail === 'string' && u.ownerEmail.toLowerCase().includes(q))
     );
   });
@@ -287,7 +288,7 @@ export const AdminDashboard: React.FC = () => {
                   <input
                     value={query}
                     onChange={(e) => setQuery(e.target.value)}
-                    placeholder="Search by user id or owner email…"
+                    placeholder="Search by user id or email…"
                     className="w-full pl-8 pr-3 py-1.5 rounded-lg border border-slate-200 text-xs outline-none focus:ring-2 focus:ring-indigo-200"
                   />
                 </div>
@@ -313,6 +314,12 @@ export const AdminDashboard: React.FC = () => {
                     </div>
                     <div className="mt-0.5 flex items-center gap-2 text-[11px] text-slate-400">
                       <span>{u.role}</span>
+                      {u.email && (
+                        <>
+                          <span>·</span>
+                          <span className="text-emerald-700 font-semibold">{u.email}</span>
+                        </>
+                      )}
                       {u.ownerEmail && (
                         <>
                           <span>·</span>
@@ -341,6 +348,16 @@ export const AdminDashboard: React.FC = () => {
                     <div className="font-mono text-xs font-semibold text-slate-700 break-all">{selected.user.id}</div>
                     <div className="mt-1 flex flex-wrap gap-2 text-[11px]">
                       <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-600">balance {selected.user.credits}</span>
+                      {selected.user.email && (
+                        <span className="px-2 py-0.5 rounded bg-emerald-50 text-emerald-700">
+                          account {selected.user.email}
+                        </span>
+                      )}
+                      {selected.user.lastLoginAt && (
+                        <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-600">
+                          last login {new Date(selected.user.lastLoginAt).toLocaleString()}
+                        </span>
+                      )}
                       {selected.user.ownerEmail && (
                         <span className="px-2 py-0.5 rounded bg-amber-50 text-amber-700">owner {selected.user.ownerEmail}</span>
                       )}

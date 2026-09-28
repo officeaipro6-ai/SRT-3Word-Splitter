@@ -29,9 +29,11 @@ test('the admin client calls exactly the documented admin endpoints', () => {
 
 test('every admin client call is authenticated (authFetch, never bare fetch)', () => {
   // The only bare fetch() calls in the client are the public ones: the session
-  // bootstrap, owner sign-in and the public credit-pack catalog.
+  // bootstrap, owner sign-in, the public credit-pack catalog, and the public
+  // email/password account signup + login. Admin and logout calls go through
+  // authFetch.
   const bareFetches = src.match(/await fetch\(/g) || [];
-  assert.equal(bareFetches.length, 3, 'only ensureSession, signInAsOwner and fetchCreditPacks may call fetch directly');
+  assert.equal(bareFetches.length, 5, 'only ensureSession, signInAsOwner, fetchCreditPacks, signupAccount and loginAccount may call fetch directly');
   for (const fn of [
     'fetchAdminUsers',
     'fetchAdminUser',

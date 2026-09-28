@@ -43,12 +43,84 @@ export class UserRepo {
     });
   }
 
+  /**
+   * Create an authenticated email/password account. Always a plain USER
+   * (creditMode NORMAL) — ADMIN is NEVER granted through this path. The scrypt
+   * hash is provided by the caller (services/accountService).
+   */
+  createAccount(opts: { email: string; passwordHash: string; initialCredits?: number }): UserRecord {
+    const now = new Date().toISOString();
+    return this.store.mutate((db) => {
+      const user: UserRecord = {
+        id: newId(),
+        tokenHashes: [],
+        credits: opts.initialCredits ?? 0,
+        role: 'USER',
+        creditMode: 'NORMAL',
+        email: opts.email.trim().toLowerCase(),
+        passwordHash: opts.passwordHash,
+        createdAt: now,
+        lastSeenAt: now,
+        lastLoginAt: now,
+        freeTrialsUsed: 0,
+      };
+      db.users.push(user);
+      return structuredClone(user);
+    });
+  }
+
   getByToken(tokenHash: string): UserRecord | null {
     return this.store.snapshot().users.find((u) => u.tokenHashes.includes(tokenHash)) ?? null;
   }
 
+  /** Account lookup by normalized email (accounts only; admin ownerEmail is separate). */
+  getByEmail(email: string): UserRecord | null {
+    const normalized = (email || '').trim().toLowerCase();
+    if (!normalized) return null;
+    return this.store.snapshot().users.find((u) => u.email === normalized) ?? null;
+  }
+
   getById(userId: string): UserRecord | null {
     return this.store.snapshot().users.find((u) => u.id === userId) ?? null;
+  }
+
+  /**
+   * Persist the scrypt password hash backing email login. Returns false when the
+   * user is missing or the hash is empty.
+   */
+  setPasswordHash(userId: string, passwordHash: string): boolean {
+    const hash = (passwordHash || '').trim();
+    if (!hash) return false;
+    return this.store.mutate((db) => {
+      const user = db.users.find((u) => u.id === userId);
+      if (!user) return false;
+      user.passwordHash = hash;
+      return true;
+    });
+  }
+
+  /** Mark a successful email/password login (sets lastLoginAt + lastSeenAt). */
+  recordLogin(userId: string): boolean {
+    const now = new Date().toISOString();
+    return this.store.mutate((db) => {
+      const user = db.users.find((u) => u.id === userId);
+      if (!user) return false;
+      user.lastLoginAt = now;
+      user.lastSeenAt = now;
+      return true;
+    });
+  }
+
+  /** Revoke one bearer token so future requests with it are rejected. */
+  revokeToken(userId: string, tokenHash: string): boolean {
+    return this.store.mutate((db) => {
+      const user = db.users.find((u) => u.id === userId);
+      if (!user) return false;
+      const idx = user.tokenHashes.indexOf(tokenHash);
+      if (idx === -1) return false;
+      user.tokenHashes.splice(idx, 1);
+      return true;
+    });
   }
 
   addToken(userId: string, tokenHash: string): boolean {
@@ -135,9 +207,9 @@ export class UserRepo {
   }
 
   /**
-   * Admin user search: match on the user id prefix, a full id, or a server-side
-   * owner email. The email match uses the stored ownerEmail of verified admins
-   * only — normal users have no email field, so nothing else is searchable.
+   * Admin user search: match on the user id prefix, a full id, a server-side
+   * account email, or a verified owner email. Account emails are only matched
+   * server-side and only surfaced through the protected admin listing.
    */
   searchUsers(query: string, limit = 50): UserRecord[] {
     const q = (query || '').trim().toLowerCase();
@@ -147,6 +219,7 @@ export class UserRepo {
       .filter(
         (u) =>
           u.id.toLowerCase().includes(q) ||
+          (typeof u.email === 'string' && u.email.toLowerCase().includes(q)) ||
           (typeof u.ownerEmail === 'string' && u.ownerEmail.toLowerCase().includes(q))
       )
       .slice(0, limit);
