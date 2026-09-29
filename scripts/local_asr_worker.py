@@ -139,23 +139,34 @@ def build_id_to_char(tokenizer):
     return id_to_char
 
 
+def load_wav_array(wav_path):
+    """Read the mono 16-bit PCM WAV ffmpeg produced into a numpy float32 array
+    (normalised to [-1, 1]). Uses only the stdlib `wave` module + numpy, so it
+    works without torchaudio/torchcodec. The sample rate was forced to SR by
+    ffmpeg, so no resampling is needed."""
+    import wave as _wave
+
+    import numpy as np
+
+    with _wave.open(wav_path, "rb") as wav:
+        assert wav.getnchannels() == 1, "worker expects mono PCM"
+        assert wav.getsampwidth() == 2, "worker expects 16-bit PCM"
+        assert wav.getframerate() == SR, "worker expects %d Hz" % SR
+        raw = wav.readframes(wav.getnframes())
+    values = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    return values
+
+
 def transcribe(model, processor, wav_path, threads):
     import torch
 
     torch.set_num_threads(max(1, int(threads)))
 
-    try:
-        batch = processor(
-            [wav_path], sampling_rate=SR, return_tensors="pt", padding=True
-        )
-    except Exception:
-        # Older processors want a decoded waveform rather than a path.
-        import torchaudio
-
-        waveform, _ = torchaudio.load(wav_path)
-        batch = processor(
-            waveform, sampling_rate=SR, return_tensors="pt"
-        )
+    # Pass the decoded waveform (numpy), never a path string: Wav2Vec2
+    # processors in current transformers require a python/numpy/torch object.
+    batch = processor(
+        load_wav_array(wav_path), sampling_rate=SR, return_tensors="pt"
+    )
     input_values = batch["input_values"]
 
     started = time.time()
@@ -319,6 +330,8 @@ def main():
                 "(20 ms frames) on the exact uploaded audio."
             ),
         }
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
         sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
         sys.stdout.flush()
     finally:
