@@ -102,6 +102,21 @@ export interface TranscriptionResult {
   stats: TranscriptionStats;
   notes?: string[];
   audioDiagnostics?: AudioDiagnostics;
+  /**
+   * LOCAL SUBMISSION MODE: true when this result came from the local,
+   * zero-budget, open-source Odia ASR instead of a paid cloud provider.
+   */
+  localSubmissionMode?: boolean;
+  localAsr?: {
+    model: string;
+    modelDir: string | null;
+    device: string;
+    wordCount: number;
+    hasReliableTimestamps: boolean;
+    timestampNote: string | null;
+    meanLogProb: number | null;
+    inferenceSeconds: number | null;
+  };
 }
 
 export interface MediaFileInfo {

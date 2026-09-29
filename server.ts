@@ -8,6 +8,12 @@ import dotenv from 'dotenv';
 import multer from 'multer';
 import { runOdiaPipeline } from './server/geminiOdiaPipeline';
 import { transcribeRawOdiaWithWhisper } from './server/groqTranscriber';
+// LOCAL SUBMISSION MODE (temporary, opt-in, zero-budget): a local open-source
+// Odia ASR that is completely separate from the Sarvam production pipeline.
+import {
+  isLocalSubmissionModeEnabled,
+  transcribeRawOdiaWithLocalAsr,
+} from './server/localTranscriber';
 import {
   transcribeRawOdiaWithSarvam,
   isSarvamConfigured,
@@ -893,6 +899,22 @@ async function startServer() {
       //     wallet (except a PAID request, which reserves the exact amount so a
       //     concurrent request cannot double-spend the same credits).
       // ------------------------------------------------------------------
+      // LOCAL SUBMISSION MODE (temporary): when the operator sets
+      // LOCAL_SUBMISSION_MODE=true the transcription step below runs a LOCAL,
+      // open-source, CPU-only Odia ASR instead of any paid cloud provider.
+      // It makes no billable API call at all, so the provider spending gate
+      // cannot apply to it. This is the ONLY exemption and it is deliberately
+      // narrow: it is keyed on the local mode flag, so Sarvam, Groq and Olive
+      // remain fully gated by PROVIDER_SPENDING_PROTECTION exactly as before.
+      // Unset LOCAL_SUBMISSION_MODE and the paid path is bit-for-bit unchanged.
+      const localSubmissionMode = isLocalSubmissionModeEnabled();
+      if (localSubmissionMode) {
+        nestedLog.warn(
+          'LOCAL SUBMISSION MODE active - local Odia ASR, no paid provider call',
+          { provider: 'local' }
+        );
+      }
+
       const decodedAudioDuration = await measureAudioDurationSeconds(audioBuffer, mimeType);
       const spendDecision = decideAudioSpend({
         user: sessionUser
@@ -905,7 +927,8 @@ async function startServer() {
           : null,
         measuredDurationSeconds: decodedAudioDuration,
         freeTrialLimit: config.freeTrialLimit,
-        providerBlocked: providerSafety.isBlocked(),
+        // See above: only the zero-cost local provider is exempt.
+        providerBlocked: providerSafety.isBlocked() && !localSubmissionMode,
       });
       if (!spendDecision.ok) {
         nestedLog.info('audio spend gated', {
@@ -950,13 +973,24 @@ async function startServer() {
       //   - Groq (fallback): kept available for testing via TRANSCRIPTION_PROVIDER=groq.
       //   - Olive (opt-in): OdiaGenAI Whisper Odia fine-tune via
       //     TRANSCRIPTION_PROVIDER=olive + OLIVE_API_URL. Never default.
-      const provider = getActiveProvider();
+      //   - local: ONLY when LOCAL SUBMISSION_MODE=true. Temporary zero-budget
+      //     local Odia ASR; no cloud/paid API is contacted.
+      const provider = localSubmissionMode ? ('local' as const) : getActiveProvider();
 
       // RAW transcription of the EXACT uploaded audio. We do NOT use any
       // canonical / cached / old / temp SRT, we do NOT apply spelling correction,
       // and we do NOT run max-3-word segmentation yet (raw text is verified first).
       const rawText = await (async () => {
-        if (provider === 'sarvam') {
+        if (provider === 'local') {
+          // LOCAL SUBMISSION MODE: local, open-source, CPU-only Odia ASR on the
+          // EXACT uploaded audio. Returns real per-word timings (CTC alignment).
+          const r = await transcribeRawOdiaWithLocalAsr(audioBuffer, mimeType);
+          return {
+            text: r.transcript,
+            duration: r.audioDurationSeconds,
+            meta: { words: r.words, localAsr: r },
+          };
+        } else if (provider === 'sarvam') {
           const r = await transcribeRawOdiaWithSarvam(audioBuffer, mimeType, { languageCode });
           return { text: r.transcript, duration: r.durationSeconds, meta: r };
         } else if (provider === 'olive') {
@@ -1003,6 +1037,23 @@ async function startServer() {
             }>) || []
           : [];
 
+      // LOCAL SUBMISSION MODE supplies REAL per-word timings measured by the
+      // local model's CTC frame alignment, so the existing 1:1 branch of
+      // buildMax3WordSegments places every cue on a real spoken word instead of
+      // distributing it evenly. Nothing here is interpolated or invented.
+      const localWordTimings =
+        provider === 'local'
+          ? ((rawText.meta as any)?.words as Array<{
+              text: string;
+              startSeconds: number;
+              endSeconds: number;
+            }>) || []
+          : [];
+
+      // For Sarvam this is identical to the previous behaviour.
+      const providerWordTimings =
+        provider === 'sarvam' ? sarvamWordTimings : localWordTimings;
+
       console.log(
         `  [TIMING] decodedWav=${decodedAudioDuration.toFixed(3)}s sarvamDuration=${(rawText.duration || 0).toFixed(3)}s ` +
           `providerChunks=${(provider === 'sarvam' ? ((rawText.meta as any)?.chunks || []).length : 0)} words=${rawTranscript.split(/\s+/).filter(Boolean).length}`
@@ -1010,7 +1061,7 @@ async function startServer() {
 
       let segments: SubtitleSegment[] =
         rawTranscript.length > 0
-          ? buildMax3WordSegments(rawTranscript, durationForSrt, sarvamWordTimings, durScaling)
+          ? buildMax3WordSegments(rawTranscript, durationForSrt, providerWordTimings, durScaling)
           : [];
 
       // TAGGING: classify the timeline against the ACTUAL audio via the existing
@@ -1201,12 +1252,29 @@ async function startServer() {
           requiredCredits: spendDecision.requiredCredits ?? 0,
         },
         notes: [
-          provider === 'sarvam'
+          provider === 'local'
+            ? 'LOCAL SUBMISSION MODE: local open-source Odia ASR (ai4bharat/indicwav2vec-odia, Apache-2.0) transcribed the EXACT uploaded audio on this machine. No Sarvam, Groq, Olive or other paid/cloud API was contacted and nothing was spent. Subtitles split to max 3 words each, using real per-word CTC frame-alignment timestamps, and classified against the actual audio (NOISE/FIL) so the exported SRT contains real tags. Punctuation is removed from spoken words. No spelling correction and no cached/previous/fixture transcript.'
+            : provider === 'sarvam'
             ? `Sarvam Saaras (saaras:v4, ${languageCode}, verbatim) transcription of the exact uploaded audio. Subtitles split to max 3 words each and classified against the actual audio (NOISE/SILENCE/MB) so the exported SRT contains real tags. No spelling correction, no canonical/old SRT fallback.`
             : provider === 'olive'
               ? 'Olive OdiaGenAI Whisper (language=or) transcription of the exact uploaded audio. Subtitles split to max 3 words each and classified against the actual audio (NOISE/SILENCE/MB) so the exported SRT contains real tags. No spelling correction, no canonical/old SRT fallback.'
               : 'Groq raw transcription (fallback provider). Subtitles split to max 3 words each and classified against the actual audio. No spelling correction, no canonical/old SRT fallback.',
         ],
+        // Clear, machine-readable LOCAL SUBMISSION MODE labelling.
+        localSubmissionMode: provider === 'local',
+        localAsr:
+          provider === 'local'
+            ? {
+                model: (rawText.meta as any)?.localAsr?.model ?? 'ai4bharat/indicwav2vec-odia',
+                modelDir: (rawText.meta as any)?.localAsr?.modelDir ?? null,
+                device: (rawText.meta as any)?.localAsr?.device ?? 'cpu',
+                wordCount: (rawText.meta as any)?.localAsr?.wordCount ?? 0,
+                hasReliableTimestamps: (rawText.meta as any)?.localAsr?.hasReliableTimestamps === true,
+                timestampNote: (rawText.meta as any)?.localAsr?.timestampNote ?? null,
+                meanLogProb: (rawText.meta as any)?.localAsr?.meanLogProb ?? null,
+                inferenceSeconds: (rawText.meta as any)?.localAsr?.inferenceSeconds ?? null,
+              }
+          : undefined,
         audioDiagnostics,
       });
     } catch (error: any) {
@@ -2265,6 +2333,26 @@ async function startServer() {
     } catch {
       console.warn('[Server] could not verify dist/ against Git HEAD (not a git checkout?)');
     }
+  }
+
+  // LOCAL SUBMISSION MODE startup banner. This is deliberately loud: the mode
+  // exists only for a temporary academic submission, and it must be impossible
+  // to forget that it is switched on after the deadline.
+  if (isLocalSubmissionModeEnabled()) {
+    console.warn(
+      '\n' +
+        '='.repeat(72) +
+        '\n' +
+        '  LOCAL SUBMISSION MODE IS ON\n' +
+        '  Transcription will run a LOCAL open-source Odia ASR\n' +
+        '  (ai4bharat/indicwav2vec-odia, CPU) instead of Sarvam.\n' +
+        '  No paid/cloud ASR API will be called.\n' +
+        '  TO RESTORE PRODUCTION: set LOCAL_SUBMISSION_MODE=false (or delete the\n' +
+        '  line from .env) and restart. See the LOCAL_SUBMISSION_MODE_BASELINE git\n' +
+        '  tag to remove the code entirely.\n' +
+        '='.repeat(72) +
+        '\n'
+    );
   }
 
   const server = app.listen(PORT, '0.0.0.0', () => {

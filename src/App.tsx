@@ -239,6 +239,12 @@ export default function App() {
 
       const result: TranscriptionResult = await response.json();
 
+      if (result.localSubmissionMode) {
+        addLog(
+          `LOCAL SUBMISSION MODE: transcribed locally with ${result.localAsr?.model ?? 'local Odia ASR'} (CPU). No paid/cloud ASR API was called.`
+        );
+      }
+
       updateStage(
         'detecting_language',
         'completed',
@@ -582,6 +588,36 @@ export default function App() {
         {segments.length > 0 && !isProcessing && (
           <div className="space-y-6 animate-in fade-in duration-300">
             {/* Result Summary Card */}
+            {/* LOCAL SUBMISSION MODE banner: this result did NOT come from a paid
+                cloud provider. It is spelled out in the UI so a submission is never
+                mistaken for Sarvam output. */}
+            {transcriptionResult?.localSubmissionMode && (
+              <div className="rounded-2xl border-2 border-blue-400 bg-blue-50 p-4">
+                <div className="text-xs font-extrabold uppercase tracking-wide text-blue-800 mb-2">
+                  Local Submission Mode — zero-budget local transcription
+                </div>
+                <div className="text-xs text-blue-900 space-y-1">
+                  <div>
+                    This SRT was produced by a <strong>local open-source Odia ASR</strong> running on this
+                    machine ({transcriptionResult.localAsr?.model ?? 'ai4bharat/indicwav2vec-odia'}, CPU only).
+                    No Sarvam, Groq, Olive or other paid/cloud ASR API was contacted and nothing was spent.
+                  </div>
+                  <div>
+                    <strong>Words recognised:</strong> {transcriptionResult.localAsr?.wordCount ?? '—'}
+                    {' · '}
+                    <strong>Timestamps:</strong>{' '}
+                    {transcriptionResult.localAsr?.hasReliableTimestamps
+                      ? `real per-word alignment (${transcriptionResult.localAsr?.timestampNote ?? 'CTC frame alignment'})`
+                      : 'unavailable — cue times fall back to even distribution across the audio'}
+                  </div>
+                  <div>
+                    Review the Odia text carefully before submission: a local model can mis-recognise words.
+                    Nothing is invented, but accuracy is not guaranteed.
+                  </div>
+                </div>
+              </div>
+            )}
+
             {transcriptionResult && (
               <ResultSummary result={transcriptionResult} segments={segments} />
             )}
