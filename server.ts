@@ -82,7 +82,8 @@ import {
   safeOriginalName,
   extensionForMime,
 } from './server/services/storage';
-import { R2StorageProvider, createStorageProvider } from './server/services/r2Storage';
+import { createStorageProvider } from './server/services/r2Storage';
+import { b2ConfigurationError, missingB2EnvKeys } from './server/services/b2Storage';
 import { JobQueue, type RunPipeline } from './server/services/queue';
 import { extractToken, hashToken, issueToken, isValidTokenShape, selectSessionToken } from './server/services/auth';
 import {
@@ -686,9 +687,28 @@ const moderationRepo = new ModerationRepo(store);
  */
 const credits: AsyncCreditService = createFileCreditFacade(new FileCreditService(users, creditsRepo));
 
-// Initialize storage provider
+// Initialize storage provider.
+//
+// Production storage is Backblaze B2 over its S3-compatible API. `b2` is the
+// only value a production process can reach here: assertProductionProviderSelection()
+// runs first and refuses to start unless STORAGE_PROVIDER is exactly 'b2', so
+// there is no path by which a production boot silently lands on local storage.
+// The 'r2' branch remains for non-production compatibility only.
 let storage: any;
-if (config.storageProvider === 'r2') {
+if (config.storageProvider === 'b2') {
+  const missingB2Vars = missingB2EnvKeys(process.env);
+  if (missingB2Vars.length > 0) {
+    throw b2ConfigurationError(missingB2Vars);
+  }
+  const { createB2StorageProvider } = await import('./server/services/b2Storage');
+  storage = createB2StorageProvider({
+    endpoint: config.b2Endpoint!,
+    region: config.b2Region!,
+    bucket: config.b2Bucket!,
+    keyId: config.b2KeyId!,
+    applicationKey: config.b2ApplicationKey!,
+  });
+} else if (config.storageProvider === 'r2') {
   if (!config.r2AccountId || !config.r2AccessKeyId || !config.r2SecretAccessKey || !config.r2Bucket) {
     throw new Error('R2 configuration required: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET must be set when STORAGE_PROVIDER=r2');
   }

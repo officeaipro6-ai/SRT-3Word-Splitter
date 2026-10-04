@@ -9,7 +9,7 @@ import path from 'path';
 
 export type ProviderName = 'sarvam' | 'olive' | 'groq' | 'azure';
 export type DatabaseProvider = 'json' | 'turso';
-export type StorageProviderType = 'local' | 'r2';
+export type StorageProviderType = 'local' | 'r2' | 'b2';
 
 function envBool(name: string, def: boolean): boolean {
   const v = process.env[name];
@@ -151,14 +151,55 @@ export const config = {
     return v || null;
   },
 
-  /** Storage provider: 'local' (local filesystem) or 'r2' (Cloudflare R2). */
+  /**
+   * Storage provider: 'local' (local filesystem), 'b2' (Backblaze B2 over the
+   * S3-compatible API) or 'r2' (Cloudflare R2, retained for non-production
+   * compatibility only — a production process can never select it).
+   */
   get storageProvider(): StorageProviderType {
     const raw = (process.env.STORAGE_PROVIDER || 'local').trim().toLowerCase();
+    if (raw === 'b2') return 'b2';
     if (raw === 'r2') return 'r2';
     return 'local';
   },
 
-  /** Cloudflare R2 account ID. */
+  /** Backblaze B2 S3-compatible endpoint (e.g. https://s3.<region>.backblazeb2.com). */
+  get b2Endpoint(): string | null {
+    const v = (process.env.B2_ENDPOINT || '').trim();
+    return v || null;
+  },
+
+  /** Backblaze B2 region (e.g. us-west-004). */
+  get b2Region(): string | null {
+    const v = (process.env.B2_REGION || '').trim();
+    return v || null;
+  },
+
+  /** Backblaze B2 bucket name. */
+  get b2Bucket(): string | null {
+    const v = (process.env.B2_BUCKET || '').trim();
+    return v || null;
+  },
+
+  /** Backblaze B2 key ID. Secret: environment only, never logged or echoed. */
+  get b2KeyId(): string | null {
+    const v = (process.env.B2_KEY_ID || '').trim();
+    return v || null;
+  },
+
+  /** Backblaze B2 application key. Secret: environment only, never logged or echoed. */
+  get b2ApplicationKey(): string | null {
+    const v = (process.env.B2_APPLICATION_KEY || '').trim();
+    return v || null;
+  },
+
+  /**
+   * Cloudflare R2 account ID.
+   * @deprecated Non-production only. Production storage is Backblaze B2 ('b2');
+   * `assertProductionProviderSelection()` refuses to start a production process
+   * that selects anything other than 'b2', so these values can never be used
+   * there. Kept so an existing non-production R2 setup keeps working.
+   */
   get r2AccountId(): string | null {
     const v = (process.env.R2_ACCOUNT_ID || '').trim();
     return v || null;
@@ -196,7 +237,7 @@ export const config = {
 
 /**
  * Stage 6B — the ONLY database and storage providers a production process may
- * use.
+ * use. Storage is Backblaze B2 over its S3-compatible API ('b2').
  *
  * The local alternatives (`json` file, local filesystem) are not "safe defaults":
  * on a host with no persistent disk they lose the entire ledger on every restart
@@ -204,7 +245,7 @@ export const config = {
  * is why this is enforced by an explicit assertion rather than by changing them.
  */
 export const PRODUCTION_DATABASE_PROVIDER: DatabaseProvider = 'turso';
-export const PRODUCTION_STORAGE_PROVIDER: StorageProviderType = 'r2';
+export const PRODUCTION_STORAGE_PROVIDER: StorageProviderType = 'b2';
 
 /** True only when NODE_ENV is exactly "production" (trimmed, case-insensitive). */
 export function isProduction(): boolean {
@@ -242,7 +283,8 @@ function describeProviderValue(raw: string): string {
  *
  * This check is about WHICH backend is selected, not whether its credentials are
  * present: the existing credential gates in server.ts still run afterwards and
- * still throw on missing Turso or R2 credentials. No secret is read or named here.
+ * still throw on missing Turso or Backblaze B2 credentials. No secret is read or
+ * named here.
  */
 export function assertProductionProviderSelection(): void {
   if (!isProduction()) return;

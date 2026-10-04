@@ -5,9 +5,14 @@
  * -------------------------
  * `config.databaseProvider` returned 'json' for ANY value that was not exactly
  * "turso", and `config.storageProvider` returned 'local' for anything that was
- * not exactly "r2" — including an unset variable and a typo like "tursoo". On a
- * host with no persistent disk that is silent, total ledger loss on the next
- * restart, so a production process must now NAME its providers explicitly.
+ * not the production object store — including an unset variable and a typo like
+ * "tursoo". On a host with no persistent disk that is silent, total ledger loss
+ * on the next restart, so a production process must now NAME its providers
+ * explicitly.
+ *
+ * Storage migration note: production storage is Backblaze B2, so the required
+ * value is STORAGE_PROVIDER=b2. Cloudflare R2 ('r2') is now REJECTED in
+ * production and survives only as a non-production option.
  *
  * Two things are deliberately preserved:
  *   - the getters still default to json/local, so local development and every
@@ -56,7 +61,7 @@ function withEnv<T>(values: Env, fn: () => T): T {
 
 test('6B. production requires the production providers, and names them', () => {
   assert.equal(PRODUCTION_DATABASE_PROVIDER, 'turso');
-  assert.equal(PRODUCTION_STORAGE_PROVIDER, 'r2');
+  assert.equal(PRODUCTION_STORAGE_PROVIDER, 'b2');
 });
 
 // ---------------------------------------------------------------------------
@@ -64,13 +69,13 @@ test('6B. production requires the production providers, and names them', () => {
 // ---------------------------------------------------------------------------
 
 test('6B-A. production with DATABASE_PROVIDER unset fails', () => {
-  withEnv({ NODE_ENV: 'production', DATABASE_PROVIDER: undefined, STORAGE_PROVIDER: 'r2' }, () => {
+  withEnv({ NODE_ENV: 'production', DATABASE_PROVIDER: undefined, STORAGE_PROVIDER: 'b2' }, () => {
     assert.throws(() => assertProductionProviderSelection(), /DATABASE_PROVIDER is not set/);
   });
 });
 
 test('6B-A2. production with an empty DATABASE_PROVIDER fails', () => {
-  withEnv({ NODE_ENV: 'production', DATABASE_PROVIDER: '   ', STORAGE_PROVIDER: 'r2' }, () => {
+  withEnv({ NODE_ENV: 'production', DATABASE_PROVIDER: '   ', STORAGE_PROVIDER: 'b2' }, () => {
     assert.throws(() => assertProductionProviderSelection(), /DATABASE_PROVIDER is not set/);
   });
 });
@@ -80,7 +85,7 @@ test('6B-A2. production with an empty DATABASE_PROVIDER fails', () => {
 // ---------------------------------------------------------------------------
 
 test('6B-B. production with the local json store fails', () => {
-  withEnv({ NODE_ENV: 'production', DATABASE_PROVIDER: 'json', STORAGE_PROVIDER: 'r2' }, () => {
+  withEnv({ NODE_ENV: 'production', DATABASE_PROVIDER: 'json', STORAGE_PROVIDER: 'b2' }, () => {
     assert.throws(() => assertProductionProviderSelection(), (err: Error) => {
       assert.match(err.message, /not permitted in production/);
       assert.match(err.message, /"json"/);
@@ -93,25 +98,25 @@ test('6B-B. production with the local json store fails', () => {
 // C. production + turso => accepted BEFORE credential validation
 // ---------------------------------------------------------------------------
 
-test('6B-C. production with turso/r2 is accepted without any credentials present', () => {
+test('6B-C. production with turso/b2 is accepted without any credentials present', () => {
   // Credentials are absent on purpose: choosing the provider is not the same
   // question as configuring it, and the server.ts gates still enforce the rest.
   withEnv(
-    { NODE_ENV: 'production', DATABASE_PROVIDER: 'turso', STORAGE_PROVIDER: 'r2' },
+    { NODE_ENV: 'production', DATABASE_PROVIDER: 'turso', STORAGE_PROVIDER: 'b2' },
     () => {
       assert.equal(process.env.TURSO_DATABASE_URL, undefined);
       assert.equal(process.env.TURSO_AUTH_TOKEN, undefined);
       assert.doesNotThrow(() => assertProductionProviderSelection());
       // The getters resolve to the production providers...
       assert.equal(config.databaseProvider, 'turso');
-      assert.equal(config.storageProvider, 'r2');
+      assert.equal(config.storageProvider, 'b2');
     }
   );
 });
 
 test('6B-C2. provider names are accepted case-insensitively and when padded', () => {
   withEnv(
-    { NODE_ENV: 'production', DATABASE_PROVIDER: ' Turso ', STORAGE_PROVIDER: 'R2' },
+    { NODE_ENV: 'production', DATABASE_PROVIDER: ' Turso ', STORAGE_PROVIDER: 'B2' },
     () => assert.doesNotThrow(() => assertProductionProviderSelection())
   );
 });
@@ -147,12 +152,36 @@ test('6B-E. production with local filesystem storage fails', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Cloudflare R2 is no longer a production storage backend
+// ---------------------------------------------------------------------------
+
+test('B2. production rejects Cloudflare R2 so it can never be used in production', () => {
+  for (const value of ['r2', 'R2', ' r2 ']) {
+    withEnv(
+      { NODE_ENV: 'production', DATABASE_PROVIDER: 'turso', STORAGE_PROVIDER: value },
+      () => assert.throws(
+        () => assertProductionProviderSelection(),
+        /STORAGE_PROVIDER=.* not permitted in production/,
+        `STORAGE_PROVIDER=${JSON.stringify(value)} must not be accepted in production`
+      )
+    );
+  }
+});
+
+test('B2. r2 remains selectable outside production for compatibility', () => {
+  withEnv({ NODE_ENV: 'development', DATABASE_PROVIDER: 'json', STORAGE_PROVIDER: 'r2' }, () => {
+    assert.doesNotThrow(() => assertProductionProviderSelection());
+    assert.equal(config.storageProvider, 'r2');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Typos and unsupported values, on either variable
 // ---------------------------------------------------------------------------
 
 test('6B. a typo such as "tursoo" fails in production instead of silently using json', () => {
   withEnv(
-    { NODE_ENV: 'production', DATABASE_PROVIDER: 'tursoo', STORAGE_PROVIDER: 'r2' },
+    { NODE_ENV: 'production', DATABASE_PROVIDER: 'tursoo', STORAGE_PROVIDER: 'b2' },
     () => assert.throws(() => assertProductionProviderSelection(), /"tursoo"/)
   );
   withEnv(
@@ -177,7 +206,7 @@ test('6B. an unsafe provider value is never echoed back verbatim', () => {
   // A value outside the safe shape must not be copied into an error that gets
   // logged, in case someone pastes a secret into the wrong variable.
   const leaky = 'rzp_live_x'.repeat(6);
-  withEnv({ NODE_ENV: 'production', DATABASE_PROVIDER: leaky, STORAGE_PROVIDER: 'r2' }, () => {
+  withEnv({ NODE_ENV: 'production', DATABASE_PROVIDER: leaky, STORAGE_PROVIDER: 'b2' }, () => {
     assert.throws(() => assertProductionProviderSelection(), (err: Error) => {
       assert.ok(!err.message.includes(leaky), 'the raw value must not appear in the error');
       assert.match(err.message, /unrecognised value/);

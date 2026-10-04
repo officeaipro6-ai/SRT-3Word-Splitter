@@ -37,7 +37,14 @@ services:
       - key: DATABASE_PROVIDER
         value: turso
       - key: STORAGE_PROVIDER
-        value: r2
+        value: b2
+      # Backblaze B2 (S3-compatible) object storage
+      - key: B2_ENDPOINT
+        value: https://s3.us-west-004.backblazeb2.com
+      - key: B2_REGION
+        value: us-west-004
+      - key: B2_BUCKET
+        value: odia-srt-production-storage
       # Provider spending protection (recommended ON for production)
       - key: PROVIDER_SPENDING_PROTECTION
         value: "true"
@@ -86,15 +93,11 @@ services:
       #   value: libsql://your-db.turso.io
       # - key: TURSO_AUTH_TOKEN
       #   value: *****
-      # Cloudflare R2 (set in Render dashboard)
-      # - key: R2_ACCOUNT_ID
-      #   value: *****
-      # - key: R2_ACCESS_KEY_ID
-      #   value: *****
-      # - key: R2_SECRET_ACCESS_KEY
-      #   value: *****
-      # - key: R2_BUCKET
-      #   value: odia-srt-storage
+# Backblaze B2 credentials (set in Render dashboard, NOT here)
+      # - key: B2_KEY_ID
+      #   value: ******
+      # - key: B2_APPLICATION_KEY
+      #   value: ******
       # Razorpay TEST mode (set in Render dashboard)
       # - key: RAZORPAY_KEY_ID
       #   value: rzp_test_******
