@@ -158,6 +158,98 @@ export type OwnerNotificationTransport = (
   notification: OwnerNotification
 ) => boolean | Promise<boolean>;
 
+/**
+ * Adapter: converts an OwnerNotificationTransport to a LoginAlertTransport.
+ * The login alert transport takes (subject, body); the owner transport takes a full notification.
+ * We wrap the subject+body into a minimal OwnerNotification for the transport.
+ */
+import type { LoginAlertTransport } from './loginAlertService';
+
+export function toLoginAlertTransport(
+  transport: OwnerNotificationTransport
+): LoginAlertTransport {
+  return (subject: string, body: string) => {
+    const notification: import('./notifications').OwnerNotification = {
+      id: `adapt_${Date.now()}`,
+      event: 'PROVIDER_WARNING', // event type doesn't matter for transport
+      provider: 'login-alert',
+      title: subject,
+      body,
+      reason: null,
+      lastError: null,
+      lastHttpStatus: null,
+      balancePercent: null,
+      balanceSource: null,
+      at: new Date().toISOString(),
+      deliveredAt: null,
+      delivered: false,
+      deliveries: [],
+      note: null,
+    };
+    return transport(notification);
+  };
+}
+
+/**
+ * Telegram Bot API transport configuration.
+ * If either TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing/empty,
+ * the transport is not registered and alerts fall back to NOT_CONFIGURED.
+ */
+export interface TelegramTransportConfig {
+  botToken: string;
+  chatId: string;
+}
+
+/**
+ * Create a Telegram Bot API transport.
+ * Returns null if configuration is incomplete (missing token or chatId).
+ * The transport sends a plain text message via sendMessage API.
+ */
+export function createTelegramTransport(
+  config: TelegramTransportConfig
+): OwnerNotificationTransport | null {
+  if (!config.botToken || !config.chatId) return null;
+
+  const { botToken, chatId } = config;
+  const apiUrl = `https://api.telegram.org/bot${botToken}/sendMessage`;
+
+  return async (notification: OwnerNotification): Promise<boolean> => {
+    const text = `${notification.title}\n\n${notification.body}`;
+    try {
+      const res = await fetch(apiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text,
+          // Send as plain text (no parse_mode) so \n renders as actual line breaks
+          disable_web_page_preview: true,
+        }),
+      });
+      if (!res.ok) {
+        const errText = await res.text().catch(() => '');
+        throw new Error(`Telegram API error ${res.status}: ${errText}`);
+      }
+      return true;
+    } catch (err) {
+      // Transport failure is logged by the notifier; we return false.
+      return false;
+    }
+  };
+}
+
+/**
+ * Read Telegram configuration from environment.
+ * Returns null if either value is missing/empty.
+ * Never logs the token or chatId.
+ */
+export function readTelegramConfig(): TelegramTransportConfig | null {
+  const botToken = (process.env.TELEGRAM_BOT_TOKEN ?? '').trim();
+  const chatId = (process.env.TELEGRAM_CHAT_ID ?? '').trim();
+  if (!botToken || !chatId) return null;
+  return { botToken, chatId };
+}
+
 const isThenable = (value: unknown): value is Promise<boolean> =>
   typeof (value as Promise<boolean>)?.then === 'function';
 

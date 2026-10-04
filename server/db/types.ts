@@ -304,6 +304,76 @@ export interface DbShape {
   moderationCases?: ModerationCaseRecord[];
   communityRestrictions?: CommunityRestrictionRecord[];
   communityMessages?: CommunityMessageRecord[];
+  /**
+   * Monthly login analytics. Optional so databases written before this feature
+   * keep loading unchanged; `store.ts` normalises them on load.
+   *
+   * PRIVACY: these tables hold NO password, token, API key or payment data.
+   * Only the fields needed to answer "who logged in, when, from where" are
+   * stored, and each one is optional.
+   */
+  loginActivity?: LoginActivityRecord[];
+  loginAlerts?: LoginAlertRecord[];
+}
+
+/** How a session/login was obtained. Never a credential itself. */
+export type LoginMethod = 'SESSION' | 'ACCOUNT_LOGIN' | 'OWNER_BOOTSTRAP';
+
+export type LoginOutcome = 'SUCCESS' | 'FAILURE';
+
+/**
+ * One login/session event, bucketed by IST civil time so a month is a
+ * YYYY-MM bucket and a day is a YYYY-MM-DD IST date.
+ *
+ * NEVER store here: passwords, bearer tokens, API keys, the admin bootstrap
+ * token, or any payment secret. `ip`/`userAgent` are captured only because the
+ * request already exposes them, and both are length-capped.
+ */
+export interface LoginActivityRecord {
+  id: string;
+  /** Empty for a FAILED login, where the caller is not yet authenticated. */
+  userId: string;
+  email?: string;
+  /** IST civil date, e.g. `2026-09-30`. */
+  loginDate: string;
+  /** IST civil time, e.g. `08:15:42`. */
+  loginTime: string;
+  /** Full IST civil timestamp, e.g. `2026-09-30T08:15:42+05:30`. */
+  istDateTime: string;
+  /** IST month bucket, e.g. `2026-09`. */
+  month: string;
+  /** Canonical UTC instant. */
+  occurredAt: string;
+  method: LoginMethod;
+  outcome: LoginOutcome;
+  /** A non-identifying failure classification (e.g. `INVALID_CREDENTIALS`). */
+  failureCode?: string;
+  ip?: string;
+  userAgent?: string;
+}
+
+/** Delivery outcome of a daily login-activity alert. */
+export type LoginAlertDelivery = 'NOT_CONFIGURED' | 'DELIVERED' | 'FAILED';
+
+/** One daily "yesterday's login activity" alert. Never contains a secret. */
+export interface LoginAlertRecord {
+  id: string;
+  /** IST date the alert was generated on. */
+  alertDate: string;
+  /** IST date the alert summarises (always the previous day). */
+  periodDate: string;
+  /** Month bucket of `periodDate`. */
+  month: string;
+  generatedAt: string;
+  totalLogins: number;
+  uniqueUsers: number;
+  newUsers: number;
+  activeUsers: number;
+  failedLogins: number;
+  /** Highest login counts for the day, capped and free of any secret. */
+  topUsers: Array<{ userId: string; email?: string; count: number }>;
+  deliveryStatus: LoginAlertDelivery;
+  statusMessage: string;
 }
 
 export const DB_VERSION = 4;

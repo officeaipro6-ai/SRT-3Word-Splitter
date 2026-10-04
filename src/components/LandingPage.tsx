@@ -18,7 +18,7 @@ import {
 const FEATURES = [
   { icon: Mic, title: 'AI Speech Transcription', desc: 'Sarvam Saaras (saaras:v4) transcribes the exact uploaded audio in Odia, Hindi, or English.' },
   { icon: AudioWaveform, title: 'Waveform Acoustic Analysis', desc: 'Speech is verified against the real audio to tag background music (BGM), noise, fillers, and laughter.' },
-  { icon: ShieldCheck, title: 'Strict Subtitle Rules A–E', desc: 'Segments are capped at 3 words, silence ≥2.00s is preserved, and exports follow the strict rule set.' },
+  { icon: ShieldCheck, title: 'Strict Subtitle Rules A–E', desc: 'Segments target 2–4 seconds, silence ≥1.00s is preserved as <SIL></SIL>, and exports follow the strict rule set.' },
   { icon: Captions, title: 'Tagged SRT Export', desc: 'Valid, sequential SRT with <NOISE>, <FIL>, and <SIL> tags — ready for any media player.' },
 ];
 
@@ -118,7 +118,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({ children }) => {
       <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-xs text-slate-500">
         <span className="inline-flex items-center gap-1.5">
           <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-          Max 3 words per subtitle
+          2–4 seconds per segment (no word limit)
         </span>
         <span className="inline-flex items-center gap-1.5">
           <CheckCircle2 className="w-4 h-4 text-emerald-600" />

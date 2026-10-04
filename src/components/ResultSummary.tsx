@@ -37,7 +37,7 @@ export const ResultSummary: React.FC<ResultSummaryProps> = ({ result, segments }
       icon: Captions,
       label: 'Total Subtitle Segments',
       value: String(result.segments.length),
-      sub: `Max 3 words per segment`,
+      sub: `2–4 seconds per segment`,
     },
     {
       icon: MessageSquareText,

@@ -48,7 +48,7 @@ test('pack catalog matches the product spec exactly', () => {
       ['Standard', 299, 80, '🟣', false],
       ['Pro', 599, 180, '🟠', false],
       ['Large', 1199, 400, '🔴', false],
-      ['Annual', 4499, 1500, '⭐', true],
+      ['Annual', 4499, 2000, '⭐', true],
     ]
   );
   // Unique ids (used as React keys / future product ids) and all 6 packs exist.

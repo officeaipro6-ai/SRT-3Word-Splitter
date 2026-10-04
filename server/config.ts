@@ -8,6 +8,8 @@
 import path from 'path';
 
 export type ProviderName = 'sarvam' | 'olive' | 'groq' | 'azure';
+export type DatabaseProvider = 'json' | 'turso';
+export type StorageProviderType = 'local' | 'r2';
 
 function envBool(name: string, def: boolean): boolean {
   const v = process.env[name];
@@ -130,6 +132,56 @@ export const config = {
   /** Enable the local durable job queue + worker. */
   enableJobQueue: envBool('ENABLE_JOB_QUEUE', true),
 
+  /** Database provider: 'json' (local file) or 'turso' (libSQL via Turso). */
+  get databaseProvider(): DatabaseProvider {
+    const raw = (process.env.DATABASE_PROVIDER || 'json').trim().toLowerCase();
+    if (raw === 'turso') return 'turso';
+    return 'json';
+  },
+
+  /** Turso database URL (e.g., libsql://my-db.turso.io). */
+  get tursoDatabaseUrl(): string | null {
+    const v = (process.env.TURSO_DATABASE_URL || '').trim();
+    return v || null;
+  },
+
+  /** Turso authentication token. */
+  get tursoAuthToken(): string | null {
+    const v = (process.env.TURSO_AUTH_TOKEN || '').trim();
+    return v || null;
+  },
+
+  /** Storage provider: 'local' (local filesystem) or 'r2' (Cloudflare R2). */
+  get storageProvider(): StorageProviderType {
+    const raw = (process.env.STORAGE_PROVIDER || 'local').trim().toLowerCase();
+    if (raw === 'r2') return 'r2';
+    return 'local';
+  },
+
+  /** Cloudflare R2 account ID. */
+  get r2AccountId(): string | null {
+    const v = (process.env.R2_ACCOUNT_ID || '').trim();
+    return v || null;
+  },
+
+  /** Cloudflare R2 access key ID. */
+  get r2AccessKeyId(): string | null {
+    const v = (process.env.R2_ACCESS_KEY_ID || '').trim();
+    return v || null;
+  },
+
+  /** Cloudflare R2 secret access key. */
+  get r2SecretAccessKey(): string | null {
+    const v = (process.env.R2_SECRET_ACCESS_KEY || '').trim();
+    return v || null;
+  },
+
+  /** Cloudflare R2 bucket name. */
+  get r2Bucket(): string | null {
+    const v = (process.env.R2_BUCKET || '').trim();
+    return v || null;
+  },
+
   /** Upload request rate limit (per identity, naive in-memory, not authoritative). */
   uploadRateLimitMax: envInt('UPLOAD_RATE_LIMIT_MAX', 10),
   uploadRateLimitWindowMs: envInt('UPLOAD_RATE_LIMIT_WINDOW_MS', 60 * 60 * 1000),
@@ -141,6 +193,94 @@ export const config = {
     return Boolean(key && region);
   },
 };
+
+/**
+ * Stage 6B — the ONLY database and storage providers a production process may
+ * use.
+ *
+ * The local alternatives (`json` file, local filesystem) are not "safe defaults":
+ * on a host with no persistent disk they lose the entire ledger on every restart
+ * or redeploy. They remain the development default via the getters above, which
+ * is why this is enforced by an explicit assertion rather than by changing them.
+ */
+export const PRODUCTION_DATABASE_PROVIDER: DatabaseProvider = 'turso';
+export const PRODUCTION_STORAGE_PROVIDER: StorageProviderType = 'r2';
+
+/** True only when NODE_ENV is exactly "production" (trimmed, case-insensitive). */
+export function isProduction(): boolean {
+  return (process.env.NODE_ENV || '').trim().toLowerCase() === 'production';
+}
+
+/**
+ * Values of DATABASE_PROVIDER / STORAGE_PROVIDER are safe to quote back in an
+ * error. Anything outside this shape is reported without echoing it, so an
+ * operator cannot accidentally copy a secret into a log by setting one of these
+ * variables to the wrong thing.
+ */
+const SAFE_PROVIDER_ECHO = /^[A-Za-z0-9_.:-]{1,32}$/;
+
+function describeProviderValue(raw: string): string {
+  return SAFE_PROVIDER_ECHO.test(raw) ? `"${raw}"` : 'an unrecognised value';
+}
+
+/**
+ * Stage 6B — refuse to START a production process whose provider selection would
+ * silently fall back to local, ephemeral storage.
+ *
+ * WHY THIS IS AN ASSERTION AND NOT A GETTER CHANGE
+ * `config.databaseProvider` and `config.storageProvider` must keep defaulting to
+ * `json`/`local` for development and for the existing test suite. So the getters
+ * stay permissive and the production contract is enforced here, once, before any
+ * provider is constructed. Every bad input is rejected, not just the defaults:
+ *
+ *   - missing variable, empty variable, a typo such as "tursoo", an unsupported
+ *     value, or an explicit `json`/`local`.
+ *
+ * With `NODE_ENV` unset or set to anything else this is a no-op, so `npm run dev`
+ * and the test suite are unaffected. `npm start` sets NODE_ENV=production and is
+ * therefore covered.
+ *
+ * This check is about WHICH backend is selected, not whether its credentials are
+ * present: the existing credential gates in server.ts still run afterwards and
+ * still throw on missing Turso or R2 credentials. No secret is read or named here.
+ */
+export function assertProductionProviderSelection(): void {
+  if (!isProduction()) return;
+
+  const problems: string[] = [];
+  const rawDatabase = (process.env.DATABASE_PROVIDER ?? '').trim();
+  const rawStorage = (process.env.STORAGE_PROVIDER ?? '').trim();
+
+  if (rawDatabase.length === 0) {
+    problems.push(
+      `DATABASE_PROVIDER is not set (production requires DATABASE_PROVIDER=${PRODUCTION_DATABASE_PROVIDER})`
+    );
+  } else if (rawDatabase.toLowerCase() !== PRODUCTION_DATABASE_PROVIDER) {
+    problems.push(
+      `DATABASE_PROVIDER=${describeProviderValue(rawDatabase)} is not permitted in production ` +
+        `(set DATABASE_PROVIDER=${PRODUCTION_DATABASE_PROVIDER}; the local json store is not durable on this host)`
+    );
+  }
+
+  if (rawStorage.length === 0) {
+    problems.push(
+      `STORAGE_PROVIDER is not set (production requires STORAGE_PROVIDER=${PRODUCTION_STORAGE_PROVIDER})`
+    );
+  } else if (rawStorage.toLowerCase() !== PRODUCTION_STORAGE_PROVIDER) {
+    problems.push(
+      `STORAGE_PROVIDER=${describeProviderValue(rawStorage)} is not permitted in production ` +
+        `(set STORAGE_PROVIDER=${PRODUCTION_STORAGE_PROVIDER}; local filesystem storage is not durable on this host)`
+    );
+  }
+
+  if (problems.length > 0) {
+    throw new Error(
+      'Unsafe production provider configuration, refusing to start. ' +
+        `${problems.join('. ')}. There is no silent fallback: a production process ` +
+        'must name its production providers explicitly.'
+    );
+  }
+}
 
 /** MIME allowlist for audio/video uploads (validated server-side). */
 export const ALLOWED_MIME_TYPES: ReadonlySet<string> = new Set([

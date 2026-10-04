@@ -3,12 +3,19 @@ import assert from 'node:assert/strict';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { fileURLToPath } from 'node:url';
 import { DataStore } from '../db/store.ts';
 import { UserRepo, CreditRepo } from '../db/repos.ts';
 import type { CreditMode, UserRecord } from '../db/types.ts';
 import { FileCreditService, CreditError } from './creditService.ts';
 import { decideAudioSpend, type AudioSpendContext } from './audioSpendGate.ts';
 import { creditsForDuration, NOT_ENOUGH_CREDITS_MESSAGE, PROVIDER_UNAVAILABLE_MESSAGE, CANNOT_MEASURE_DURATION_MESSAGE } from './creditPolicy.ts';
+import {
+  FREE_TRIAL_DURATION_LIMIT_MESSAGE,
+  FREE_TRIAL_MAX_DURATION_SECONDS,
+  exceedsFreeTrialDuration,
+  freeTrialTotalMaxDurationSeconds,
+} from './freeTrialPolicy.ts';
 import { ProviderSafetyService, classifyProviderFailure } from './providerSafety.ts';
 import { ProviderSafetyRepo } from '../db/repos.ts';
 import { config } from '../config.ts';
@@ -180,29 +187,173 @@ test('free trials: #1 and #2 are allowed free, #3 requires credits (failures nev
   const { service, users, user } = await makeWallet(0);
   const fresh = () => users.getById(user.id) as UserRecord;
 
-  // Trial #1 — allowed free, consumes nothing.
-  let d = decideAudioSpend(ctx(fresh(), 300));
+  // Trial #1 — allowed free (100s <= the 2-minute per-trial cap), consumes nothing.
+  let d = decideAudioSpend(ctx(fresh(), 100));
   assert.equal(d.ok, true);
   assert.equal(d.kind, 'FREE_TRIAL');
   assert.equal(d.freeTrialsRemaining, 2);
   users.incrementFreeTrialsUsed(fresh().id);
 
   // Trial #2 — allowed free.
-  d = decideAudioSpend(ctx(fresh(), 300));
+  d = decideAudioSpend(ctx(fresh(), 100));
   assert.equal(d.ok, true);
   assert.equal(d.kind, 'FREE_TRIAL');
   assert.equal(d.freeTrialsRemaining, 1);
   users.incrementFreeTrialsUsed(fresh().id);
 
   // Trial #3 — must pay with credits (0 in the wallet -> 402).
-  d = decideAudioSpend(ctx(fresh(), 300));
+  d = decideAudioSpend(ctx(fresh(), 100));
   assert.equal(d.ok, false);
   assert.equal(d.kind, 'NEED_CREDITS');
-  assert.equal(d.requiredCredits, 5); // 300s = 5 minutes
+  assert.equal(d.requiredCredits, 2); // 100s = 2 minutes
   // Free trials never move credits and never write a credit ledger entry.
   assert.equal(service.getBalance(fresh().id), 0);
   assert.equal(allTxns(service,fresh().id).length, 0);
   assert.equal(fresh().freeTrialsUsed, 2);
+});
+
+test('free trial duration cap: 1:00 and 2:00 are allowed, 2:01 is blocked before any provider call', () => {
+  const freshUser = () => ({ id: 'u', creditMode: 'NORMAL', freeTrialsUsed: 0, credits: 0 }) as UserRecord;
+
+  // 1:00 — well within the cap.
+  const oneMinute = decideAudioSpend(ctx(freshUser(), 60));
+  assert.equal(oneMinute.ok, true);
+  assert.equal(oneMinute.kind, 'FREE_TRIAL');
+
+  // 2:00 exactly — the LAST accepted second (no rounding down).
+  const twoMinutes = decideAudioSpend(ctx(freshUser(), 120));
+  assert.equal(twoMinutes.ok, true);
+  assert.equal(twoMinutes.kind, 'FREE_TRIAL');
+  assert.equal(exceedsFreeTrialDuration(120, 2), false);
+
+  // 2:01 — one second over: refused, and refused as a DURATION problem with
+  // the exact product message (not the generic "out of trials" message).
+  const twoOhOne = decideAudioSpend(ctx(freshUser(), 121));
+  assert.equal(twoOhOne.ok, false);
+  assert.equal(twoOhOne.kind, 'FREE_TRIAL_DURATION_LIMIT');
+  assert.equal(twoOhOne.status, 402);
+  assert.equal(twoOhOne.code, 'FREE_TRIAL_DURATION_LIMIT');
+  // It is priced, but the trial is NOT consumed and no credit moves.
+  assert.equal(twoOhOne.requiredCredits, 3); // 121s rounds UP to 3 minutes
+  assert.equal(twoOhOne.balance, 0);
+  assert.equal(twoOhOne.freeTrialsUsed, 0);
+  assert.equal(twoOhOne.freeTrialsRemaining, 2);
+  assert.equal(exceedsFreeTrialDuration(121, 2), true);
+  assert.equal(FREE_TRIAL_MAX_DURATION_SECONDS, 120);
+  assert.equal(twoOhOne.message, FREE_TRIAL_DURATION_LIMIT_MESSAGE);
+  assert.equal(
+    twoOhOne.message,
+    'Free trial is limited to 2 minutes. Please use credits for longer files.'
+  );
+
+  // A long file is never split across trials: each 121s request is refused
+  // independently and the trial counter stays untouched.
+  for (let i = 0; i < 5; i += 1) {
+    const again = decideAudioSpend(ctx(freshUser(), 600));
+    assert.equal(again.ok, false);
+    assert.equal(again.kind, 'FREE_TRIAL_DURATION_LIMIT');
+    assert.equal(again.freeTrialsUsed, 0);
+    assert.equal(again.freeTrialsRemaining, 2);
+  }
+});
+
+test('free trial counter and total free allowance: 2 trials x 2 minutes = 4 minutes', async () => {
+  const { service, users, user } = await makeWallet(0);
+  const fresh = () => users.getById(user.id) as UserRecord;
+
+  // Trial #1 available: 2 minutes usable, 2 trials remaining.
+  let d = decideAudioSpend(ctx(fresh(), 120));
+  assert.equal(d.kind, 'FREE_TRIAL');
+  assert.equal(d.freeTrialsRemaining, 2);
+  users.incrementFreeTrialsUsed(fresh().id);
+
+  // After trial #1 is used: 1 trial remaining.
+  d = decideAudioSpend(ctx(fresh(), 120));
+  assert.equal(d.kind, 'FREE_TRIAL');
+  assert.equal(d.freeTrialsUsed, 1);
+  assert.equal(d.freeTrialsRemaining, 1);
+  users.incrementFreeTrialsUsed(fresh().id);
+
+  // Both trials are now spent: even a 120s file must use credits, and the
+  // refusal is the generic one because the trials (not the duration) are gone.
+  d = decideAudioSpend(ctx(fresh(), 120));
+  assert.equal(d.ok, false);
+  assert.equal(d.kind, 'NEED_CREDITS');
+  assert.equal(d.message, NOT_ENOUGH_CREDITS_MESSAGE);
+  assert.equal(d.code, 'NOT_ENOUGH_CREDITS');
+  assert.equal(d.freeTrialsUsed, 2);
+  assert.equal(d.freeTrialsRemaining, 0);
+
+  // A short file is refused identically: exhaustion, not duration, is the cause.
+  d = decideAudioSpend(ctx(fresh(), 30));
+  assert.equal(d.ok, false);
+  assert.equal(d.kind, 'NEED_CREDITS');
+  assert.equal(d.freeTrialsRemaining, 0);
+
+  // Total free audio allowance across both trials.
+  assert.equal(freeTrialTotalMaxDurationSeconds(2), 240);
+  assert.equal(freeTrialTotalMaxDurationSeconds(2) / 60, 4);
+  // Free trials never move credits or write a credit ledger entry.
+  assert.equal(service.getBalance(fresh().id), 0);
+  assert.equal(allTxns(service, fresh().id).length, 0);
+});
+
+test('a refused over-length free trial does not consume the trial (only success does)', async () => {
+  const { users, user } = await makeWallet(0);
+  const fresh = () => users.getById(user.id) as UserRecord;
+
+  // Refused twice for being too long.
+  for (let i = 0; i < 2; i += 1) {
+    const d = decideAudioSpend(ctx(fresh(), 300));
+    assert.equal(d.ok, false);
+    assert.equal(d.kind, 'FREE_TRIAL_DURATION_LIMIT');
+  }
+  assert.equal(fresh().freeTrialsUsed, 0, 'a blocked request must never consume a trial');
+
+  // A later file that fits still runs on trial #1.
+  const ok = decideAudioSpend(ctx(fresh(), 60));
+  assert.equal(ok.kind, 'FREE_TRIAL');
+  assert.equal(ok.freeTrialsRemaining, 2);
+});
+
+test('a user WITH credits may still process a >2:00 file (paid, not free)', () => {
+  const rich = { id: 'u', creditMode: 'NORMAL', freeTrialsUsed: 0, credits: 10 } as UserRecord;
+  const d = decideAudioSpend(ctx(rich, 300));
+  assert.equal(d.ok, true);
+  assert.equal(d.kind, 'PAID');
+  assert.equal(d.requiredCredits, 5); // 1 credit = 1 minute, rounded up
+  // The trial is untouched: paying does not burn free allowance.
+  assert.equal(d.freeTrialsUsed, 0);
+  assert.equal(d.freeTrialsRemaining, 2);
+});
+
+test('an unmeasurable duration cannot be served by a free trial (fails closed)', () => {
+  const w = { id: 'u', creditMode: 'NORMAL', freeTrialsUsed: 0, credits: 0 } as UserRecord;
+  const d = decideAudioSpend(ctx(w, 0));
+  assert.equal(d.ok, false);
+  assert.equal(d.kind, 'NO_DURATION');
+  assert.equal(d.status, 422);
+  assert.equal(d.freeTrialsUsed, 0);
+});
+
+test('saved-SRT reuse stays free: it short-circuits BEFORE this gate and never consumes a trial', () => {
+  // Reuse is a server.ts short-circuit, not a gate decision: the saved-SRT
+  // `return res.json({ ... reusedSrt: true })` must be reached BEFORE
+  // decideAudioSpend(), so it can neither consume a trial nor be refused for
+  // exceeding the 2-minute free cap. This pins that ordering as a contract.
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const src = fs.readFileSync(path.join(here, '..', '..', 'server.ts'), 'utf8');
+  const reuseReturn = src.indexOf('reusedSrt: true,');
+  const gateCall = src.indexOf('decideAudioSpend(');
+  assert.ok(reuseReturn > -1, 'the saved-SRT reuse return must exist in server.ts');
+  assert.ok(gateCall > -1, 'decideAudioSpend must still be called in server.ts');
+  assert.ok(
+    reuseReturn < gateCall,
+    'the saved-SRT reuse return must come BEFORE decideAudioSpend so reuse is free and consumes no trial'
+  );
+  // The reuse response advertises zero charge and no trial consumption.
+  assert.match(src, /charge:\s*\{\s*kind:\s*'REUSE',\s*requiredCredits:\s*0\s*\}/);
+  assert.match(src, /no free trial or credit was consumed/);
 });
 
 test('after 2 successful trials, credits are used and the ledger shows PURCHASE-style usage', async () => {
@@ -374,22 +525,20 @@ test('a real 402 blocks the provider until an admin reset, and never auto-rechar
   assert.doesNotThrow(() => reloaded.assertProviderSpendingAllowed());
 });
 
-test('payment buttons cannot create credits (no purchase/checkout route exists)', () => {
+test('real payment system exists with Razorpay integration', () => {
   const src = fs.readFileSync(new URL('../../server.ts', import.meta.url), 'utf8');
-  // The pack catalog is display-only: there is no endpoint that turns a click
-  // into credits (that requires a payment gateway, which does not exist yet).
-  assert.doesNotMatch(
-    src,
-    /app\.(post|get|put|patch)\(\s*['"`]\/api\/[^'"`]*(purchase|checkout|payment|paynow|orders)/i
-  );
-  // No payment SDK is imported anywhere in the server.
-  assert.doesNotMatch(src, /from\s+['"](razorpay|stripe|paypal|paytm|phonepe|ccavenue)/i);
-  // The server never writes a PURCHASE ledger entry: credits can only come from
-  // an operator grant (admin), the initial grant, or a refund/release.
-  assert.doesNotMatch(src, /type:\s*'PURCHASE'/);
+  const serviceSrc = fs.readFileSync(new URL('./razorpayService.ts', import.meta.url), 'utf8');
+  // The payment system is now implemented with Razorpay integration.
+  // Verify the purchase routes exist in server.ts
+  assert.match(src, /app\.post\(['"`]\/api\/credits\/purchase\/order['"`]/);
+  assert.match(src, /app\.post\(['"`]\/api\/credits\/purchase\/verify['"`]/);
+  assert.match(src, /app\.post\(['"`]\/api\/credits\/purchase\/webhook['"`]/);
+  // Razorpay SDK is imported in razorpayService
+  assert.match(serviceSrc, /from\s+['"]razorpay['"]/);
+  // PURCHASE ledger entries are now created for verified payments
   const service = fs.readFileSync(new URL('./creditService.ts', import.meta.url), 'utf8');
-  assert.doesNotMatch(service, /this\.apply\([^)]*'PURCHASE'/);
-  assert.match(service, /adminGrantCredits/);
+  assert.match(service, /recordPurchase/);
+  assert.match(service, /findByPaymentId/);
 });
 
 test('ledger supports every transaction type required by the product spec', () => {

@@ -48,9 +48,22 @@ export interface LocalAsrWord {
   endSeconds: number;
 }
 
+/**
+ * A final subtitle cue produced by the local worker. Windows come from the
+ * ACTUAL first/last word CTC timing (never a broad VAD region) and carry at
+ * most 3 spoken words, so the server must NOT re-snap them.
+ */
+export interface LocalAsrSegment {
+  id: number;
+  startSeconds: number;
+  endSeconds: number;
+  text: string;
+}
+
 export interface LocalAsrResult {
   transcript: string;
   words: LocalAsrWord[];
+  segments: LocalAsrSegment[];
   wordCount: number;
   audioDurationSeconds: number;
   model: string;
@@ -60,6 +73,10 @@ export interface LocalAsrResult {
   timestampNote: string;
   meanLogProb: number | null;
   inferenceSeconds: number;
+  speechRegionCount: number;
+  speechSeconds: number;
+  nonSpeechSeconds: number;
+  wordsDroppedAsNonSpeech: number;
 }
 
 function projectRoot(): string {
@@ -364,9 +381,30 @@ export async function transcribeRawOdiaWithLocalAsr(
       );
     const finalTranscript = cleanedWords.map((w) => w.text).join(' ');
 
+    // The worker already produced the final max-3-word cues from real word
+    // timing. Pass them through untouched (punctuation scrubbed again for
+    // safety). Validation is numeric only: never invent or re-time a cue here.
+    const segments: LocalAsrSegment[] = Array.isArray(payload.segments)
+      ? payload.segments
+          .map((s: any, i: number) => ({
+            id: Number.isFinite(Number(s?.id)) ? Number(s.id) : i + 1,
+            startSeconds: Number(s?.startSeconds),
+            endSeconds: Number(s?.endSeconds),
+            text: stripSpokenPunctuation(String(s?.text ?? '')),
+          }))
+          .filter(
+            (s) =>
+              s.text.length > 0 &&
+              Number.isFinite(s.startSeconds) &&
+              Number.isFinite(s.endSeconds) &&
+              s.endSeconds >= s.startSeconds
+          )
+      : [];
+
     return {
       transcript: finalTranscript,
       words: cleanedWords,
+      segments,
       wordCount: cleanedWords.length,
       audioDurationSeconds: Number(payload.audioDurationSeconds) || 0,
       model: String(payload.model || 'ai4bharat/indicwav2vec-odia'),
@@ -382,6 +420,10 @@ export async function transcribeRawOdiaWithLocalAsr(
           ? null
           : Number(payload.meanLogProb),
       inferenceSeconds: Number(payload.inferenceSeconds) || 0,
+      speechRegionCount: Number(payload.speechRegionCount) || 0,
+      speechSeconds: Number(payload.speechSeconds) || 0,
+      nonSpeechSeconds: Number(payload.nonSpeechSeconds) || 0,
+      wordsDroppedAsNonSpeech: Number(payload.wordsDroppedAsNonSpeech) || 0,
     };
   } finally {
     // The temporary upload never outlives the request.

@@ -7,8 +7,9 @@
  *   - rehydrates on boot (stale PROCESSING -> FAILED + refund, QUEUED stay);
  *   - claims one eligible QUEUED job at a time (single concurrency);
  *   - runs the injected pipeline (the exact legacy post-processing steps);
- *   - enforces a job timeout, auto-retry for transient failures only, and
- *     refunds credits whenever a job ends in FAILED.
+ *   - enforces a job timeout, and refunds credits whenever a job ends in
+ *     FAILED. There is NO automatic retry loop: a failed request is terminal
+ *     and is never auto-resubmitted, so a provider call is never repeated.
  * A future cloud deployment swaps THIS class for a real QueueProvider-backed
  * worker without touching the API or credit layers.
  */
@@ -22,7 +23,8 @@ import {
   ProviderNotConfiguredError,
 } from '../providers/types';
 import { type StorageProvider, srtKey } from './storage';
-import { type CreditService } from './creditService';
+import { runDetached } from '../http/asyncRoute';
+import type { AsyncCreditService } from './creditFacade';
 import {
   ProviderSpendingError,
   type ProviderSafetyService,
@@ -49,7 +51,7 @@ export type RunPipeline = (input: RunPipelineInput) => Promise<RunPipelineResult
 export interface JobQueueDeps {
   repo: JobRepo;
   storage: StorageProvider;
-  credits: CreditService;
+  credits: AsyncCreditService;
   getProvider: (name: string) => TranscriptionProvider;
   runPipeline: RunPipeline;
   /** Persisted provider safety state: the pre-call gate + failure reporting. */
@@ -74,7 +76,7 @@ function isTransientError(err: unknown): boolean {
 export class JobQueue {
   private readonly repo: JobRepo;
   private readonly storage: StorageProvider;
-  private readonly credits: CreditService;
+  private readonly credits: AsyncCreditService;
   private readonly getProvider: (name: string) => TranscriptionProvider;
   private readonly runPipeline: RunPipeline;
   private readonly pollMs: number;
@@ -92,11 +94,19 @@ export class JobQueue {
     this.pollMs = deps.pollMs ?? 2500;
   }
 
-  /** Boot recovery: PROCESSING jobs are treated as interrupted (crash). */
-  rehydrate(): void {
+  /**
+   * Boot recovery: PROCESSING jobs are treated as interrupted (crash).
+   *
+   * Async because the refund is a real credit transaction on the libSQL
+   * provider. The ORDER is deliberately unchanged: the refund commits BEFORE the
+   * job is marked FAILED, exactly as in the synchronous version, so a crash
+   * between the two leaves a refunded-but-still-processing job rather than a
+   * failed job that was never paid back.
+   */
+  async rehydrate(): Promise<void> {
     const now = new Date().toISOString();
     for (const job of this.repo.listProcessing()) {
-      this.credits.refundFinishedJob(job.userId, job.id, 'refund_interrupted_job');
+      await this.credits.refundFinishedJob(job.userId, job.id, 'refund_interrupted_job');
       this.repo.update(job.id, {
         status: 'FAILED',
         errorCode: 'INTERRUPTED',
@@ -108,12 +118,12 @@ export class JobQueue {
     }
   }
 
-  start(): void {
+start(): void {
     if (this.timer) return;
     this.timer = setInterval(() => {
-      void this.tick();
+      runDetached('queue.tick', () => this.tick());
     }, this.pollMs);
-    void this.tick();
+    runDetached('queue.tick:initial', () => this.tick());
   }
 
   stop(): void {
@@ -219,25 +229,14 @@ export class JobQueue {
     }
     const transient = !isNowBlocked && !isSpendingBlocked && isTransientError(err);
 
-    // Auto-retry transient failures (network/503) up to the configured cap.
-    if (transient && job.retryCount < config.maxJobRetries) {
-      const retryCount = job.retryCount + 1;
-      const backoff = config.retryBackoffBaseMs * retryCount;
-      this.repo.update(job.id, {
-        status: 'QUEUED',
-        retryCount,
-        nextRetryAt: new Date(Date.now() + backoff).toISOString(),
-        startedAt: undefined,
-        lastError: message,
-        errorCode: 'TRANSIENT',
-      });
-      nestedLog.warn('job scheduled for transient retry', { jobId: job.id, retryCount });
-      return;
-    }
+    // No automatic retry loop for failed requests: a failed transcription
+    // request is never auto-resubmitted (that would repeat the same provider/
+    // Sarvam call). Failed jobs are terminal, classified as TRANSIENT when the
+    // cause was a transient provider/network error but never re-queued here.
 
     // Terminal failure: refund the charge so the user is never billed for a
     // job that did not produce an SRT.
-    this.credits.refundFinishedJob(job.userId, job.id, 'refund_failed_job');
+    await this.credits.refundFinishedJob(job.userId, job.id, 'refund_failed_job');
     const errorCode = isProviderMissing
       ? 'PROVIDER_NOT_CONFIGURED'
       : isSpendingBlocked || failure.kind === 'QUOTA_EXHAUSTED' || failure.kind === 'PAYMENT_REQUIRED'

@@ -274,6 +274,105 @@ export async function fetchAdminJobs(userId?: string): Promise<AdminJob[]> {
   return data.jobs ?? [];
 }
 
+// ------------------------------------------------- monthly login activity
+
+/** One recorded login/session event, as returned by the admin API. */
+export interface AdminLoginRow {
+  id: string;
+  userId: string;
+  email?: string;
+  loginDate: string;
+  loginTime: string;
+  istDateTime: string;
+  month: string;
+  occurredAt: string;
+  method: string;
+  outcome: 'SUCCESS' | 'FAILURE';
+  failureCode?: string;
+  ip?: string;
+  userAgent?: string;
+}
+
+export interface AdminLoginPage {
+  month: string;
+  summary: {
+    month: string;
+    totalLogins: number;
+    uniqueUsers: number;
+    activeUsers: number;
+    failedLogins: number;
+  };
+  rows: AdminLoginRow[];
+  total: number;
+  page: number;
+  pageSize: number;
+  pageCount: number;
+  availableMonths: string[];
+}
+
+export async function fetchAdminLoginActivity(params: {
+  month?: string;
+  q?: string;
+  page?: number;
+  pageSize?: number;
+} = {}): Promise<AdminLoginPage> {
+  const qs = new URLSearchParams();
+  if (params.month) qs.set('month', params.month);
+  if (params.q) qs.set('q', params.q);
+  if (params.page) qs.set('page', String(params.page));
+  if (params.pageSize) qs.set('pageSize', String(params.pageSize));
+  const suffix = qs.toString() ? `?${qs}` : '';
+  const res = await authFetch(`/api/admin/login-activity${suffix}`);
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Failed to load login activity.');
+  return res.json();
+}
+
+/** The daily "yesterday's login activity" alert log, newest first. */
+export async function fetchAdminLoginAlerts(): Promise<{
+  alerts: Array<{
+    id: string;
+    alertDate: string;
+    periodDate: string;
+    month: string;
+    generatedAt: string;
+    totalLogins: number;
+    uniqueUsers: number;
+    newUsers: number;
+    activeUsers: number;
+    failedLogins: number;
+    deliveryStatus: 'NOT_CONFIGURED' | 'DELIVERED' | 'FAILED';
+    statusMessage: string;
+  }>;
+}> {
+  const res = await authFetch('/api/admin/login-alerts');
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Failed to load login alerts.');
+  return res.json();
+}
+
+/**
+ * Run the daily login-activity alert now. Safe to press repeatedly: the server
+ * keys the alert on the day being reported, so a second press returns the
+ * existing alert with `duplicate: true` instead of sending a new one.
+ */
+export async function runAdminLoginAlert(): Promise<{ duplicate: boolean }> {
+  const res = await authFetch('/api/admin/login-alerts/run', { method: 'POST' });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Failed to run the login alert.');
+  return res.json();
+}
+
+/**
+ * Download the login activity as Excel for a given month and optional query.
+ */
+export async function downloadAdminLoginExcel(month?: string, q?: string): Promise<Blob> {
+  const qs = new URLSearchParams();
+  if (month) qs.set('month', month);
+  if (q) qs.set('q', q);
+  const suffix = qs.toString() ? `?${qs}` : '';
+  const res = await authFetch(`/api/admin/login-activity/export${suffix}`);
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Failed to download login activity Excel.');
+  return res.blob();
+}
+
 /**
  * Manual credit adjustment (the admin UI's "add credits" action).
  * Records exactly one ADMIN_ADJUSTMENT ledger entry on the server: amount
@@ -655,4 +754,71 @@ export function adminAttachmentUrl(userId: string, key: string): string {
     .split('/')
     .map(encodeURIComponent)
     .join('/')}`;
+}
+
+// ============================================================================
+// CREDIT PURCHASE — Razorpay integration (server-verified)
+// ============================================================================
+
+export interface CreateOrderRequest {
+  planId: string;
+}
+
+export interface CreateOrderResponse {
+  orderId: string;
+  amount: number; // in paise
+  currency: 'INR';
+  keyId: string;
+  plan: {
+    id: string;
+    name: string;
+    credits: number;
+    priceInr: number;
+  };
+}
+
+export interface VerifyPaymentRequest {
+  orderId: string;
+  paymentId: string;
+  signature: string;
+  planId: string;
+}
+
+export interface VerifyPaymentResponse {
+  success: boolean;
+  transaction: any;
+  credits: number;
+  alreadyProcessed: boolean;
+}
+
+/**
+ * Create a Razorpay order for a credit purchase.
+ * The server resolves the plan and amount from locked server-side definitions.
+ */
+export async function createCreditPurchaseOrder(planId: string): Promise<CreateOrderResponse> {
+  const res = await authFetch('/api/credits/purchase/order', {
+    method: 'POST',
+    body: JSON.stringify({ planId }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Failed to create order (${res.status})`);
+  }
+  return res.json();
+}
+
+/**
+ * Verify a payment after Razorpay checkout.
+ * The server verifies the Razorpay signature and credits the account only on success.
+ */
+export async function verifyCreditPurchase(input: VerifyPaymentRequest): Promise<VerifyPaymentResponse> {
+  const res = await authFetch('/api/credits/purchase/verify', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Payment verification failed (${res.status})`);
+  }
+  return res.json();
 }

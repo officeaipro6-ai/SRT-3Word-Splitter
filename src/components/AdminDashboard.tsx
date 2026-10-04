@@ -6,6 +6,7 @@ import {
   ArrowUpFromLine,
   History,
   ListChecks,
+  LogIn,
   ShieldCheck,
   Loader2,
   Activity,
@@ -13,6 +14,7 @@ import {
   RotateCcw,
   AlertTriangle,
   ShieldAlert,
+  FileSpreadsheet,
 } from 'lucide-react';
 import {
   fetchAdminUsers,
@@ -24,23 +26,29 @@ import {
   makeIdempotencyKey,
   fetchProviderSafety,
   resetProviderSafety,
-  fetchAdminAlerts,
-  fetchAdminModeration,
-  markModerationCaseReviewed,
-  extendRestriction,
-  releaseRestriction,
-  adminAttachmentUrl,
-  type AdminUserView,
-  type AdminTxn,
-  type AdminJob,
-  type ProviderSafety,
-  type OwnerAlert,
-  type AdminModerationCase,
-  type AdminActiveRestriction,
-  type AdminModerationMessage,
+    fetchAdminAlerts,
+    fetchAdminModeration,
+    markModerationCaseReviewed,
+    extendRestriction,
+    releaseRestriction,
+    adminAttachmentUrl,
+    fetchAdminLoginActivity,
+    fetchAdminLoginAlerts,
+    runAdminLoginAlert,
+    downloadAdminLoginExcel,
+    type AdminUserView,
+    type AdminTxn,
+    type AdminJob,
+    type ProviderSafety,
+    type OwnerAlert,
+    type AdminModerationCase,
+    type AdminActiveRestriction,
+    type AdminModerationMessage,
+    type AdminLoginPage,
+    type AdminLoginRow,
 } from '../lib/sessionClient';
 
-type Section = 'users' | 'transactions' | 'jobs' | 'provider' | 'moderation';
+  type Section = 'users' | 'transactions' | 'jobs' | 'provider' | 'moderation' | 'logins';
 
 interface PendingOp {
   mode: 'grant' | 'debit';
@@ -76,6 +84,24 @@ export const AdminDashboard: React.FC = () => {
   const [modNote, setModNote] = useState<Record<string, string>>({});
   const [alertDelivery, setAlertDelivery] = useState<{ transports: string[]; connected: boolean; note: string | null } | null>(null);
   const [resetting, setResetting] = useState(false);
+  // Monthly login activity (see the "User Login Activity" section).
+  const [loginMonth, setLoginMonth] = useState('');
+  const [loginQuery, setLoginQuery] = useState('');
+  const [loginPage, setLoginPage] = useState(1);
+  const [loginData, setLoginData] = useState<AdminLoginPage | null>(null);
+  const [loginAlerts, setLoginAlerts] = useState<Array<{
+    id: string;
+    alertDate: string;
+    periodDate: string;
+    totalLogins: number;
+    uniqueUsers: number;
+    newUsers: number;
+    activeUsers: number;
+    failedLogins: number;
+    deliveryStatus: 'NOT_CONFIGURED' | 'DELIVERED' | 'FAILED';
+    statusMessage: string;
+  }>>([]);
+  const [loginExporting, setLoginExporting] = useState(false);
   const [loading, setLoading] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [pending, setPending] = useState<PendingOp | null>(null);
@@ -90,6 +116,37 @@ export const AdminDashboard: React.FC = () => {
     setTimeout(() => setNotice(null), 4000);
   };
 
+// Load one page of the login-activity table plus its alert log. The first
+    // load also adopts the server's current IST month, so the selector is never
+    // blank even before any data exists.
+    const loadLogins = async (month?: string, q?: string, page?: number) => {
+      const [data, alertData] = await Promise.all([
+        fetchAdminLoginActivity({
+          month: month || undefined,
+          q: q || undefined,
+          page: page || 1,
+          pageSize: 25,
+        }),
+        fetchAdminLoginAlerts(),
+      ]);
+      setLoginData(data);
+      setLoginAlerts(alertData.alerts);
+      if (!loginMonth && data.month) setLoginMonth(data.month);
+    };
+  
+const runLoginAlertNow = async () => {
+      try {
+        const { duplicate } = await runAdminLoginAlert();
+        flash(
+          duplicate
+            ? "Yesterday's alert was already generated - nothing sent again."
+            : "Yesterday's login-activity alert generated."
+        );
+        await loadLogins(loginMonth || undefined, loginQuery, loginPage);
+      } catch {
+        flash('Could not generate the alert. Please try again.');
+      }
+    };
   const refreshUsers = useCallback(async () => {
     const list = await fetchAdminUsers();
     setUsers(list);
@@ -113,8 +170,12 @@ export const AdminDashboard: React.FC = () => {
     setSection(s);
     setLoading(s);
     try {
-      if (s === 'transactions') setTxns(await fetchAdminTransactions());
-      else if (s === 'jobs') setJobs(await fetchAdminJobs());
+        if (s === 'transactions') setTxns(await fetchAdminTransactions());
+        else if (s === 'jobs') setJobs(await fetchAdminJobs());
+        else if (s === 'logins') {
+          setLoading('logins');
+          await loadLogins(loginMonth || undefined, loginQuery, loginPage);
+        }
       else if (s === 'moderation') {
         setLoading('moderation');
         const mod = await fetchAdminModeration();
@@ -134,7 +195,7 @@ export const AdminDashboard: React.FC = () => {
     }
   };
 
-  const selectUser = async (id: string) => {
+    const selectUser = async (id: string) => {
     setSelectedId(id);
     setLoading('detail');
     try {
@@ -340,6 +401,9 @@ export const AdminDashboard: React.FC = () => {
             <button className={tabCls(section === 'jobs')} onClick={() => void loadSection('jobs')}>
               <span className="inline-flex items-center gap-1"><ListChecks className="w-3.5 h-3.5" /> Jobs</span>
             </button>
+            <button className={tabCls(section === 'logins')} onClick={() => void loadSection('logins')}>
+              <span className="inline-flex items-center gap-1"><LogIn className="w-3.5 h-3.5" /> Login Activity</span>
+            </button>
             <button className={tabCls(section === 'provider')} onClick={() => void loadSection('provider')}>
               <span className="inline-flex items-center gap-1"><Activity className="w-3.5 h-3.5" /> Provider</span>
             </button>
@@ -394,21 +458,21 @@ export const AdminDashboard: React.FC = () => {
                       <span>{u.role}</span>
                       {u.email && (
                         <>
-                          <span>·</span>
+                          <span>/</span>
                           <span className="text-emerald-700 font-semibold">{u.email}</span>
                         </>
                       )}
                       {u.ownerEmail && (
                         <>
-                          <span>·</span>
+                          <span>/</span>
                           <span className="text-amber-600">owner {u.ownerEmail}</span>
                         </>
                       )}
-                      <span>·</span>
+                      <span>/</span>
                       <span>granted {u.totalGranted}</span>
-                      <span>·</span>
+                      <span>/</span>
                       <span>used {u.totalUsed}</span>
-                      <span>·</span>
+                      <span>/</span>
                       <span>created {new Date(u.createdAt).toLocaleString()}</span>
                     </div>
                   </button>
@@ -509,11 +573,11 @@ export const AdminDashboard: React.FC = () => {
                         selected.transactions.map((t) => (
                           <div key={t.id} className="rounded-md bg-slate-50 p-1.5 flex justify-between gap-2">
                             <span className="truncate">
-                              {txnType(t)} <span className="text-slate-400">· {t.reason}</span>
+                              {txnType(t)} <span className="text-slate-400">/ {t.reason}</span>
                               {t.balanceBefore != null && (
-                                <span className="text-slate-400"> · {t.balanceBefore} → {t.balanceAfter}</span>
+                                <span className="text-slate-400"> / {t.balanceBefore} → {t.balanceAfter}</span>
                               )}
-                              {t.adminEmail && <span className="text-amber-600"> · by {t.adminEmail}</span>}
+                              {t.adminEmail && <span className="text-amber-600"> / by {t.adminEmail}</span>}
                             </span>
                             <span className="text-slate-400 shrink-0">{new Date(t.createdAt).toLocaleTimeString()}</span>
                           </div>
@@ -603,6 +667,216 @@ export const AdminDashboard: React.FC = () => {
           </div>
         )}
 
+        {/* ── User Login Activity section ─────────────────────────────────── */}
+        {section === 'logins' && (
+          <div className="rounded-xl bg-white border border-slate-200 p-4 space-y-4">
+            <div className="flex flex-wrap items-end justify-between gap-3">
+              <div className="flex flex-wrap items-end gap-2">
+                <label className="text-[11px] text-slate-500">
+                  <span className="block mb-1 font-semibold">Month (IST)</span>
+                  <select
+                    value={loginMonth}
+                    onChange={(e) => {
+                      setLoginMonth(e.target.value);
+                      setLoginPage(1);
+                      void loadLogins(e.target.value, loginQuery, 1);
+                    }}
+                    className="px-2 py-1.5 rounded-lg border border-slate-300 text-xs bg-white"
+                  >
+                    {!loginMonth && <option value="">Current month</option>}
+                    {(loginData?.availableMonths ?? []).map((m) => (
+                      <option key={m} value={m}>{m}</option>
+                    ))}
+                  </select>
+                </label>
+                <label className="text-[11px] text-slate-500">
+                  <span className="block mb-1 font-semibold">Search</span>
+                  <input
+                    value={loginQuery}
+                    onChange={(e) => setLoginQuery(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        setLoginPage(1);
+                        void loadLogins(loginMonth || undefined, loginQuery, 1);
+                      }
+                    }}
+                    placeholder="User, email or date"
+                    className="px-2 py-1.5 rounded-lg border border-slate-300 text-xs w-40"
+                  />
+                </label>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setLoginPage(1);
+                    void loadLogins(loginMonth || undefined, loginQuery, 1);
+                  }}
+                  className="px-2.5 py-1.5 rounded-lg border border-slate-300 text-xs font-semibold hover:bg-slate-50"
+                >
+                  Apply
+                </button>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => void runLoginAlertNow()}
+                  title="Generate the alert for yesterday (IST). Safe to press more than once."
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-300 text-xs font-semibold hover:bg-slate-50"
+                >
+                  <Bell className="w-3.5 h-3.5" /> Yesterday Alert
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void downloadAdminLoginExcel(loginMonth, loginQuery)}
+                  disabled={loginExporting}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-300 text-xs font-semibold hover:bg-slate-50 disabled:opacity-50"
+                >
+                  <FileSpreadsheet className="w-3.5 h-3.5" /> Export Excel
+                </button>
+              </div>
+
+            {/* Whole-month metrics - independent of the table's page and filter. */}
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+              {[
+                { label: 'Total Logins', value: loginData?.summary.totalLogins ?? 0 },
+                { label: 'Unique Users', value: loginData?.summary.uniqueUsers ?? 0 },
+                { label: 'Active Users', value: loginData?.summary.activeUsers ?? 0 },
+                { label: 'Failed Logins', value: loginData?.summary.failedLogins ?? 0 },
+                { label: 'Month', value: loginData?.month ?? loginMonth ?? '—' },
+              ].map((m) => (
+                <div key={m.label} className="rounded-lg border border-slate-200 px-3 py-2">
+                  <div className="text-[10px] uppercase tracking-wide text-slate-400">{m.label}</div>
+                  <div className="text-sm font-bold text-slate-700">{m.value}</div>
+                </div>
+              ))}
+            </div>
+
+            <div className="max-h-[24rem] overflow-auto text-xs">
+              <table className="w-full">
+                <thead className="text-left text-slate-500 sticky top-0 bg-white">
+                  <tr>
+                    <th className="py-1.5 pr-2 font-semibold">IST Date-Time</th>
+                    <th className="py-1.5 pr-2 font-semibold">User</th>
+                    <th className="py-1.5 pr-2 font-semibold">Email</th>
+                    <th className="py-1.5 pr-2 font-semibold">Method</th>
+                    <th className="py-1.5 pr-2 font-semibold">Device</th>
+                    <th className="py-1.5 pr-2 font-semibold">IP</th>
+                    <th className="py-1.5 pr-2 font-semibold">Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(loginData?.rows ?? []).map((r: AdminLoginRow) => (
+                    <tr key={r.id} className="border-t border-slate-100">
+                      <td className="py-1.5 pr-2 text-slate-400 whitespace-nowrap">{r.istDateTime}</td>
+                      <td className="py-1.5 pr-2 font-mono text-slate-600">
+                        {r.userId ? r.userId.slice(0, 8) : '—'}
+                      </td>
+                      <td className="py-1.5 pr-2 text-slate-600">{r.email ?? '—'}</td>
+                      <td className="py-1.5 pr-2 text-slate-500">{r.method}</td>
+                      <td className="py-1.5 pr-2 text-slate-500 truncate max-w-[14rem]">{r.userAgent ?? '—'}</td>
+                      <td className="py-1.5 pr-2 text-slate-500">{r.ip ?? '—'}</td>
+                      <td className="py-1.5 pr-2">
+                        <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${
+                          r.outcome === 'SUCCESS'
+                            ? 'bg-emerald-50 text-emerald-700'
+                            : 'bg-rose-50 text-rose-700'
+                        }`}>{r.outcome}</span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {loginData && loginData.rows.length === 0 && (
+                <div className="text-slate-400 italic py-6 text-center">
+                  No login activity for {loginData.month}.
+                </div>
+              )}
+            </div>
+
+            {loginData && loginData.pageCount > 1 && (
+              <div className="flex items-center justify-between text-[11px] text-slate-500">
+                <span>
+                  Page {loginData.page} of {loginData.pageCount} / {loginData.total} matching records
+                </span>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={loginData.page <= 1}
+                    onClick={() => {
+                      const p = loginData.page - 1;
+                      setLoginPage(p);
+                      void loadLogins(loginMonth || undefined, loginQuery, p);
+                    }}
+                    className="px-2 py-1 rounded border border-slate-300 disabled:opacity-40"
+                  >
+                    Prev
+                  </button>
+                  <button
+                    type="button"
+                    disabled={loginData.page >= loginData.pageCount}
+                    onClick={() => {
+                      const p = loginData.page + 1;
+                      setLoginPage(p);
+                      void loadLogins(loginMonth || undefined, loginQuery, p);
+                    }}
+                    className="px-2 py-1 rounded border border-slate-300 disabled:opacity-40"
+                  >
+                    Next
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Daily post-midnight alert log for the previous IST day. */}
+            <div className="border-t border-slate-100 pt-3">
+              <div className="text-[11px] font-semibold text-slate-500 mb-2">
+                Daily login-activity alerts (previous IST day)
+              </div>
+              <div className="max-h-48 overflow-auto text-xs">
+                <table className="w-full">
+                  <thead className="text-left text-slate-500 sticky top-0 bg-white">
+                    <tr>
+                      <th className="py-1.5 pr-2 font-semibold">Period (IST)</th>
+                      <th className="py-1.5 pr-2 font-semibold">Total</th>
+                      <th className="py-1.5 pr-2 font-semibold">Unique</th>
+                      <th className="py-1.5 pr-2 font-semibold">New</th>
+                      <th className="py-1.5 pr-2 font-semibold">Failed</th>
+                      <th className="py-1.5 pr-2 font-semibold">Delivery</th>
+                      <th className="py-1.5 pr-2 font-semibold">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {loginAlerts.map((a) => (
+                      <tr key={a.id} className="border-t border-slate-100">
+                        <td className="py-1.5 pr-2 text-slate-500 whitespace-nowrap">{a.periodDate}</td>
+                        <td className="py-1.5 pr-2">{a.totalLogins}</td>
+                        <td className="py-1.5 pr-2">{a.uniqueUsers}</td>
+                        <td className="py-1.5 pr-2">{a.newUsers}</td>
+                        <td className="py-1.5 pr-2">{a.failedLogins}</td>
+                        <td className="py-1.5 pr-2">
+                          <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${
+                            a.deliveryStatus === 'DELIVERED'
+                              ? 'bg-emerald-50 text-emerald-700'
+                              : a.deliveryStatus === 'FAILED'
+                                ? 'bg-rose-50 text-rose-700'
+                                : 'bg-slate-100 text-slate-600'
+                          }`}>{a.deliveryStatus}</span>
+                        </td>
+                        <td className="py-1.5 pr-2 text-slate-500">{a.statusMessage}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                {loginAlerts.length === 0 && (
+                  <div className="text-slate-400 italic py-4 text-center">
+                    No alerts generated yet. The daily job runs shortly after IST midnight.
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+        )}
+
         {/* ── Provider section ────────────────────────────────────────────── */}
         {section === 'provider' && (
           <div className="space-y-4">
@@ -623,7 +897,7 @@ export const AdminDashboard: React.FC = () => {
                   <div>{safety.message}</div>
                   <div className="text-[10px] text-slate-500">
                     Consecutive failures: {safety.consecutiveFailures}
-                    {safety.lastErrorAt && <> · last error {new Date(safety.lastErrorAt).toLocaleString()}</>}
+                    {safety.lastErrorAt && <> / last error {new Date(safety.lastErrorAt).toLocaleString()}</>}
                     {safety.lastHttpStatus && <> (HTTP {safety.lastHttpStatus})</>}
                   </div>
                   <div className="text-[10px] text-slate-500">
@@ -688,7 +962,6 @@ export const AdminDashboard: React.FC = () => {
       </div>
 
       {/* ── Confirm modal (grant/deduct) ─────────────────────────────────── */}
-        {/* ── Moderation section (community & support) ─────────────────── */}
         {section === 'moderation' && (
           <div className="grid grid-cols-1 gap-4">
             <div className="rounded-xl bg-white border border-slate-200 p-4 space-y-3">
@@ -713,9 +986,9 @@ export const AdminDashboard: React.FC = () => {
                         <span className="font-mono text-[10px] text-slate-400">{r.userId}</span>
                       </div>
                       <div className="text-[11px] text-slate-500">
-                        Expires: {new Date(r.expiresAt).toLocaleString()} · started{' '}
-                        {new Date(r.startedAt).toLocaleString()} ·{' '}
-                        {r.automatic ? 'automatic' : 'manual'} · extended {r.extendedCount}×
+                        Expires: {new Date(r.expiresAt).toLocaleString()} / started{' '}
+                        {new Date(r.startedAt).toLocaleString()} /{' '}
+                        {r.automatic ? 'automatic' : 'manual'} / extended {r.extendedCount}×
                       </div>
                     </div>
                     <input

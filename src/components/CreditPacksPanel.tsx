@@ -1,19 +1,33 @@
 import React, { useEffect, useState } from 'react';
 import { Coins, Sparkles, Timer } from 'lucide-react';
-import { fetchCreditPacks, type CreditPack } from '../lib/sessionClient';
+import { fetchCreditPacks, type CreditPack, createCreditPurchaseOrder, verifyCreditPurchase } from '../lib/sessionClient';
+
+// Razorpay global type declaration (loaded from https://checkout.razorpay.com/v1/checkout.js)
+declare global {
+  interface Window {
+    Razorpay: any;
+  }
+}
 
 /**
  * Additive user dashboard section: shows the SERVER-authoritative wallet
  * (available credits) plus the free-trial counter, then the credit pack cards.
  *
- * Purchases are NOT possible yet (there is no payment gateway), so every button
- * is an inert "Coming Soon" placeholder. Nothing here can create credits: the
- * only way credits exist is a server-side admin grant.
+ * Purchases are handled via Razorpay Checkout (server-verified).
+ * The button text changes to "Buy X Credits" when payment is configured.
+ * If Razorpay is not configured, buttons show "Payments launching soon".
  */
 export interface WalletView {
   credits: number;
   unlimited: boolean;
 }
+
+/**
+ * DISPLAY copy only — the server is the single source of truth and enforces the
+ * limit. Keep in sync with FREE_TRIAL_MAX_DURATION_SECONDS in
+ * server/services/freeTrialPolicy.ts (120 seconds = 2 minutes per trial).
+ */
+const FREE_TRIAL_MAX_MINUTES = 2;
 
 interface Props {
   wallet: WalletView | null;
@@ -23,6 +37,101 @@ interface Props {
 
 export const CreditPacksPanel: React.FC<Props> = ({ wallet, freeTrialsRemaining, freeTrialLimit }) => {
   const [packs, setPacks] = useState<CreditPack[]>([]);
+  const [razorpayLoaded, setRazorpayLoaded] = useState(false);
+  const [purchasingPlanId, setPurchasingPlanId] = useState<string | null>(null);
+  const [purchaseError, setPurchaseError] = useState<string | null>(null);
+
+  // Load Razorpay script dynamically
+  useEffect(() => {
+    if (typeof window !== 'undefined' && !window.Razorpay) {
+      const script = document.createElement('script');
+      script.src = 'https://checkout.razorpay.com/v1/checkout.js';
+      script.async = true;
+      script.onload = () => setRazorpayLoaded(true);
+      script.onerror = () => console.error('Failed to load Razorpay script');
+      document.body.appendChild(script);
+    } else if (typeof window !== 'undefined' && window.Razorpay) {
+      setRazorpayLoaded(true);
+    }
+    return () => {};
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchCreditPacks()
+      .then((p) => {
+        if (!cancelled) setPacks(p);
+      })
+      .catch(() => {
+        /* catalog unavailable — the wallet row above still renders */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const handlePurchase = async (planId: string) => {
+    if (!razorpayLoaded) {
+      setPurchaseError('Payment system is still loading. Please try again in a moment.');
+      return;
+    }
+
+    setPurchasingPlanId(planId);
+    setPurchaseError(null);
+
+    try {
+      // Step 1: Create order on server
+      const order = await createCreditPurchaseOrder(planId);
+
+      // Step 2: Open Razorpay Checkout
+      const options = {
+        key: order.keyId,
+        amount: order.amount,
+        currency: order.currency,
+        name: 'Odia SRT',
+        description: `${order.plan.name} — ${order.plan.credits} credits`,
+        order_id: order.orderId,
+        handler: async (response: any) => {
+          // Step 3: Verify payment on server
+          try {
+            const result = await verifyCreditPurchase({
+              orderId: response.razorpay_order_id,
+              paymentId: response.razorpay_payment_id,
+              signature: response.razorpay_signature,
+              planId,
+            });
+            if (result.success) {
+              // Refresh wallet credits
+              // The parent component will refetch the wallet
+              window.dispatchEvent(new CustomEvent('credits-updated', { detail: result.credits }));
+            } else {
+              setPurchaseError('Payment verification failed. Please contact support.');
+            }
+          } catch (err: any) {
+            setPurchaseError(err.message || 'Payment verification failed. Please contact support.');
+          }
+        },
+        modal: {
+          ondismiss: () => {
+            setPurchasingPlanId(null);
+          },
+        },
+        theme: {
+          color: '#0f172a',
+        },
+      };
+
+      const rzp = new (window as any).Razorpay(options);
+      rzp.on('payment.failed', (response: any) => {
+        setPurchaseError(`Payment failed: ${response.error?.description || 'Unknown error'}`);
+        setPurchasingPlanId(null);
+      });
+      rzp.open();
+    } catch (err: any) {
+      setPurchaseError(err.message || 'Failed to initiate payment. Please try again.');
+      setPurchasingPlanId(null);
+    }
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -65,6 +174,19 @@ export const CreditPacksPanel: React.FC<Props> = ({ wallet, freeTrialsRemaining,
         </p>
       </header>
 
+      {freeTrialsRemaining !== null && freeTrialLimit > 0 && (
+        <div className="rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-2 text-[11px] text-slate-600 space-y-0.5">
+          <p className="font-semibold text-slate-700">
+            {freeTrialLimit} Free Trials — Up to {FREE_TRIAL_MAX_MINUTES} minutes each
+          </p>
+          <p>Total free usage: up to {freeTrialLimit * FREE_TRIAL_MAX_MINUTES} minutes</p>
+          <p className="text-slate-500">
+            Files longer than {FREE_TRIAL_MAX_MINUTES} minutes cannot be processed with a free trial and
+            need credits.
+          </p>
+        </div>
+      )}
+
       {packs.length > 0 ? (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
           {packs.map((pack) => (
@@ -97,14 +219,41 @@ export const CreditPacksPanel: React.FC<Props> = ({ wallet, freeTrialsRemaining,
                   ? 'One-time annual payment. It does not renew automatically.'
                   : 'One-time payment. It does not renew automatically.'}
               </div>
+              <div className="text-[11px] text-slate-400">
+                {pack.annual
+                  ? 'One-time annual payment. It does not renew automatically.'
+                  : 'One-time payment. It does not renew automatically.'}
+              </div>
               <button
                 type="button"
-                disabled
-                title="Payments are not available yet."
-                className="mt-1 inline-flex items-center justify-center gap-1.5 rounded-lg bg-slate-200 text-slate-500 px-3 py-1.5 text-xs font-semibold cursor-not-allowed"
+                disabled={purchasingPlanId === pack.id || !razorpayLoaded}
+                onClick={() => handlePurchase(pack.id)}
+                title={razorpayLoaded ? undefined : 'Payment system is still loading.'}
+                className={`
+                  mt-1 inline-flex items-center justify-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold
+                  ${purchasingPlanId === pack.id
+                    ? 'bg-amber-500 text-white cursor-wait'
+                    : razorpayLoaded
+                    ? 'bg-slate-900 text-white hover:bg-slate-700'
+                    : 'bg-slate-200 text-slate-500 cursor-not-allowed'}
+                `}
               >
-                <Sparkles className="w-3.5 h-3.5" />
-                Coming Soon
+                {purchasingPlanId === pack.id ? (
+                  <>
+                    <svg className="animate-spin -ml-1 mr-2 h-3.5 w-3.5" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                    </svg>
+                    Processing...
+                  </>
+                ) : (
+                  <>
+                    <Sparkles className="w-3.5 h-3.5" />
+                    {pack.annual
+                      ? `Buy ${pack.credits.toLocaleString('en-IN')} Credits`
+                      : `Buy ${pack.credits} Credits`}
+                  </>
+                )}
               </button>
             </article>
           ))}
@@ -114,8 +263,9 @@ export const CreditPacksPanel: React.FC<Props> = ({ wallet, freeTrialsRemaining,
       )}
 
       <p className="text-[11px] text-slate-400">
-        Payments are not enabled yet, so no purchase can be made. Credits are added by the
-        operator (or by your free audio trials).
+        {razorpayLoaded
+          ? 'Payments are powered by Razorpay. Click a plan to purchase credits securely.'
+          : 'Loading payment system… Credits are added by the operator (or by your free audio trials).'}
       </p>
     </section>
   );

@@ -7,7 +7,8 @@
  *
  * Order of checks (mirrors the product spec):
  *   1. provider safety gate (hard layer — no caller is exempt)
- *   2. identity / free-trial eligibility (exactly 2 successful free trials)
+ *   2. identity / free-trial eligibility (exactly 2 successful free trials,
+ *      each covering at most 2 minutes of measured audio)
  *   3. required credits from the SERVER-MEASURED duration
  *   4. available balance (server value only — client-supplied values never used)
  *
@@ -15,7 +16,13 @@
  * Reservation happens at the very end, only when the decision is PAID, so a
  * rejected request cannot touch the wallet.
  */
-import { isFreeTrialExempt, freeTrialsUsedFor } from './freeTrialPolicy';
+import {
+  exceedsFreeTrialDuration,
+  FREE_TRIAL_DURATION_LIMIT_CODE,
+  FREE_TRIAL_DURATION_LIMIT_MESSAGE,
+  isFreeTrialExempt,
+  freeTrialsUsedFor,
+} from './freeTrialPolicy';
 import {
   CANNOT_MEASURE_DURATION_MESSAGE,
   creditsForDuration,
@@ -29,6 +36,7 @@ export type SpendKind =
   | 'NEED_CREDITS'
   | 'NO_DURATION'
   | 'FREE_TRIAL'
+  | 'FREE_TRIAL_DURATION_LIMIT'
   | 'PAID'
   | 'UNLIMITED'
   | 'ANONYMOUS';
@@ -95,9 +103,18 @@ export function decideAudioSpend(ctx: AudioSpendContext): SpendDecision {
     return { ok: true, kind: 'UNLIMITED', ...baseUsage(used, ctx.freeTrialLimit) };
   }
 
+  // A free trial may cover at most 2 minutes of SERVER-MEASURED audio. This is
+  // checked BEFORE any provider call, from the measured duration only (a
+  // client-supplied duration is never trusted), and it never rounds down:
+  // 2:00 is the last accepted second, 2:01 is refused. A long file is never
+  // split across several trials.
+  const trialAvailable = ctx.freeTrialLimit === 0 || used < ctx.freeTrialLimit;
+  const tooLongForTrial = exceedsFreeTrialDuration(ctx.measuredDurationSeconds, ctx.freeTrialLimit);
+
   // cap disabled (FREE_TRIAL_LIMIT=0) = unlimited free, matching the legacy
-  // "0 disables the cap" semantics.
-  if (ctx.freeTrialLimit === 0 || used < ctx.freeTrialLimit) {
+  // "0 disables the cap" semantics (exceedsFreeTrialDuration returns false for
+  // limit <= 0, so the duration cap is not applied in that mode).
+  if (trialAvailable && !tooLongForTrial) {
     return {
       ok: true,
       kind: 'FREE_TRIAL',
@@ -105,9 +122,9 @@ export function decideAudioSpend(ctx: AudioSpendContext): SpendDecision {
     };
   }
 
-  // Trials exhausted -> the user must pay with credits. The duration used for
-  // pricing is ALWAYS the server-measured one; a client-supplied duration is
-  // never accepted.
+  // A free trial is unavailable (exhausted, or the file is too long for one) ->
+  // the user must pay with credits. The duration used for pricing is ALWAYS the
+  // server-measured one; a client-supplied duration is never accepted.
   if (!(ctx.measuredDurationSeconds > 0)) {
     return {
       ok: false,
@@ -121,12 +138,16 @@ export function decideAudioSpend(ctx: AudioSpendContext): SpendDecision {
   const required = creditsForDuration(ctx.measuredDurationSeconds);
   const balance = ctx.user.credits ?? 0;
   if (balance < required) {
+    // When a trial is still available but the file is longer than 2:00, say so
+    // explicitly and point the user at credits, instead of the generic
+    // "out of trials" message. Trials are NOT consumed by this refusal.
+    const blockedByTrialDuration = trialAvailable && tooLongForTrial;
     return {
       ok: false,
-      kind: 'NEED_CREDITS',
+      kind: blockedByTrialDuration ? 'FREE_TRIAL_DURATION_LIMIT' : 'NEED_CREDITS',
       status: 402,
-      code: 'NOT_ENOUGH_CREDITS',
-      message: NOT_ENOUGH_CREDITS_MESSAGE,
+      code: blockedByTrialDuration ? FREE_TRIAL_DURATION_LIMIT_CODE : 'NOT_ENOUGH_CREDITS',
+      message: blockedByTrialDuration ? FREE_TRIAL_DURATION_LIMIT_MESSAGE : NOT_ENOUGH_CREDITS_MESSAGE,
       requiredCredits: required,
       measuredDurationSeconds: ctx.measuredDurationSeconds,
       balance,

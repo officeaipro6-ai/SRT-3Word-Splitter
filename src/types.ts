@@ -103,6 +103,12 @@ export interface TranscriptionResult {
   notes?: string[];
   audioDiagnostics?: AudioDiagnostics;
   /**
+   * SAVED-SRT REUSE: true when this result came from the already-saved SRT for
+   * the exact same uploaded audio + language. No provider request was made and
+   * no free trial/credit was consumed.
+   */
+  reusedSrt?: boolean;
+  /**
    * LOCAL SUBMISSION MODE: true when this result came from the local,
    * zero-budget, open-source Odia ASR instead of a paid cloud provider.
    */

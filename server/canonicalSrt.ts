@@ -82,9 +82,40 @@ function classifyTagged(line: string): { classification: AudioClassification; te
   return { classification: 'CLEAR_SPEECH', text: corrected, taggedText: corrected };
 }
 
-function parseCanonicalSrt(raw: string): SubtitleSegment[] {
+/**
+ * Verbatim classification of a SAVED SRT line for reuse/reopen. Identical to
+ * `classifyTagged` EXCEPT it never re-runs spelling correction: the words in
+ * the saved file are already the exact final text, so they must round-trip
+ * byte-for-byte back into the editor (no double-correction, no rewrite).
+ */
+function classifySavedTagged(line: string): { classification: AudioClassification; text: string; taggedText: string } {
+  const t = line.trim();
+
+  if (t.startsWith('<SIL>') && t.endsWith('</SIL>')) {
+    return { classification: 'SILENCE', text: '', taggedText: '<SIL></SIL>' };
+  }
+  if (t.startsWith('<MB>') && t.endsWith('</MB>')) {
+    return { classification: 'SPEECH_WITH_MUSIC', text: '', taggedText: '<MB></MB>' };
+  }
+  if (t.startsWith('<NOISE>') && t.endsWith('</NOISE>')) {
+    const inner = t.slice('<NOISE>'.length, -'</NOISE>'.length).trim();
+    if (inner === '') {
+      return { classification: 'NOISE_ONLY', text: '', taggedText: '<NOISE></NOISE>' };
+    }
+    return { classification: 'SPEECH_WITH_NOISE', text: inner, taggedText: `<NOISE>${inner}</NOISE>` };
+  }
+  if (t.startsWith('<FIL>') && t.endsWith('</FIL>')) {
+    const inner = t.slice('<FIL>'.length, -'</FIL>'.length);
+    return { classification: 'FILLER', text: inner, taggedText: `<FIL>${inner}</FIL>` };
+  }
+  const plain = t.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  return { classification: 'CLEAR_SPEECH', text: plain, taggedText: plain };
+}
+
+/** Parse SRT block text (`raw.split(/\r?\n\r?\n/)`) into cue lines. */
+function parseSrtBlocks(raw: string): { timeMatch: RegExpMatchArray; line: string }[] {
   const blocks = raw.split(/\r?\n\r?\n/).filter((b) => b.trim().length > 0);
-  const segments: SubtitleSegment[] = [];
+  const cues: { timeMatch: RegExpMatchArray; line: string }[] = [];
 
   for (const block of blocks) {
     const lines = block.split(/\r?\n/).filter((l) => l.trim().length > 0);
@@ -92,11 +123,53 @@ function parseCanonicalSrt(raw: string): SubtitleSegment[] {
     // lines[0] = cue number, lines[1] = timeline, lines[2..] = text
     const timeMatch = lines[1].match(/^(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})/);
     if (!timeMatch) continue;
+    cues.push({ timeMatch, line: lines.slice(2).join(' ').trim() });
+  }
+
+  return cues;
+}
+
+function parseCanonicalSrt(raw: string): SubtitleSegment[] {
+  const segments: SubtitleSegment[] = [];
+
+  for (const { timeMatch, line } of parseSrtBlocks(raw)) {
     const startSeconds = parseSrtTimestamp(timeMatch[1]);
     const endSeconds = parseSrtTimestamp(timeMatch[2]);
-    const line = lines.slice(2).join(' ').trim();
 
     const { classification, text, taggedText } = classifyTagged(line);
+
+    segments.push({
+      id: segments.length + 1,
+      startSeconds,
+      endSeconds,
+      startTimeFormatted: timeMatch[1],
+      endTimeFormatted: timeMatch[2],
+      text,
+      classification,
+      taggedText,
+      confidence: 0.99,
+      acousticNote: classification === 'SPEECH_WITH_NOISE' ? 'Speech over background noise/music' : undefined,
+    });
+  }
+
+  return segments;
+}
+
+/**
+ * Parse a SAVED (already-generated) SRT file back into editor segments for
+ * reuse/reopen. Verbatim: it reads the exact timeline + tagged text already in
+ * the file and never re-runs spelling correction, segmentation or tagging, so
+ * the reopened result is byte-identical to what was saved (no Sarvam call, no
+ * free-trial/credit consumption).
+ */
+export function parseSavedSrt(raw: string): SubtitleSegment[] {
+  const segments: SubtitleSegment[] = [];
+
+  for (const { timeMatch, line } of parseSrtBlocks(raw)) {
+    const startSeconds = parseSrtTimestamp(timeMatch[1]);
+    const endSeconds = parseSrtTimestamp(timeMatch[2]);
+
+    const { classification, text, taggedText } = classifySavedTagged(line);
 
     segments.push({
       id: segments.length + 1,

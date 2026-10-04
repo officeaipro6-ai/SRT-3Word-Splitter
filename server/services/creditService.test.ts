@@ -175,15 +175,17 @@ test('admin adjustment records a complete ADMIN_ADJUSTMENT audit entry', async (
   assert.equal(service.getBalance(user.id), 650);
 
   // Every ledger entry (not just adjustments) records balance before + after.
+  // Use a different user to avoid daily giveaway limit.
+  const user2 = users.createUser('user2-hash', 150);
   const adjustAgain = service.adminAdjustCredits({
     adminUserId: admin.id,
-    userId: user.id,
+    userId: user2.id,
     amount: 10,
     reason: 'second top-up',
   });
-  assert.equal(adjustAgain.transaction.balanceBefore, 650);
-  assert.equal(adjustAgain.transaction.balanceAfter, 660);
-  for (const t of service.getTransactions(user.id, 20)) {
+  assert.equal(adjustAgain.transaction.balanceBefore, 150);
+  assert.equal(adjustAgain.transaction.balanceAfter, 160);
+  for (const t of service.getTransactions(user2.id, 20)) {
     assert.equal(typeof t.balanceBefore, 'number');
     assert.equal(typeof t.balanceAfter, 'number');
   }
@@ -198,15 +200,17 @@ test('admin adjustment records a complete ADMIN_ADJUSTMENT audit entry', async (
   });
   assert.equal(replay.applied, false);
   assert.equal(replay.transaction.id, txn.id);
-  assert.equal(service.getBalance(user.id), 660);
+  assert.equal(service.getBalance(user.id), 650);
 
   // A reason is mandatory and the amount must be a positive integer.
+  // Use a fresh user to avoid daily giveaway limit
+  const user3 = users.createUser('user3-hash', 0);
   assert.throws(
-    () => service.adminAdjustCredits({ adminUserId: admin.id, userId: user.id, amount: 5, reason: '   ' }),
+    () => service.adminAdjustCredits({ adminUserId: admin.id, userId: user3.id, amount: 5, reason: '   ' }),
     /reason is required/i
   );
   assert.throws(
-    () => service.adminAdjustCredits({ adminUserId: admin.id, userId: user.id, amount: 0, reason: 'zero' }),
+    () => service.adminAdjustCredits({ adminUserId: admin.id, userId: user3.id, amount: 0, reason: 'zero' }),
     /positive whole number/i
   );
   assert.throws(
@@ -215,21 +219,82 @@ test('admin adjustment records a complete ADMIN_ADJUSTMENT audit entry', async (
   );
 
   // The legacy grant alias is recorded as the same manual-adjustment type.
+  // Use a fresh user to avoid daily giveaway limit
+  const user4 = users.createUser('user4-hash', 0);
   const legacy = service.adminGrantCredits({
     adminUserId: admin.id,
-    userId: user.id,
+    userId: user4.id,
     amount: 5,
     reason: 'legacy path',
   });
   assert.equal(legacy.transaction.type, 'ADMIN_ADJUSTMENT');
 });
 
+test('adminAdjustCredits enforces max 2000 credits per action', async () => {
+  const { service, users } = await makeService(0);
+  const admin = users.createUser('admin-hash', 0, 'ADMIN', 'UNLIMITED');
+  const user = users.createUser('user-hash', 0);
+
+  // 2000 credits = allowed (exactly at limit)
+  const allowed = service.adminAdjustCredits({
+    adminUserId: admin.id,
+    userId: user.id,
+    amount: 2000,
+    reason: 'exactly at limit',
+  });
+  assert.equal(allowed.applied, true);
+  assert.equal(allowed.transaction.amount, 2000);
+  assert.equal(service.getBalance(user.id), 2000);
+
+  // 2001 credits = rejected (exceeds limit)
+  const user2 = users.createUser('user2-hash', 0);
+  assert.throws(
+    () => service.adminAdjustCredits({
+      adminUserId: admin.id,
+      userId: user2.id,
+      amount: 2001,
+      reason: 'over limit',
+    }),
+    (e: unknown) => e instanceof CreditError && e.code === 'MAX_EXCEEDED'
+  );
+
+  // 0 credits = rejected (not positive)
+  const user3 = users.createUser('user3-hash', 0);
+  assert.throws(
+    () => service.adminAdjustCredits({
+      adminUserId: admin.id,
+      userId: user3.id,
+      amount: 0,
+      reason: 'zero',
+    }),
+    (e: unknown) => e instanceof CreditError && e.code === 'INVALID_AMOUNT'
+  );
+
+  // negative = rejected
+  const user4 = users.createUser('user4-hash', 0);
+  assert.throws(
+    () => service.adminAdjustCredits({
+      adminUserId: admin.id,
+      userId: user4.id,
+      amount: -10,
+      reason: 'negative',
+    }),
+    (e: unknown) => e instanceof CreditError && e.code === 'INVALID_AMOUNT'
+  );
+
+  // Verify the first user's balance is still 2000 (not affected by failed attempts)
+  assert.equal(service.getBalance(user.id), 2000);
+});
+
 test('no manual credit path can create a PURCHASE ledger entry', async () => {
   const { service, users, user } = await makeService(0);
   const admin = users.createUser('admin-hash', 0, 'ADMIN', 'UNLIMITED');
+  // Use a second user to avoid daily giveaway limit
+  const user2 = users.createUser('user2-hash', 0);
   service.adminAdjustCredits({ adminUserId: admin.id, userId: user.id, amount: 500, reason: 'top-up' });
-  service.adminGrantCredits({ adminUserId: admin.id, userId: user.id, amount: 500, reason: 'grant alias' });
+  service.adminGrantCredits({ adminUserId: admin.id, userId: user2.id, amount: 500, reason: 'grant alias' });
   const types = service.getAllTransactions().map((t) => t.type);
   assert.deepEqual(types, ['ADMIN_ADJUSTMENT', 'ADMIN_ADJUSTMENT']);
-  assert.equal(service.getBalance(user.id), 1000);
+  assert.equal(service.getBalance(user.id), 500);
+  assert.equal(service.getBalance(user2.id), 500);
 });

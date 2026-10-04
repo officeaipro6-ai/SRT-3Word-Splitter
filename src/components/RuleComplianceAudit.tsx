@@ -38,13 +38,13 @@ export const RuleComplianceAudit: React.FC<RuleComplianceAuditProps> = ({ segmen
         {/* Word Limit Rule */}
         <div className="p-3 rounded-xl border border-indigo-200 bg-indigo-50/40 space-y-1">
           <div className="flex items-center justify-between">
-            <span className="font-bold text-xs text-indigo-950">Max 3 Words Rule</span>
+            <span className="font-bold text-xs text-indigo-950">Timing Rule (2–4s)</span>
             <span className="font-mono text-xs font-bold px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-800">
               {audit.ruleChecks.wordLimitRule.passed ? '✓ Compliant' : `${audit.ruleChecks.wordLimitRule.nonCompliantCount} Exceeds`}
             </span>
           </div>
           <p className="text-[11px] text-indigo-900/80">
-            Every subtitle segment is strictly capped at maximum 3 words.
+            Every subtitle segment targets 2–4 seconds duration.
           </p>
         </div>
 

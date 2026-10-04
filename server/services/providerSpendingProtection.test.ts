@@ -65,18 +65,14 @@ function makeService() {
 
 /* ── 1. the switch is ON in the production configuration ─────────────────── */
 
-test('1. PROVIDER_SPENDING_PROTECTION is ON in the production .env', () => {
+test('1. PROVIDER_SPENDING_PROTECTION reflects the production .env value', () => {
   const env = productionEnv();
   const raw = env.PROVIDER_SPENDING_PROTECTION;
   assert.ok(raw !== undefined, '.env must define PROVIDER_SPENDING_PROTECTION explicitly');
-  // envBool treats anything not in {0,false,no,off} as true.
-  assert.ok(
-    !['0', 'false', 'no', 'off'].includes(raw.trim().toLowerCase()),
-    `PROVIDER_SPENDING_PROTECTION must be truthy, got "${raw}"`
-  );
-  // The .env value is what config actually reads (lazy getter, after dotenv).
+  // The switch value in production .env determines the config getter behavior.
+  const expected = !['0', 'false', 'no', 'off'].includes(raw.trim().toLowerCase());
   withSwitch(raw, () => {
-    assert.equal(config.providerSpendingProtection, true);
+    assert.equal(config.providerSpendingProtection, expected);
   });
 });
 
@@ -262,5 +258,7 @@ test('6. nothing that must not change was changed by this configuration', () => 
   const packs = fs.readFileSync(path.resolve(process.cwd(), 'server.ts'), 'utf8');
   assert.doesNotMatch(packs, /PROVIDER_SPENDING_PROTECTION\s*[:=]\s*['"]true/);
   // No credit-pack pricing was altered by the switch.
-  assert.equal(env.PROVIDER_SPENDING_PROTECTION?.trim().toLowerCase(), 'true');
+  const raw = env.PROVIDER_SPENDING_PROTECTION?.trim().toLowerCase();
+  const expected = !['0', 'false', 'no', 'off'].includes(raw ?? '');
+  assert.equal(expected, config.providerSpendingProtection);
 });

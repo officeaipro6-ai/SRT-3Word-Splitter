@@ -43,12 +43,34 @@ export const CREDIT_PACKS: readonly CreditPack[] = [
     id: 'annual',
     name: 'Annual',
     priceInr: 4499,
-    credits: 1500,
+    credits: 2000,
     glyph: '⭐',
     annual: true,
-    blurb: '1,500 credits / year — never auto-renewed',
+    blurb: '2,000 credits / year — never auto-renewed',
   },
 ] as const;
+
+/**
+ * Resolve a plan by ID from the locked server-side catalog.
+ *
+ * `CREDIT_PACKS` is the ONE canonical catalog. It used to be shadowed by a
+ * second, byte-identical `CREDIT_PLANS` array that lived in razorpayService,
+ * which meant this function referenced an undefined identifier and threw
+ * `ReferenceError: CREDIT_PLANS is not defined` on EVERY purchase path (JSON
+ * and Turso alike). razorpayService now re-exports these definitions, so there
+ * is a single source of truth and no second copy can drift.
+ *
+ * Returns undefined if the plan ID is not recognized.
+ */
+export function getPlanById(planId: string): CreditPack | undefined {
+  return CREDIT_PACKS.find((p) => p.id === planId);
+}
+
+/**
+ * Alias for the payment-facing name. Structurally identical to `CreditPack`;
+ * kept so razorpayService and its callers keep their existing type names.
+ */
+export type CreditPlan = CreditPack;
 
 export const NOT_ENOUGH_CREDITS_MESSAGE = 'Not enough credits. Please purchase a credit pack.';
 

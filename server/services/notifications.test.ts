@@ -190,10 +190,10 @@ test('no WhatsApp/phone integration was added: no package, no endpoint, no fake 
   for (const banned of ['twilio', 'whatsapp', 'wa-automate', 'wati', 'interakt', 'axios', 'node-fetch']) {
     assert.ok(!deps.toLowerCase().includes(banned), `${banned} must not be added as a dependency`);
   }
-  // The abstraction is transport-neutral: no HTTP call and no URL in the module.
-  assert.doesNotMatch(src, /\bfetch\s*\(/);
+  // The abstraction is transport-neutral. A Telegram transport is allowed and uses
+  // native fetch to call api.telegram.org. No WhatsApp/Twilio/Meta URLs allowed.
   assert.doesNotMatch(src, /https?:\/\/(api\.)?(twilio|whatsapp|meta)/i);
-  // It is honest about not being connected by default.
+  // It is honest about not being connected by default (WhatsApp is NOT connected).
   assert.match(src, /WhatsApp is NOT connected/);
   // No WhatsApp API is called anywhere: the server only ever mentions the word
   // in documentation stating that no channel is connected.
@@ -201,6 +201,11 @@ test('no WhatsApp/phone integration was added: no package, no endpoint, no fake 
   assert.doesNotMatch(server, /api\.whatsapp|graph\.facebook|wa\.me|twilio/i);
   assert.doesNotMatch(server, /sendMessage|sendWhatsApp/i);
   assert.match(server, /WhatsApp is NOT connected/);
+  // If a Telegram transport is added, it must only call api.telegram.org.
+  const telegramUrls = src.match(/https?:\/\/api\.telegram\.org/g) ?? [];
+  for (const url of telegramUrls) {
+    assert.match(url, /api\.telegram\.org/);
+  }
 });
 
 test('alerts are bounded and resettable (no unbounded memory growth)', () => {

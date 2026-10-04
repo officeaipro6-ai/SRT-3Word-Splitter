@@ -20,32 +20,49 @@
  */
 import { UserRepo, CreditRepo } from '../db/repos';
 import { type CreditTransactionRecord, type CreditTransactionType } from '../db/types';
+import { getPlanById } from './creditPolicy';
+import { istStamp } from './istTime';
+import {
+  CreditError,
+  REDUCING_TYPES,
+  signedAmountFor,
+  assertValidAmount,
+} from './creditRules';
 
-export class CreditError extends Error {
-  readonly code:
-    | 'INSUFFICIENT_BALANCE'
-    | 'ALREADY_CHARGED'
-    | 'ALREADY_REFUNDED'
-    | 'NOT_CHARGED'
-    | 'NO_USER'
-    | 'INVALID_AMOUNT'
-    | 'MISSING_REASON'
-    | 'IDEMPOTENCY_CONFLICT';
-  constructor(
-    code: CreditError['code'],
-    message: string
-  ) {
-    super(message);
-    this.name = 'CreditError';
-    this.code = code;
-  }
-}
+/**
+ * Re-exported so every existing `import { CreditError } from './creditService'`
+ * keeps resolving. The class itself now lives in `creditRules.ts` so the JSON and
+ * Turso credit backends share ONE definition of the failure taxonomy.
+ */
+export { CreditError };
 
 export interface ChargeInput {
   userId: string;
   jobId: string;
   amount: number;
   reason: string;
+}
+
+/**
+ * A VERIFIED payment, as handed to the credit layer by the payment gateway
+ * path. Prices are never taken from here: `planId` is resolved against the
+ * locked server catalog, so a tampered `amountInr` cannot buy extra credits.
+ */
+export interface PurchaseInput {
+  userId: string;
+  planId: string;
+  paymentId: string;
+  orderId: string;
+  amountInr: number;
+  currency: string;
+  planName: string;
+  email?: string;
+}
+
+/** Result of an admin credit mutation. `applied:false` means idempotent replay. */
+export interface AdminResult {
+  transaction: CreditTransactionRecord;
+  applied: boolean;
 }
 
 export interface ChargeResult {
@@ -121,27 +138,27 @@ export interface CreditService {
   /** Admin debit; idempotent by idempotencyKey; never negative. */
   adminDebitCredits(input: AdminCreditInput): { transaction: CreditTransactionRecord; applied: boolean };
   getAllTransactions(limit?: number): CreditTransactionRecord[];
+  /** Unpaginated, unsliced ledger across all users (admin Excel export). */
+  getAllTransactionsUnbounded(): CreditTransactionRecord[];
   sumGrants(userId: string): number;
   sumUsed(userId: string): number;
+  /**
+   * Record a verified purchase. Adds credits to the user and writes a PURCHASE
+   * ledger entry with full payment metadata. Idempotent by paymentId.
+   */
+  recordPurchase(input: {
+    userId: string;
+    planId: string;
+    paymentId: string;
+    orderId: string;
+    amountInr: number;
+    currency: string;
+    planName: string;
+    email?: string;
+  }): { transaction: CreditTransactionRecord; credits: number; alreadyProcessed: boolean };
 }
 
 export class FileCreditService implements CreditService {
-  /** Transaction types that REDUCE the balance when applied. */
-  private static readonly REDUCING = new Set<CreditTransactionType>([
-    'DEBIT',
-    'ADMIN_DEBIT',
-    'RESERVATION',
-  ]);
-  /** Transaction types that INCREASE the balance when applied. */
-  private static readonly INCREASING = new Set<CreditTransactionType>([
-    'CREDIT',
-    'REFUND',
-    'RELEASE',
-    'PURCHASE',
-    'ADMIN_GRANT',
-    'ADMIN_ADJUSTMENT',
-  ]);
-
   constructor(
     private readonly users: UserRepo,
     private readonly credits: CreditRepo
@@ -240,6 +257,15 @@ export class FileCreditService implements CreditService {
     return this.credits.listAll(limit);
   }
 
+  /**
+   * EVERY transaction for EVERY user, unpaginated and unsliced. The admin
+   * Excel export uses this so the file is never truncated to the number of
+   * rows the dashboard happens to display.
+   */
+  getAllTransactionsUnbounded(): CreditTransactionRecord[] {
+    return this.credits.listAllUnbounded();
+  }
+
   sumGrants(userId: string): number {
     return this.credits.sumGrants(userId);
   }
@@ -262,6 +288,22 @@ export class FileCreditService implements CreditService {
     if (!this.users.getById(input.userId)) {
       throw new CreditError('NO_USER', 'Unknown target user.');
     }
+    // Enforce max 2000 credits per admin action (giveaway/adjustment).
+    const amount = Math.floor(Number(input.amount));
+    if (!Number.isFinite(amount) || amount <= 0) {
+      throw new CreditError('INVALID_AMOUNT', 'Amount must be a positive whole number.');
+    }
+    if (amount > 2000) {
+      throw new CreditError('MAX_EXCEEDED', 'Maximum 2,000 credits per admin action');
+    }
+
+    // Enforce max 2000 giveaway credits per USER per DAY (IST).
+    // Check if this user has already received an admin giveaway today (IST).
+    const todayIst = istStamp().date;
+    if (this.credits.hasAdminGiveawayToday(input.userId, todayIst)) {
+      throw new CreditError('DAILY_LIMIT_EXCEEDED', 'User has already received a giveaway today');
+    }
+
     return this.applyAdmin(input, 'ADMIN_ADJUSTMENT');
   }
 
@@ -344,26 +386,20 @@ export class FileCreditService implements CreditService {
     jobId: string | undefined,
     extra?: Partial<CreditTransactionRecord>
   ): { transaction: CreditTransactionRecord; charged: boolean } {
-    if (!Number.isFinite(amount) || amount < 0) {
-      throw new CreditError('INVALID_AMOUNT', 'Amount must be a non-negative whole number.');
-    }
-    if (amount === 0 && type !== 'FREE_TRIAL') {
-      throw new CreditError('INVALID_AMOUNT', 'Only FREE_TRIAL ledger records may carry a zero amount.');
-    }
+    // Amount rules live in creditRules so this provider and the Turso provider
+    // cannot drift; call order is preserved (amount checks, then sign, then
+    // balance).
+    assertValidAmount(type, amount);
     // Sign by type: reducing types block funds, increasing types add funds,
     // zero types (USAGE / FREE_TRIAL) never move the balance (the reservation
     // already blocked USAGE's funds; a free trial is worth 0 credits).
-    const signed = FileCreditService.REDUCING.has(type)
-      ? -amount
-      : FileCreditService.INCREASING.has(type)
-        ? amount
-        : 0;
+    const signed = signedAmountFor(type, amount);
     const balanceBefore = this.users.getById(userId)?.credits ?? 0;
     const balanceAfter = this.users.bumpCredits(userId, signed);
     if (balanceAfter === null) {
       throw new CreditError('NO_USER', 'Unknown user.');
     }
-    if (FileCreditService.REDUCING.has(type) && balanceAfter < 0) {
+    if (REDUCING_TYPES.has(type) && balanceAfter < 0) {
       // Roll back the negative mutation so the ledger never goes negative.
       this.users.bumpCredits(userId, -signed);
       throw new CreditError('INSUFFICIENT_BALANCE', 'Insufficient credit balance.');
@@ -379,5 +415,49 @@ export class FileCreditService implements CreditService {
       ...(extra || {}),
     });
     return { transaction: txn, charged: true };
+  }
+
+  /**
+   * Record a verified purchase. Adds credits to the user and writes a PURCHASE
+   * ledger entry with full payment metadata. Idempotent by paymentId.
+   */
+  recordPurchase(input: {
+    userId: string;
+    planId: string;
+    paymentId: string;
+    orderId: string;
+    amountInr: number;
+    currency: string;
+    planName: string;
+    email?: string;
+  }): { transaction: CreditTransactionRecord; credits: number; alreadyProcessed: boolean } {
+    const plan = getPlanById(input.planId);
+    if (!plan) {
+      throw new CreditError('INVALID_AMOUNT', 'Invalid plan ID.');
+    }
+
+    // Idempotency: check if already processed by paymentId
+    const existing = this.credits.findByPaymentId(input.paymentId);
+    if (existing) {
+      const userRecord = this.users.getById(input.userId);
+      return { transaction: existing, credits: userRecord?.credits ?? 0, alreadyProcessed: true };
+    }
+
+    // Use the apply method to create the PURCHASE transaction
+    const { transaction } = this.apply(
+      input.userId,
+      'PURCHASE',
+      plan.credits,
+      'purchase',
+      undefined,
+      {
+        paymentId: input.paymentId,
+        paymentStatus: 'captured',
+        packageId: input.planId,
+      }
+    );
+
+    const userRecord = this.users.getById(input.userId);
+    return { transaction, credits: userRecord?.credits ?? 0, alreadyProcessed: false };
   }
 }

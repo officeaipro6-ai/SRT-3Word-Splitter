@@ -125,3 +125,121 @@ test('users: payment-ready fields are optional and persisted', async () => {
   assert.equal(fresh.purchasedCredits, 50);
   assert.equal(fresh.bonusCredits, 20);
 });
+
+// ---------------------------------------------------------------------------
+// Stage 5C-5 Part A: JobRepo.update() must not let a patch rewrite the job
+// primary key. Previously `Object.assign(job, patch)` copied patch.id straight
+// over the row id, which produced two records sharing one id on disk. Parity
+// target: TursoStore.updateJob() (Stage 5C-4) already refuses this.
+// ---------------------------------------------------------------------------
+
+/** Two jobs with distinct, assertable field values. */
+function seedJobs(jobs: JobRepo) {
+  const a = jobs.create(sampleJob('u1'));
+  const b = jobs.create(sampleJob('u2'));
+  return { a, b };
+}
+
+test('5C5-A1. a normal job update still works end to end', async () => {
+  const { store, jobs } = makeRepos();
+  await store.init();
+  const { a, b } = seedJobs(jobs);
+
+  const updated = jobs.update(a.id, { status: 'PROCESSING', startedAt: '2026-01-02T00:00:00.000Z' });
+  assert.equal(updated!.id, a.id);
+  assert.equal(updated!.status, 'PROCESSING');
+  assert.equal(updated!.startedAt, '2026-01-02T00:00:00.000Z');
+  assert.equal(jobs.get(a.id)!.status, 'PROCESSING', 'the write is readable back');
+  assert.equal(jobs.get(b.id)!.status, 'QUEUED', 'the other job is untouched');
+});
+
+test('5C5-A2. patch.id cannot rewrite the job primary key', async () => {
+  const { store, jobs } = makeRepos();
+  await store.init();
+  const { a, b } = seedJobs(jobs);
+
+  // The patch names b while the argument names a.
+  const updated = jobs.update(a.id, { id: b.id, status: 'FAILED' } as Partial<JobRecord>);
+
+  assert.equal(updated!.id, a.id, 'the ARGUMENT id is authoritative');
+  assert.equal(updated!.status, 'FAILED', 'the other fields still merge');
+  assert.equal(jobs.get(a.id)!.id, a.id, 'a keeps its own id');
+  assert.equal(jobs.get(b.id)!.id, b.id, 'b keeps its own id');
+  assert.equal(jobs.get(b.id)!.status, 'QUEUED', 'b is not redirected-to or modified');
+  assert.equal(jobs.listAll().length, 2, 'no record is created or lost');
+});
+
+test('5C5-A3. an id-only patch is a no-op', async () => {
+  const { store, jobs } = makeRepos();
+  await store.init();
+  const { a } = seedJobs(jobs);
+  const before = jobs.get(a.id)!;
+
+  const updated = jobs.update(a.id, { id: 'someone-else' } as Partial<JobRecord>);
+
+  assert.equal(updated!.id, a.id);
+  assert.deepEqual(jobs.get(a.id), before, 'nothing about the job changed');
+});
+
+test('5C5-A4. unrelated fields remain unchanged', async () => {
+  const { store, jobs } = makeRepos();
+  await store.init();
+  const { a } = seedJobs(jobs);
+  const before = jobs.get(a.id)!;
+
+  jobs.update(a.id, { status: 'COMPLETED', completedAt: '2026-01-03T00:00:00.000Z' });
+
+  const after = jobs.get(a.id)!;
+  assert.equal(after.status, 'COMPLETED');
+  assert.equal(after.completedAt, '2026-01-03T00:00:00.000Z');
+  assert.equal(after.userId, before.userId, 'userId untouched');
+  assert.equal(after.provider, before.provider, 'provider untouched');
+  assert.deepEqual(after.input, before.input, 'input untouched');
+  assert.equal(after.retryCount, before.retryCount, 'retryCount untouched');
+  assert.equal(after.createdAt, before.createdAt, 'createdAt untouched');
+  assert.equal(after.output, before.output, 'output untouched');
+});
+
+test('5C5-A5. an unknown job id changes nothing', async () => {
+  const { store, jobs } = makeRepos();
+  await store.init();
+  const { a } = seedJobs(jobs);
+  const before = jobs.listAll();
+
+  const updated = jobs.update('no-such-job', { status: 'COMPLETED' });
+
+  assert.equal(updated, null, 'unknown id returns null, as before');
+  assert.deepEqual(jobs.listAll(), before, 'no record was added or modified');
+  assert.equal(jobs.get(a.id)!.status, 'QUEUED');
+});
+
+test('5C5-A6. input/output and other JSON-ish fields still merge unchanged', async () => {
+  const { store, jobs } = makeRepos();
+  await store.init();
+  const { a } = seedJobs(jobs);
+  const output = { srtKey: 'srt/a.srt', rawSrt: '1\nx\n', segmentCount: 1, wordCount: 1, provider: 'sarvam' };
+  const input = { storageKey: 'uploads/y.mp3', originalName: 'y.mp3', mimeType: 'audio/mpeg', sizeBytes: 20, sha256: 'h2', durationSeconds: 3 };
+
+  const updated = jobs.update(a.id, { output, input, retryCount: 2, nextRetryAt: undefined, lastError: 'boom' } as Partial<JobRecord>);
+
+  assert.deepEqual(updated!.output, output, 'output merges verbatim');
+  assert.deepEqual(updated!.input, input, 'input merges verbatim');
+  assert.equal(updated!.retryCount, 2);
+  assert.equal(updated!.nextRetryAt, undefined, 'explicit undefined still clears the field');
+  assert.equal(updated!.lastError, 'boom');
+  assert.equal(jobs.get(a.id)!.retryCount, 2, 'persisted');
+});
+
+test('5C5-A7. the returned record is a defensive clone, not the live row', async () => {
+  const { store, jobs } = makeRepos();
+  await store.init();
+  const { a } = seedJobs(jobs);
+
+  const first = jobs.update(a.id, { status: 'PROCESSING' })!;
+  first.status = 'FAILED';
+  first.retryCount = 999;
+
+  const fresh = jobs.get(a.id)!;
+  assert.equal(fresh.status, 'PROCESSING', 'mutating the clone must not affect storage');
+  assert.equal(fresh.retryCount, 0);
+});

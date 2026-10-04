@@ -40,14 +40,14 @@ export const RulesGuideModal: React.FC<RulesGuideModalProps> = ({ isOpen, onClos
             <div className="flex items-center justify-between">
               <span className="font-bold text-indigo-950 flex items-center gap-1.5">
                 <CheckCircle2 className="w-4 h-4 text-indigo-600" />
-                MANDATORY RULE — Maximum 3 Words Per Subtitle Segment
+                MANDATORY RULE — 2–4 Second Duration Per Subtitle Segment
               </span>
               <span className="text-xs font-mono font-medium px-2 py-0.5 rounded bg-indigo-200 text-indigo-900">
-                Max 3 Words / Segment
+                2–4 Seconds / Segment
               </span>
             </div>
             <p className="text-xs text-indigo-950/90">
-              Each subtitle segment must contain <strong>MAXIMUM 3 words</strong>. If a sentence contains more than 3 words, it is <strong>automatically split into multiple consecutive subtitle segments</strong> with proportional continuous timestamps.
+              Each subtitle segment targets <strong>2–4 seconds</strong>. There is <strong>NO maximum word count</strong>. Segments naturally fit spoken words within the timing boundary. If a segment exceeds 4 seconds, it is split at a natural speech boundary. Segments under 2 seconds may be merged with adjacent spoken content.
             </p>
             <ul className="text-xs list-disc list-inside space-y-1 text-indigo-900">
               <li>Original Unicode text is preserved exactly (no rewriting, translation, or omissions).</li>
@@ -161,11 +161,11 @@ export const RulesGuideModal: React.FC<RulesGuideModalProps> = ({ isOpen, onClos
               </span>
             </div>
             <p className="text-xs text-slate-700">
-              Only create a SILENCE tag when audio is <strong>COMPLETE silence for 2.00 seconds or longer</strong>:
+              Only create a SILENCE tag when audio is <strong>COMPLETE silence for 1.00 seconds or longer</strong>:
             </p>
             <ul className="text-xs list-disc list-inside space-y-1 text-slate-600">
-              <li><strong>0–1.99 seconds</strong> complete silence = <strong>IGNORE</strong></li>
-              <li><strong>2.00 seconds or more</strong> complete silence = <code>&lt;SIL&gt;&lt;/SIL&gt;</code></li>
+              <li><strong>0–0.99 seconds</strong> complete silence = <strong>IGNORE</strong></li>
+              <li><strong>1.00 seconds or more</strong> complete silence = <code>&lt;SIL&gt;&lt;/SIL&gt;</code></li>
               <li>Background music/noise means it is NOT silence.</li>
             </ul>
             <div className="p-2.5 bg-white rounded-lg border border-slate-300 font-mono text-xs text-slate-800">

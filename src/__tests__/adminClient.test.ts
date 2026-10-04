@@ -11,6 +11,9 @@ const server = fs.readFileSync(path.resolve(process.cwd(), 'server.ts'), 'utf8')
 const ADMIN_ROUTES = [
   '/api/admin/users',
   '/api/admin/transactions',
+  '/api/admin/login-activity',
+  '/api/admin/login-alerts',
+  '/api/admin/login-alerts/run',
   '/api/admin/jobs',
   '/api/admin/credits/adjust',
   '/api/admin/credits/grant',

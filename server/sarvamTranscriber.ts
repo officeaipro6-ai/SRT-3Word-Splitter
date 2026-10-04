@@ -189,9 +189,14 @@ async function startBatchJob(jobId: string): Promise<void> {
 async function pollUntilComplete(jobId: string, timeoutMs: number): Promise<{ outputFileNames: string[]; jobState: string }> {
   const start = Date.now();
   const pollIntervalMs = 5000;
+  let pollCount = 0;
   for (;;) {
     if (Date.now() - start > timeoutMs) {
       throw new Error(`Sarvam batch job timed out after ${Math.floor(timeoutMs / 1000)}s (still processing). The job id is ${jobId}.`);
+    }
+    pollCount++;
+    if (pollCount % 6 === 1) { // Log every ~30 seconds
+      console.log(`[SARVAM BATCH] ${jobId} polling... (elapsed: ${Math.floor((Date.now() - start) / 1000)}s)`);
     }
     const res = await fetch(`${BATCH_API_BASE}/${encodeURIComponent(jobId)}/status`, {
       method: 'GET',
@@ -200,6 +205,7 @@ async function pollUntilComplete(jobId: string, timeoutMs: number): Promise<{ ou
     const { data } = await throwOnBad(res, 'job status');
     const state = data && data.job_state;
     if (state === 'Completed' || state === 'PartiallyCompleted') {
+      console.log(`[SARVAM BATCH] ${jobId} completed (state: ${state})`);
       const outputs: string[] = [];
       const details = data && data.job_details;
       if (Array.isArray(details)) {
@@ -321,6 +327,7 @@ export async function transcribeRawOdiaWithSarvam(
 
   console.log(`[SARVAM BATCH] init job (model=saaras:v4, language_code=${languageCode}, mode=verbatim)...`);
   const jobId = await initBatchJob(languageCode);
+  console.log(`[SARVAM BATCH] job created: ${jobId}`);
 
   console.log(`[SARVAM BATCH] ${jobId} uploading ${audioBuffer.length} bytes...`);
   await uploadAudio(jobId, fileBytes, fileName, mimeType);

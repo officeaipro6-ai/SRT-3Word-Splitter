@@ -168,7 +168,7 @@ export default function App() {
   };
 
   // Start the 11-step pipeline
-  const handleStartPipeline = async () => {
+  const handleStartPipeline = async (forceRegenerate = false) => {
     if (!selectedMedia) return;
 
     setIsProcessing(true);
@@ -229,6 +229,7 @@ export default function App() {
           duration: selectedMedia.duration,
           language: selectedLanguage,
           languageCode: LANGUAGE_CODE_BY_SELECTION[selectedLanguage],
+          ...(forceRegenerate ? { regenerate: true } : {}),
         }),
       });
 
@@ -242,6 +243,12 @@ export default function App() {
       if (result.localSubmissionMode) {
         addLog(
           `LOCAL SUBMISSION MODE: transcribed locally with ${result.localAsr?.model ?? 'local Odia ASR'} (CPU). No paid/cloud ASR API was called.`
+        );
+      }
+
+      if (result.reusedSrt) {
+        addLog(
+          'SAVED-SRT REUSE: this exact audio + language already had a saved SRT, so it was reused instantly. No new transcription request was made and no free trial/credit was consumed.'
         );
       }
 
@@ -613,6 +620,35 @@ export default function App() {
                   <div>
                     Review the Odia text carefully before submission: a local model can mis-recognise words.
                     Nothing is invented, but accuracy is not guaranteed.
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* SAVED-SRT REUSE banner: this result was loaded from the already-saved
+                SRT for this exact audio. No provider request, no free trial/credit. */}
+            {transcriptionResult?.reusedSrt && (
+              <div className="rounded-2xl border-2 border-emerald-400 bg-emerald-50 p-4">
+                <div className="text-xs font-extrabold uppercase tracking-wide text-emerald-800 mb-2">
+                  Saved SRT reused — no new transcription requested
+                </div>
+                <div className="text-xs text-emerald-900 space-y-1">
+                  <div>
+                    This exact audio + language already had a saved SRT, so it was loaded instantly for
+                    preview/edit/tag/download. <strong>No Sarvam (or other provider) request was made</strong> and no
+                    free trial or credit was consumed.
+                  </div>
+                  <div>
+                    {"If you want a fresh transcription anyway, click "}
+                    <button
+                      type="button"
+                      disabled={isProcessing}
+                      onClick={() => void handleStartPipeline(true)}
+                      className="inline-flex items-center gap-1 rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-bold text-white transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {isProcessing ? 'Processing…' : 'Generate SRT again'}
+                    </button>
+                    {" — this will run a new transcription request and overwrite the saved SRT (and it may consume a free trial or credits)."}
                   </div>
                 </div>
               </div>

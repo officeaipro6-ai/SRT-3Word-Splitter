@@ -1,0 +1,126 @@
+# Render Free Web Service Configuration for Odia-SRT-App
+# This file configures the web service for deployment on Render Free tier.
+# 
+# IMPORTANT: 
+# - DO NOT commit secrets to this file. Set sensitive values in Render dashboard.
+# - Render Free tier does NOT include Persistent Disk. 
+# - This config uses Turso (libSQL) for database and Cloudflare R2 for file storage.
+# - The app must have DATA_DIR pointing to an ephemeral path since no disk is available.
+#
+# To deploy:
+# 1. Push this repo to GitHub
+# 2. Create a new Web Service on Render from this repo
+# 3. Set all required environment variables in Render dashboard (see below)
+# 4. Deploy
+
+services:
+  - type: web
+    name: odia-srt-app
+    env: node
+    plan: free
+    buildCommand: npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      # Runtime
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "10000"
+      # Render Free does NOT provide persistent disk. 
+      # Database and file storage MUST use external services (Turso + R2).
+      # DATA_DIR is set to an ephemeral path for local temp files only.
+      - key: DATA_DIR
+        value: /tmp/odia-srt-data
+      # Provider configuration
+      - key: DATABASE_PROVIDER
+        value: turso
+      - key: STORAGE_PROVIDER
+        value: r2
+      # Provider spending protection (recommended ON for production)
+      - key: PROVIDER_SPENDING_PROTECTION
+        value: "true"
+      # Job timeout (ms) - 15 minutes default
+      - key: JOB_TIMEOUT_MS
+        value: "900000"
+      # Rate limits
+      - key: UPLOAD_RATE_LIMIT_MAX
+        value: "10"
+      - key: UPLOAD_RATE_LIMIT_WINDOW_MS
+        value: "3600000"
+      # Job queue
+      - key: ENABLE_JOB_QUEUE
+        value: "true"
+      # Credit system
+      - key: INITIAL_CREDITS
+        value: "0"
+      - key: FREE_TRIAL_LIMIT
+        value: "2"
+      - key: CREDITS_PER_JOB
+        value: "1"
+      - key: MAX_UPLOAD_BYTES
+        value: "104857600"
+      - key: PER_USER_ACTIVE_JOBS
+        value: "3"
+      # Provider selection (default: sarvam)
+      - key: ASR_PROVIDER
+        value: sarvam
+      # Free trial policy
+      - key: FREE_TRIAL_LIMIT
+        value: "2"
+      # Credit policy
+      - key: CREDITS_PER_JOB
+        value: "1"
+      # Admin bootstrap (set in Render dashboard, NOT here)
+      # - key: ADMIN_BOOTSTRAP_TOKEN
+      #   value: ******
+      # Owner emails (comma-separated, set in Render dashboard)
+      # - key: OWNER_EMAILS
+      #   value: *****
+      # Sarvam API key (set in Render dashboard)
+      # - key: SARVAM_API_KEY
+      #   value: *****
+      # Turso database (set in Render dashboard)
+      # - key: TURSO_DATABASE_URL
+      #   value: libsql://your-db.turso.io
+      # - key: TURSO_AUTH_TOKEN
+      #   value: *****
+      # Cloudflare R2 (set in Render dashboard)
+      # - key: R2_ACCOUNT_ID
+      #   value: *****
+      # - key: R2_ACCESS_KEY_ID
+      #   value: *****
+      # - key: R2_SECRET_ACCESS_KEY
+      #   value: *****
+      # - key: R2_BUCKET
+      #   value: odia-srt-storage
+      # Razorpay TEST mode (set in Render dashboard)
+      # - key: RAZORPAY_KEY_ID
+      #   value: rzp_test_******
+      # - key: RAZORPAY_KEY_SECRET
+      #   value: ******
+      # - key: RAZORPAY_WEBHOOK_SECRET
+      #   value: ******
+      # - key: RAZORPAY_TEST_MODE
+      #   value: "true"
+      # Telegram notifications (optional, set in Render dashboard)
+      # - key: TELEGRAM_BOT_TOKEN
+      #   value: *****
+      # - key: TELEGRAM_CHAT_ID
+      #   value: ******
+      # Provider quota cooldown
+      - key: PROVIDER_QUOTA_COOLDOWN_MS
+        value: "600000"
+      - key: PROVIDER_WARNING_AFTER_FAILURES
+        value: "2"
+      # Retry policy
+      - key: MAX_JOB_RETRIES
+        value: "1"
+      - key: RETRY_BACKOFF_BASE_MS
+        value: "5000"
+    # No persistent disk on Free plan
+    # disk:
+    #   name: odia-data
+    #   mountPath: /var/data
+    #   sizeGB: 1

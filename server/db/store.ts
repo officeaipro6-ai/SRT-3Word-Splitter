@@ -16,18 +16,20 @@
 import fsp from 'fs/promises';
 import path from 'path';
 import { randomUUID } from 'crypto';
-import {
-  DB_VERSION,
-  type CommunityMessageRecord,
-  type CommunityRestrictionRecord,
-  type DbShape,
-  type ModerationCaseRecord,
-  type ProviderSafetyRecord,
+  import {
+    DB_VERSION,
+    type CommunityMessageRecord,
+    type CommunityRestrictionRecord,
+    type DbShape,
+    type LoginActivityRecord,
+    type LoginAlertRecord,
+    type ModerationCaseRecord,
+    type ProviderSafetyRecord,
   type UserRecord,
   emptyDbShape,
 } from './types';
 
-function normalizeUser(u: any): UserRecord {
+export function normalizeUser(u: any): UserRecord {
   return {
     ...u,
     role: u.role === 'ADMIN' ? 'ADMIN' : 'USER',
@@ -77,7 +79,7 @@ export function normalizeProviderSafety(value: any, provider: string): ProviderS
  * feature has none of them, and a hand-edited/partial file must still load. Any
  * unusable entry is dropped rather than trusted.
  */
-function normalizeModerationCases(value: any): ModerationCaseRecord[] {
+export function normalizeModerationCases(value: any): ModerationCaseRecord[] {
   if (!Array.isArray(value)) return [];
   return value
     .filter(
@@ -91,7 +93,7 @@ function normalizeModerationCases(value: any): ModerationCaseRecord[] {
     })) as ModerationCaseRecord[];
 }
 
-function normalizeRestrictions(value: any): CommunityRestrictionRecord[] {
+export function normalizeRestrictions(value: any): CommunityRestrictionRecord[] {
   if (!Array.isArray(value)) return [];
   return value
     .filter(
@@ -109,17 +111,91 @@ function normalizeRestrictions(value: any): CommunityRestrictionRecord[] {
     }));
 }
 
-function normalizeCommunityMessages(value: any): CommunityMessageRecord[] {
+export function normalizeCommunityMessages(value: any): CommunityMessageRecord[] {
   if (!Array.isArray(value)) return [];
   return value
     .filter((m) => m && typeof m.id === 'string' && typeof m.userId === 'string' && typeof m.createdAt === 'string')
     .map((m) => ({
       ...m,
-      kind: m.kind === 'SUPPORT' ? 'SUPPORT' : 'COMMUNITY',
-      accepted: m.accepted === true,
-      body: typeof m.body === 'string' ? m.body : '',
-    }));
-}
+        kind: m.kind === 'SUPPORT' ? 'SUPPORT' : 'COMMUNITY',
+        accepted: m.accepted === true,
+        body: typeof m.body === 'string' ? m.body : '',
+      }));
+  }
+
+  /** Login analytics are additive: a missing/garbled table loads as empty. */
+  export function normalizeLoginActivity(value: any): LoginActivityRecord[] {
+    if (!Array.isArray(value)) return [];
+    return value
+      .filter(
+        (r) =>
+          r &&
+          typeof r.id === 'string' &&
+          typeof r.userId === 'string' &&
+          typeof r.occurredAt === 'string' &&
+          typeof r.loginDate === 'string' &&
+          typeof r.month === 'string'
+      )
+      .map((r) => ({
+        id: r.id,
+        // userId is intentionally allowed to be '' for a failed login.
+        userId: typeof r.userId === 'string' ? r.userId : '',
+        email: typeof r.email === 'string' ? r.email : undefined,
+        loginDate: r.loginDate,
+        loginTime: typeof r.loginTime === 'string' ? r.loginTime : '',
+        istDateTime: typeof r.istDateTime === 'string' ? r.istDateTime : '',
+        month: r.month,
+        occurredAt: r.occurredAt,
+        method: (['SESSION', 'ACCOUNT_LOGIN', 'OWNER_BOOTSTRAP'] as const).includes(r.method)
+          ? r.method
+          : 'SESSION',
+        outcome: r.outcome === 'FAILURE' ? 'FAILURE' : 'SUCCESS',
+        failureCode: typeof r.failureCode === 'string' ? r.failureCode.slice(0, 64) : undefined,
+        // Length-capped: a hostile client cannot bloat the database via these.
+        ip: typeof r.ip === 'string' ? r.ip.slice(0, 64) : undefined,
+        userAgent: typeof r.userAgent === 'string' ? r.userAgent.slice(0, 200) : undefined,
+      }));
+  }
+
+  export function normalizeLoginAlerts(value: any): LoginAlertRecord[] {
+    if (!Array.isArray(value)) return [];
+    return value
+      .filter(
+        (a) =>
+          a &&
+          typeof a.id === 'string' &&
+          typeof a.alertDate === 'string' &&
+          typeof a.periodDate === 'string' &&
+          typeof a.generatedAt === 'string'
+      )
+      .map((a) => ({
+        id: a.id,
+        alertDate: a.alertDate,
+        periodDate: a.periodDate,
+        month: typeof a.month === 'string' ? a.month : a.periodDate.slice(0, 7),
+        generatedAt: a.generatedAt,
+        totalLogins: Number.isFinite(a.totalLogins) ? Number(a.totalLogins) : 0,
+        uniqueUsers: Number.isFinite(a.uniqueUsers) ? Number(a.uniqueUsers) : 0,
+        newUsers: Number.isFinite(a.newUsers) ? Number(a.newUsers) : 0,
+        activeUsers: Number.isFinite(a.activeUsers) ? Number(a.activeUsers) : 0,
+        failedLogins: Number.isFinite(a.failedLogins) ? Number(a.failedLogins) : 0,
+        topUsers: Array.isArray(a.topUsers)
+          ? a.topUsers
+              .filter((t: any) => t && typeof t.userId === 'string' && Number.isFinite(t.count))
+              .slice(0, 10)
+              .map((t: any) => ({
+                userId: String(t.userId),
+                email: typeof t.email === 'string' ? t.email : undefined,
+                count: Number(t.count),
+              }))
+          : [],
+        deliveryStatus: (['NOT_CONFIGURED', 'DELIVERED', 'FAILED'] as const).includes(a.deliveryStatus)
+          ? a.deliveryStatus
+          : 'NOT_CONFIGURED',
+        statusMessage: typeof a.statusMessage === 'string' ? a.statusMessage.slice(0, 400) : '',
+      }));
+  }
+
 
 export class DataStore {
   private readonly filePath: string;
@@ -141,19 +217,21 @@ export class DataStore {
     }
     if (raw) {
       try {
-        const parsed = JSON.parse(raw) as Partial<DbShape>;
-        this.current = {
-          version: typeof parsed.version === 'number' ? parsed.version : DB_VERSION,
-          users: Array.isArray(parsed.users) ? parsed.users.map(normalizeUser) : [],
-          jobs: Array.isArray(parsed.jobs) ? parsed.jobs : [],
-          transactions: Array.isArray(parsed.transactions) ? parsed.transactions : [],
-        };
+      const parsed = JSON.parse(raw) as Partial<DbShape>;
+      this.current = {
+            version: typeof parsed.version === 'number' ? parsed.version : DB_VERSION,
+            users: Array.isArray(parsed.users) ? parsed.users.map(normalizeUser) : [],
+            jobs: Array.isArray(parsed.jobs) ? parsed.jobs : [],
+            transactions: Array.isArray(parsed.transactions) ? parsed.transactions : [],
+          };
         if (parsed.providerSafety) {
           this.current.providerSafety = normalizeProviderSafety(parsed.providerSafety, 'sarvam');
         }
-        this.current.moderationCases = normalizeModerationCases(parsed.moderationCases);
-        this.current.communityRestrictions = normalizeRestrictions(parsed.communityRestrictions);
-        this.current.communityMessages = normalizeCommunityMessages(parsed.communityMessages);
+          this.current.moderationCases = normalizeModerationCases(parsed.moderationCases);
+          this.current.communityRestrictions = normalizeRestrictions(parsed.communityRestrictions);
+          this.current.communityMessages = normalizeCommunityMessages(parsed.communityMessages);
+          this.current.loginActivity = normalizeLoginActivity(parsed.loginActivity);
+          this.current.loginAlerts = normalizeLoginAlerts(parsed.loginAlerts);
       } catch {
         // Corrupt file: preserve it for inspection, start fresh.
         const backup = `${this.filePath}.corrupt-${Date.now()}`;

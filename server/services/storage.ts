@@ -91,6 +91,17 @@ export function srtKey(jobId: string): string {
   return `srt/${jobId}.srt`;
 }
 
+/**
+ * Storage key for a generated SRT that is reusable by audio identity. Keyed on
+ * the SHA-256 of the exact uploaded bytes + the ASR language code so reopening
+ * an already-transcribed audio returns the saved SRT with NO new provider call.
+ * Both inputs are already restricted to safe characters by their callers.
+ */
+export function srtHashKey(sha256: string, languageCode: string): string {
+  const safeLang = String(languageCode || 'od-IN').replace(/[^A-Za-z0-9-]/g, '');
+  return `srt/${sha256}-${safeLang}.srt`;
+}
+
 export function safeOriginalName(name: string): string {
   const base = path.basename(String(name || 'audio').replace(/[^\w.\- ]/g, '_'));
   return base || 'audio';

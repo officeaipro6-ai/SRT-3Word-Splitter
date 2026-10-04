@@ -7,23 +7,25 @@
  */
 import { randomUUID } from 'crypto';
 import { DataStore, normalizeProviderSafety } from './store';
-import {
-  type UserRecord,
-  type JobRecord,
-  type CreditTransactionRecord,
-  type JobStatus,
-  type UserRole,
-  type CreditMode,
-  type ProviderSafetyRecord,
-  type ProviderSafetyStatus,
-  type CommunityMessageRecord,
-  type CommunityRestrictionRecord,
-  type ModerationCaseRecord,
-  type ModerationAction,
-  type ModerationConfidence,
-  type SupportCategory,
-  type ViolationCategory,
-} from './types';
+  import {
+    type UserRecord,
+    type JobRecord,
+    type CreditTransactionRecord,
+    type JobStatus,
+    type UserRole,
+    type CreditMode,
+    type ProviderSafetyRecord,
+    type ProviderSafetyStatus,
+    type CommunityMessageRecord,
+    type CommunityRestrictionRecord,
+    type ModerationCaseRecord,
+    type ModerationAction,
+    type ModerationConfidence,
+    type SupportCategory,
+    type ViolationCategory,
+    type LoginActivityRecord,
+    type LoginAlertRecord,
+  } from './types';
 
 export function newId(): string {
   return randomUUID();
@@ -356,6 +358,19 @@ export class CreditRepo {
   }
 
   /**
+   * EVERY transaction across every user, oldest first, with NO limit and NO
+   * slicing. Used by the admin Excel export, which must never be truncated to
+   * the number of rows currently visible in the dashboard.
+   */
+  listAllUnbounded(): CreditTransactionRecord[] {
+    return this.store
+      .snapshot()
+      .transactions.slice()
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
+      .map((t) => structuredClone(t));
+  }
+
+  /**
    * Find a prior transaction that already used this idempotency key. When `type`
    * is given, only that type matches, so reusing a key across operations
    * (e.g. an adjustment and a debit) can never cross-apply.
@@ -373,7 +388,44 @@ export class CreditRepo {
           (!userId || t.userId === userId) &&
           (!type || t.type === type)
       );
-    return txn ? structuredClone(txn) : null;
+return txn ? structuredClone(txn) : null;
+  }
+
+  /**
+   * Find a purchase transaction by Razorpay payment ID.
+   * Used for idempotency protection against duplicate webhooks/verifications.
+   *
+   * `paymentId` is the canonical application field: it is declared on
+   * CreditTransactionRecord, written by every purchase path
+   * (FileCreditService.purchase, razorpayService.verifyPayment and the webhook
+   * handlers) and read back by the Excel export. Matching on it is what makes
+   * this store agree with TursoStore's dedicated `transactions.paymentId`
+   * column, so the same lookup semantics hold on both backends.
+   *
+   * This used to match `extra.gatewayPaymentId`, which no write path ever set
+   * and which appears in no source record, so it could only ever return null and
+   * the duplicate-purchase guard in creditService/server.ts never fired. The
+   * `extra` column itself is left untouched in both stores.
+   */
+  findByPaymentId(paymentId: string): CreditTransactionRecord | null {
+    const txn = this.store
+      .snapshot()
+      .transactions.find((t) => t.paymentId === paymentId);
+return txn ? structuredClone(txn) : null;
+  }
+
+  /**
+   * Check if a user has already received an ADMIN_ADJUSTMENT giveaway on the given IST date.
+   * Returns true if the user has already received any admin adjustment giveaway on that date.
+   */
+  hasAdminGiveawayToday(userId: string, istDate: string): boolean {
+    const snapshot = this.store.snapshot();
+    return snapshot.transactions.some(
+      (t) =>
+        t.userId === userId &&
+        t.type === 'ADMIN_ADJUSTMENT' &&
+        t.createdAt.startsWith(istDate)
+    );
   }
 
   /**
@@ -445,7 +497,15 @@ export class JobRepo {
     return this.store.mutate((db) => {
       const job = db.jobs.find((j) => j.id === id);
       if (!job) return null;
-      Object.assign(job, patch);
+      // A job id is minted once (randomUUID at enqueue) and is load-bearing
+      // outside this record: srtKey()/uploadKey() derive storage object paths
+      // from it, and creditTxnId / refundFinishedJob() key on it. Object.assign
+      // would copy a patch.id straight over the primary key, which silently
+      // orphans those storage objects and desynchronises the credit ledger.
+      // The explicit `id` argument stays authoritative; every other field in
+      // the patch is merged exactly as before. Mirrors TursoStore.updateJob().
+      const { id: _ignoredPatchId, ...mergeable } = patch;
+      Object.assign(job, mergeable);
       return structuredClone(job);
     });
   }
@@ -694,5 +754,159 @@ export class ModerationRepo {
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
       .slice(0, limit)
       .map((m) => structuredClone(m));
+  }
+}
+
+/**
+ * Upper bound on retained login-activity rows.
+ *
+ * The database is a single JSON file that is rewritten on every mutation, so
+ * this list is part of every write's cost. The cap keeps that bounded while
+ * still covering many months of logins; the oldest rows are trimmed.
+ *
+ * The cap is a retention limit only - it never touches other tables.
+ */
+export const LOGIN_ACTIVITY_RETENTION = 10_000;
+
+/**
+ * Login analytics: month-bucketed activity plus the daily alert log.
+ *
+ * Separate from `CreditRepo` and `UserRepo` on purpose: this table is purely
+ * observational and holds no wallet or credential state.
+ */
+export class LoginActivityRepo {
+  constructor(private readonly store: DataStore) {}
+
+  private all(): LoginActivityRecord[] {
+    return this.store.snapshot().loginActivity ?? [];
+  }
+
+  /**
+   * Append one event, trimming the oldest rows past the retention cap.
+   * Returns the stored record.
+   */
+  record(rec: LoginActivityRecord): LoginActivityRecord {
+    return this.store.mutate((db) => {
+      const list = db.loginActivity ?? (db.loginActivity = []);
+      list.push(rec);
+      if (list.length > LOGIN_ACTIVITY_RETENTION) {
+        // Oldest-first ordering is guaranteed by `sort`, so trim from the front.
+        const excess = list.length - LOGIN_ACTIVITY_RETENTION;
+        list.sort((a, b) => a.occurredAt.localeCompare(b.occurredAt) || a.id.localeCompare(b.id));
+        list.splice(0, excess);
+      }
+      return structuredClone(rec);
+    });
+  }
+
+  /** Newest-first, optionally narrowed to one IST month bucket. */
+  listForMonth(month?: string): LoginActivityRecord[] {
+    const src = month ? this.all().filter((r) => r.month === month) : this.all();
+    return src
+      .slice()
+      .sort((a, b) => b.occurredAt.localeCompare(a.occurredAt) || b.id.localeCompare(a.id))
+      .map((r) => structuredClone(r));
+  }
+
+  /** Oldest-first, optionally narrowed to one IST civil date. */
+  listForDate(date: string): LoginActivityRecord[] {
+    return this.all()
+      .filter((r) => r.loginDate === date)
+      .sort((a, b) => a.occurredAt.localeCompare(b.occurredAt) || a.id.localeCompare(a.id))
+      .map((r) => structuredClone(r));
+  }
+
+  /** Every retained event, oldest first. */
+  listAll(): LoginActivityRecord[] {
+    return this.all()
+      .slice()
+      .sort((a, b) => a.occurredAt.localeCompare(b.occurredAt) || a.id.localeCompare(a.id))
+      .map((r) => structuredClone(r));
+  }
+
+  /**
+   * The most recent event for this (user, method) pair, if any. Used to collapse
+   * a page-refresh storm into a single login event.
+   */
+  lastForUserMethod(userId: string, method: string): LoginActivityRecord | undefined {
+    let best: LoginActivityRecord | undefined;
+    for (const r of this.all()) {
+      if (r.userId !== userId || r.method !== method) continue;
+      if (!best || r.occurredAt > best.occurredAt) best = r;
+    }
+    return best ? structuredClone(best) : undefined;
+  }
+
+  /** Distinct month buckets that actually hold data, newest first. */
+  availableMonths(): string[] {
+    const set = new Set<string>();
+    for (const r of this.all()) set.add(r.month);
+    return [...set].sort((a, b) => b.localeCompare(a));
+  }
+
+  /**
+   * Distinct month buckets that hold data, gap-filled between the oldest and
+   * newest so the admin selector never silently omits an empty month.
+   */
+  availableMonthsFilled(): string[] {
+    const months = this.availableMonths();
+    if (months.length === 0) return [];
+    const out: string[] = [];
+    let [y, m] = months[months.length - 1].split('-').map(Number);
+    const [ty, tm] = months[0].split('-').map(Number);
+    const p2 = (n: number) => (n < 10 ? `0${n}` : String(n));
+    while (y < ty || (y === ty && m <= tm)) {
+      out.push(`${y}-${p2(m)}`);
+      m += 1;
+      if (m > 12) {
+        m = 1;
+        y += 1;
+      }
+    }
+    return out.reverse();
+  }
+
+  /** First ever successful login for a user, or undefined. */
+  firstLoginFor(userId: string): LoginActivityRecord | undefined {
+    const hits = this.all()
+      .filter((r) => r.userId === userId && r.outcome === 'SUCCESS')
+      .sort((a, b) => a.occurredAt.localeCompare(b.occurredAt));
+    return hits[0] ? structuredClone(hits[0]) : undefined;
+  }
+
+  // ------------------------------------------------------------ alert log
+
+  hasAlertFor(periodDate: string): boolean {
+    return (this.store.snapshot().loginAlerts ?? []).some((a) => a.periodDate === periodDate);
+  }
+
+  findAlertFor(periodDate: string): LoginAlertRecord | undefined {
+    const hit = (this.store.snapshot().loginAlerts ?? []).find((a) => a.periodDate === periodDate);
+    return hit ? structuredClone(hit) : undefined;
+  }
+
+  saveAlert(alert: LoginAlertRecord): LoginAlertRecord {
+    return this.store.mutate((db) => {
+      const list = db.loginAlerts ?? (db.loginAlerts = []);
+      // Re-issuing an alert for a period replaces the old row rather than
+      // appending a duplicate.
+      const at = list.findIndex((a) => a.periodDate === alert.periodDate);
+      if (at >= 0) list[at] = structuredClone(alert);
+      else list.push(structuredClone(alert));
+      return structuredClone(alert);
+    });
+  }
+
+  /** Newest-first alert log. */
+  listAlerts(limit = 60): LoginAlertRecord[] {
+    return (this.store.snapshot().loginAlerts ?? [])
+      .slice()
+      .sort((a, b) => b.generatedAt.localeCompare(a.generatedAt) || b.id.localeCompare(a.id))
+      .slice(0, limit)
+      .map((a) => structuredClone(a));
+  }
+
+  countEvents(): number {
+    return this.all().length;
   }
 }

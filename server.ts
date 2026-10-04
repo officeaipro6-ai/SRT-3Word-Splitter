@@ -42,10 +42,12 @@ import {
   convertToWav,
   SpeechRegion,
 } from './server/audioAnalysis';
-import { config } from './server/config';
+import { parseSavedSrt } from './server/canonicalSrt';
+import { config, assertProductionProviderSelection } from './server/config';
 import { nestedLog, redact } from './server/logger';
-import { DataStore } from './server/db/store';
-import { UserRepo, JobRepo, CreditRepo, ProviderSafetyRepo, ModerationRepo, newId } from './server/db/repos';
+import type { DataStore } from './server/db/store';
+import type { DataStoreProvider } from './server/db/dataStore';
+import { UserRepo, JobRepo, CreditRepo, ProviderSafetyRepo, ModerationRepo, LoginActivityRepo, newId } from './server/db/repos';
 import { type JobRecord, type UserRecord, isJobStatus } from './server/db/types';
 import { type SupportCategory } from './server/db/types';
 import {
@@ -53,16 +55,36 @@ import {
   COMMUNITY_GUIDELINES,
   TELEGRAM_MODERATION_NOTE,
 } from './server/services/communityModeration';
-import { FileCreditService, CreditError } from './server/services/creditService';
+import { FileCreditService } from './server/services/creditService';
+import { CreditError } from './server/services/creditRules';
+import {
+  createFileCreditFacade,
+  createTursoCreditFacade,
+  type AsyncCreditService,
+} from './server/services/creditFacade';
+import { asyncRoute, runDetached } from './server/http/asyncRoute';
+import {
+  readRazorpayConfig,
+  createRazorpayInstance,
+  createRazorpayOrder,
+  verifyWebhookSignature,
+  verifyPaymentSignature,
+  parseWebhookPayload,
+  createPurchaseTransaction,
+  CREDIT_PLANS,
+  getPlanById,
+} from './server/services/razorpayService';
 import {
   LocalFileStorageProvider,
   uploadKey,
   srtKey,
+  srtHashKey,
   safeOriginalName,
   extensionForMime,
 } from './server/services/storage';
+import { R2StorageProvider, createStorageProvider } from './server/services/r2Storage';
 import { JobQueue, type RunPipeline } from './server/services/queue';
-import { extractToken, hashToken, issueToken, isValidTokenShape } from './server/services/auth';
+import { extractToken, hashToken, issueToken, isValidTokenShape, selectSessionToken } from './server/services/auth';
 import {
   validateUpload,
   assertWithinActiveJobLimit,
@@ -85,6 +107,9 @@ import {
   freeTrialsUsedFor,
 } from './server/services/freeTrialPolicy';
 import { CREDIT_PACKS, PROVIDER_UNAVAILABLE_MESSAGE } from './server/services/creditPolicy';
+import { LoginActivityService, resolveMonth } from './server/services/loginActivityService';
+import { runLoginAlert, startDailyLoginAlertScheduler } from './server/services/loginAlertService';
+import { createTelegramTransport, readTelegramConfig, toLoginAlertTransport } from './server/services/notifications';
 import {
   ProviderSafetyService,
   ProviderSpendingError,
@@ -614,29 +639,82 @@ async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
 
+  // Stage 6B: fail fast, BEFORE any provider is constructed, if a production
+  // process has not named its production providers explicitly. A no-op unless
+  // NODE_ENV=production, so local development and the test suite are unchanged.
+  // The per-provider credential checks below still run afterwards.
+  assertProductionProviderSelection();
+
   // ---------------------------------------------------------------------------
   // Architecture layer: durable user/job/credit stores + storage + queue.
-  // Everything below is ADDITIVE — the legacy /api/process-audio behaviour is
-  // untouched. These instances are wired in-process; a future deployment swaps
-  // DataStore/StorageProvider/JobQueue for cloud backends behind the same
-  // interfaces.
-  // ---------------------------------------------------------------------------
-  const store = new DataStore(config.dbFile);
-  await store.init();
-  const users = new UserRepo(store);
-  const creditsRepo = new CreditRepo(store);
-  const jobs = new JobRepo(store);
-  const providerSafetyRepo = new ProviderSafetyRepo(store);
-  const moderationRepo = new ModerationRepo(store);
-  const credits = new FileCreditService(users, creditsRepo);
-  const storage = new LocalFileStorageProvider(config.storageDir);
-  // Community & Support moderation. Additive: no existing pipeline, credit,
-  // provider-safety or auth path reads or writes these.
-  const moderation = new CommunityModerationService(moderationRepo);
-  // Attachments live in their own directory, never mixed with job uploads.
-  const communityAttachments = new LocalFileStorageProvider(
-    path.join(config.dataDir, 'community-attachments')
-  );
+// Everything below is ADDITIVE — the legacy /api/process-audio behaviour is
+// untouched. These instances are wired in-process; a future deployment swaps
+// DataStore/StorageProvider/JobQueue for cloud backends behind the same
+// interfaces.
+// ---------------------------------------------------------------------------
+// Initialize database provider
+let store: DataStoreProvider;
+if (config.databaseProvider === 'turso') {
+  if (!config.tursoDatabaseUrl || !config.tursoAuthToken) {
+    throw new Error('Turso configuration required: TURSO_DATABASE_URL and TURSO_AUTH_TOKEN must be set when DATABASE_PROVIDER=turso');
+  }
+  const { createTursoStore } = await import('./server/db/tursoStore');
+  store = await createTursoStore(config.tursoDatabaseUrl, config.tursoAuthToken);
+} else {
+  const { DataStore } = await import('./server/db/store');
+  store = new DataStore(config.dbFile);
+}
+await store.init();
+
+const users = new UserRepo(store);
+const creditsRepo = new CreditRepo(store);
+const jobs = new JobRepo(store);
+const providerSafetyRepo = new ProviderSafetyRepo(store);
+const moderationRepo = new ModerationRepo(store);
+/**
+ * The ONE credit surface the HTTP layer uses.
+ *
+ * It is an async facade so a single handler body is correct for BOTH providers:
+ * the JSON provider's synchronous methods are wrapped (a sync throw becomes a
+ * rejection at the same `await`), and the libSQL provider's methods are already
+ * async. Nothing downstream branches on which store is mounted, and no handler
+ * has to be rewritten when the provider changes.
+ *
+ * The JSON provider remains the behaviourally-identical default. Wiring the
+ * Turso provider in is a one-line change here, but it is deliberately NOT enabled
+ * in this stage — see the migration report.
+ */
+const credits: AsyncCreditService = createFileCreditFacade(new FileCreditService(users, creditsRepo));
+
+// Initialize storage provider
+let storage: any;
+if (config.storageProvider === 'r2') {
+  if (!config.r2AccountId || !config.r2AccessKeyId || !config.r2SecretAccessKey || !config.r2Bucket) {
+    throw new Error('R2 configuration required: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET must be set when STORAGE_PROVIDER=r2');
+  }
+  const { createStorageProvider } = await import('./server/services/r2Storage');
+  storage = createStorageProvider('r2', { r2Config: {
+    accountId: config.r2AccountId!,
+    accessKeyId: config.r2AccessKeyId!,
+    secretAccessKey: config.r2SecretAccessKey!,
+    bucket: config.r2Bucket!,
+  }});
+} else {
+  const { LocalFileStorageProvider } = await import('./server/services/storage');
+  storage = new LocalFileStorageProvider(config.storageDir);
+}
+
+// Community & Support moderation. Additive: no existing pipeline, credit,
+// provider-safety or auth path reads or writes these.
+const moderation = new CommunityModerationService(moderationRepo);
+// Attachments live in their own directory, never mixed with job uploads.
+const communityAttachments = new LocalFileStorageProvider(
+  path.join(config.dataDir, 'community-attachments')
+);
+// Monthly login analytics. Purely observational: its own tables, its own repo,
+// and it is never read by the credit/pipeline/provider-safety paths.
+const loginActivityRepo = new LoginActivityRepo(store);
+const loginActivity = new LoginActivityService(loginActivityRepo);
 
   /**
    * Owner notifications. NO transport is configured: alerts are rendered,
@@ -699,6 +777,13 @@ async function startServer() {
     runPipeline: runJobPipeline,
     providerSafety,
   });
+
+  // Razorpay payment gateway — test mode by default, credentials from .env.
+  // Returns null if credentials are not configured (feature safely disabled).
+  const razorpayConfig = readRazorpayConfig();
+  const razorpay = razorpayConfig ? createRazorpayInstance(razorpayConfig) : null;
+  const razorpayEnabled = !!razorpay;
+
   const uploadLimiter = new SlidingWindowLimiter(config.uploadRateLimitWindowMs, config.uploadRateLimitMax);
 
   /** Bearer-token auth: resolves identity, verifies ownership, records access. */
@@ -882,6 +967,65 @@ async function startServer() {
       console.log('==========================================================');
 
       // ------------------------------------------------------------------
+      // SAVED-SRT REUSE (free, zero Sarvam): when the exact uploaded audio
+      // (SHA-256) + language already produced an SRT, reopening/reusing it must
+      // NOT call Sarvam again and must NOT consume a free trial or credit. The
+      // saved SRT is the source of truth for every subsequent preview/edit/tag/
+      // download/reopen operation. Only the explicit "Generate SRT again"
+      // action (regenerate=true) forces a fresh transcription request.
+      // ------------------------------------------------------------------
+      const regenerateRequested = req.body && req.body.regenerate === true;
+      const savedSrtKey = srtHashKey(sha256, languageCode);
+      if (!regenerateRequested) {
+        const savedSrtBytes = await storage.get(savedSrtKey);
+        if (savedSrtBytes) {
+          const savedRawSrt = savedSrtBytes.toString('utf8');
+          const savedSegments = parseSavedSrt(savedRawSrt);
+          const savedDurationSeconds =
+            savedSegments.length > 0 ? savedSegments[savedSegments.length - 1].endSeconds : fileDuration;
+          const reuseUsage = {
+            freeTrialsUsed,
+            freeTrialLimit: config.freeTrialLimit,
+            freeTrialsRemaining: freeTrialsRemaining(freeTrialsUsed, config.freeTrialLimit),
+          };
+          const reuseWallet =
+            sessionUser === null
+              ? null
+              : {
+                  credits: await credits.getBalance(sessionUser.id),
+                  creditMode: sessionUser.creditMode,
+                  unlimited: sessionUser.creditMode === 'UNLIMITED',
+                };
+          nestedLog.info('reused saved SRT (no provider call, no charge)', {
+            savedSrtKey,
+            reusedSrt: true,
+            cues: savedSegments.length,
+          });
+          return res.json({
+            detectedLanguage: languageName,
+            isOdia: languageCode === 'od-IN',
+            languageConfidence: 0,
+            languageCode,
+            languageName,
+            requestedLanguage,
+            isLanguageDetected,
+            durationSeconds: savedDurationSeconds,
+            segments: savedSegments,
+            rawSrt: savedRawSrt,
+            stats: calculateTranscriptionStats(savedSegments),
+            usage: reuseUsage,
+            wallet: reuseWallet,
+            charge: { kind: 'REUSE', requiredCredits: 0 },
+            notes: [
+              'Reused the saved SRT for this exact audio. No new transcription request was made, no free trial or credit was consumed.',
+            ],
+            localSubmissionMode: false,
+            reusedSrt: true,
+          });
+        }
+      }
+
+      // ------------------------------------------------------------------
       // CREDIT GATE (server-side monetization, enforced BEFORE any provider
       // call). Product rules:
       //   - 1 credit = 1 minute of the SERVER-MEASURED upload duration, rounded
@@ -949,7 +1093,7 @@ async function startServer() {
       }
       if (spendDecision.kind === 'PAID' && sessionUser) {
         const jobId = newId();
-        credits.reserveJob({
+        await credits.reserveJob({
           userId: sessionUser.id,
           jobId,
           amount: spendDecision.requiredCredits as number,
@@ -991,7 +1135,10 @@ async function startServer() {
             meta: { words: r.words, localAsr: r },
           };
         } else if (provider === 'sarvam') {
-          const r = await transcribeRawOdiaWithSarvam(audioBuffer, mimeType, { languageCode });
+          const r = await transcribeRawOdiaWithSarvam(audioBuffer, mimeType, {
+            languageCode,
+            jobTimeoutMs: config.jobTimeoutMs,
+          });
           return { text: r.transcript, duration: r.durationSeconds, meta: r };
         } else if (provider === 'olive') {
           const r = await transcribeRawOdiaWithOlive(audioBuffer, mimeType);
@@ -1059,46 +1206,104 @@ async function startServer() {
           `providerChunks=${(provider === 'sarvam' ? ((rawText.meta as any)?.chunks || []).length : 0)} words=${rawTranscript.split(/\s+/).filter(Boolean).length}`
       );
 
-      let segments: SubtitleSegment[] =
-        rawTranscript.length > 0
-          ? buildMax3WordSegments(rawTranscript, durationForSrt, providerWordTimings, durScaling)
+      // LOCAL SUBMISSION MODE: the worker already produced the FINAL cues
+      // directly from its VAD speech-region-clipped, per-region CTC inference.
+      // Each window is the ACTUAL first/last word timing (20 ms frame alignment
+      // on the exact uploaded audio), max 3 spoken words, punctuation-free,
+      // and chunked so no cue ever spans confirmed non-speech/BGM. They are
+      // used VERBATIM and the re-tagging + VAD re-snap are SKIPPED: both would
+      // otherwise override the real word timing the worker measured.
+      let workerWordCursor = 0;
+      const workerCuesRaw =
+        provider === 'local'
+          ? (((rawText.meta as any)?.localAsr?.segments as Array<{
+              id?: number;
+              startSeconds: number;
+              endSeconds: number;
+              text: string;
+            }>) || [])
           : [];
+      let segments: SubtitleSegment[] = [];
+      if (workerCuesRaw.length > 0) {
+        let segId = 1;
+        for (const cue of workerCuesRaw) {
+          const startSeconds = Number(cue.startSeconds);
+          const endSeconds = Number(cue.endSeconds);
+          const text = String(cue.text ?? '').trim();
+          if (
+            !text ||
+            !Number.isFinite(startSeconds) ||
+            !Number.isFinite(endSeconds) ||
+            endSeconds < startSeconds
+          ) {
+            continue;
+          }
+          const wordsInCue = text.split(/\s+/).filter(Boolean).length;
+          const cueWordTimings = localWordTimings
+            .slice(workerWordCursor, workerWordCursor + wordsInCue)
+            .map((w) => ({ word: w.text, startSeconds: w.startSeconds, endSeconds: w.endSeconds }));
+          workerWordCursor += wordsInCue;
+          segments.push({
+            id: segId++,
+            startSeconds,
+            endSeconds,
+            startTimeFormatted: formatSrtTimestamp(startSeconds),
+            endTimeFormatted: formatSrtTimestamp(endSeconds),
+            text,
+            classification: 'CLEAR_SPEECH' as const,
+            taggedText: applyTaggingRule(text, 'CLEAR_SPEECH', endSeconds - startSeconds)
+              .taggedText,
+            confidence: 0.98,
+            wordTimings: cueWordTimings,
+          });
+        }
+        // rawWordCount === finalWordCount is still verified below: the cues
+        // partition every word the worker recognised, in order, with no loss.
+        console.log(
+          `[VOICE TIMING] local worker cues used verbatim=${segments.length} (real CTC word timing; VAD re-snap skipped)`
+        );
+      } else {
+        segments =
+          rawTranscript.length > 0
+            ? buildMax3WordSegments(rawTranscript, durationForSrt, providerWordTimings, durScaling)
+            : [];
 
-      // TAGGING: classify the timeline against the ACTUAL audio via the existing
-      // VAD analysis and insert real NOISE / SILENCE / MB tags for the portions
-      // of the audio that are genuinely non-speech (never over spoken words,
-      // never inventing tags). Spoken-word cues keep their exact Sarvam text,
-      // word order, and timestamps.
-      const taggedSegments = await applyAudioAnalysisTags(
-        audioBuffer,
-        mimeType,
-        segments,
-        durationForSrt
-      );
-      segments = taggedSegments;
+        // TAGGING: classify the timeline against the ACTUAL audio via the existing
+        // VAD analysis and insert real NOISE / SILENCE / MB tags for the portions
+        // of the audio that are genuinely non-speech (never over spoken words,
+        // never inventing tags). Spoken-word cues keep their exact Sarvam text,
+        // word order, and timestamps.
+        const taggedSegments = await applyAudioAnalysisTags(
+          audioBuffer,
+          mimeType,
+          segments,
+          durationForSrt
+        );
+        segments = taggedSegments;
 
-      // VOICE-ALIGNED TIMING: snap spoken-word cue boundaries to the actual
-      // voice regions detected on the exact uploaded audio (Start = first
-      // overlapping speech region's start, End = last overlapping speech
-      // region's end), so subtitles appear ONLY over real speech - never over
-      // leading/trailing silence or BGM - while staying clamped between the
-      // neighboring cues (no overlaps, no invented timing). Text and tags are
-      // never modified; non-speech cues are untouched.
-      const voiceRegions = await computeSpeechRegions(audioBuffer, mimeType || 'audio/wav');
-      const beforeAligned = segments;
-      segments = alignSegmentsToSpeechRegions(segments, voiceRegions);
-      const alignedCount = segments.reduce(
-        (acc, s, idx) => {
-          const prev = beforeAligned[idx];
-          if (prev && (prev.startSeconds !== s.startSeconds || prev.endSeconds !== s.endSeconds)) acc++;
-          return acc;
-        },
-        0
-      );
-      console.log(
-        `[VOICE TIMING] speechRegions=${voiceRegions.filter((r) => r.type === 'speech').length}, ` +
-          `cuesRealigned=${alignedCount}`
-      );
+        // VOICE-ALIGNED TIMING: snap spoken-word cue boundaries to the actual
+        // voice regions detected on the exact uploaded audio (Start = first
+        // overlapping speech region's start, End = last overlapping speech
+        // region's end), so subtitles appear ONLY over real speech - never over
+        // leading/trailing silence or BGM - while staying clamped between the
+        // neighboring cues (no overlaps, no invented timing). Text and tags are
+        // never modified; non-speech cues are untouched.
+        const voiceRegions = await computeSpeechRegions(audioBuffer, mimeType || 'audio/wav');
+        const beforeAligned = segments;
+        segments = alignSegmentsToSpeechRegions(segments, voiceRegions);
+        const alignedCount = segments.reduce(
+          (acc, s, idx) => {
+            const prev = beforeAligned[idx];
+            if (prev && (prev.startSeconds !== s.startSeconds || prev.endSeconds !== s.endSeconds)) acc++;
+            return acc;
+          },
+          0
+        );
+        console.log(
+          `[VOICE TIMING] speechRegions=${voiceRegions.filter((r) => r.type === 'speech').length}, ` +
+            `cuesRealigned=${alignedCount}`
+        );
+      }
 
       // Verification: raw word count must equal final subtitle word count.
       const rawWordCount = rawTranscript.split(/\s+/).filter(Boolean).length;
@@ -1199,7 +1404,7 @@ async function startServer() {
         freeTrialsRemaining: freeTrialsRemaining(freeTrialsUsed, config.freeTrialLimit),
       };
       if (paidReservation) {
-        credits.settleJobReservation(paidReservation.userId, paidReservation.jobId, 'usage_transcription');
+        await credits.settleJobReservation(paidReservation.userId, paidReservation.jobId, 'usage_transcription');
         nestedLog.info('paid credits used', {
           userId: paidReservation.userId,
           amount: paidReservation.requiredCredits,
@@ -1228,10 +1433,23 @@ async function startServer() {
         sessionUser === null
           ? null
           : {
-              credits: credits.getBalance(sessionUser.id),
+              credits: await credits.getBalance(sessionUser.id),
               creditMode: sessionUser.creditMode,
               unlimited: sessionUser.creditMode === 'UNLIMITED',
             };
+
+      const generatedSrt = generateSrtContent(segments);
+
+      // Persist the generated SRT so any reopen/re-upload of this exact audio +
+      // language reuses it (free) instead of making another Sarvam request.
+      // Best-effort: a storage failure must never fail an otherwise-successful
+      // transcription (the SRT is still returned to the caller).
+      try {
+        await storage.put(savedSrtKey, Buffer.from(generatedSrt, 'utf8'));
+        nestedLog.info('saved generated SRT for reuse', { savedSrtKey, cues: segments.length });
+      } catch (saveErr) {
+        nestedLog.warn('could not save SRT for reuse', { savedSrtKey, error: String(saveErr) });
+      }
 
       return res.json({
         detectedLanguage: languageName,
@@ -1243,7 +1461,7 @@ async function startServer() {
         isLanguageDetected,
         durationSeconds: durationForSrt,
         segments,
-        rawSrt: generateSrtContent(segments),
+        rawSrt: generatedSrt,
         stats: calculateTranscriptionStats(segments),
         usage,
         wallet,
@@ -1253,7 +1471,7 @@ async function startServer() {
         },
         notes: [
           provider === 'local'
-            ? 'LOCAL SUBMISSION MODE: local open-source Odia ASR (ai4bharat/indicwav2vec-odia, Apache-2.0) transcribed the EXACT uploaded audio on this machine. No Sarvam, Groq, Olive or other paid/cloud API was contacted and nothing was spent. Subtitles split to max 3 words each, using real per-word CTC frame-alignment timestamps, and classified against the actual audio (NOISE/FIL) so the exported SRT contains real tags. Punctuation is removed from spoken words. No spelling correction and no cached/previous/fixture transcript.'
+            ? 'LOCAL SUBMISSION MODE: local open-source Odia ASR (ai4bharat/indicwav2vec-odia, Apache-2.0) transcribed the EXACT uploaded audio on this machine. No Sarvam, Groq, Olive or other paid/cloud API was contacted and nothing was spent. The model ran ONLY on detected speech regions (VAD-clipped), so music/noise-only spans never reach it and no words are hallucinated over BGM. Subtitles are at most 3 spoken words each, timed from the ACTUAL first/last per-word CTC frame alignment mapped back to the exact uploaded audio timeline (cue windows never span non-speech gaps; no VAD re-snap). Punctuation is removed from spoken words. No spelling correction and no cached/previous/fixture transcript.'
             : provider === 'sarvam'
             ? `Sarvam Saaras (saaras:v4, ${languageCode}, verbatim) transcription of the exact uploaded audio. Subtitles split to max 3 words each and classified against the actual audio (NOISE/SILENCE/MB) so the exported SRT contains real tags. No spelling correction, no canonical/old SRT fallback.`
             : provider === 'olive'
@@ -1269,6 +1487,9 @@ async function startServer() {
                 modelDir: (rawText.meta as any)?.localAsr?.modelDir ?? null,
                 device: (rawText.meta as any)?.localAsr?.device ?? 'cpu',
                 wordCount: (rawText.meta as any)?.localAsr?.wordCount ?? 0,
+                cueCount: (rawText.meta as any)?.localAsr?.segments?.length ?? 0,
+                speechRegionCount: (rawText.meta as any)?.localAsr?.speechRegionCount ?? 0,
+                speechSecTotal: (rawText.meta as any)?.localAsr?.speechSeconds ?? null,
                 hasReliableTimestamps: (rawText.meta as any)?.localAsr?.hasReliableTimestamps === true,
                 timestampNote: (rawText.meta as any)?.localAsr?.timestampNote ?? null,
                 meanLogProb: (rawText.meta as any)?.localAsr?.meanLogProb ?? null,
@@ -1284,7 +1505,7 @@ async function startServer() {
       // the reserved amount to the wallet and record a RELEASE ledger entry.
       if (paidReservation) {
         try {
-          credits.releaseJobReservation(paidReservation.userId, paidReservation.jobId, 'release_failed_job');
+          await credits.releaseJobReservation(paidReservation.userId, paidReservation.jobId, 'release_failed_job');
           nestedLog.info('reservation released', {
             userId: paidReservation.userId,
             jobId: paidReservation.jobId,
@@ -1404,10 +1625,12 @@ async function startServer() {
         return res.status(403).json({ error: ownerRejectionMessage(code), code });
       }
       let userId: string;
+      let presentedIsLive = false;
       if (existing && isValidTokenShape(existing)) {
         const user = users.getByToken(hashToken(existing));
         if (!user) return res.status(401).json({ error: 'Unknown or expired session token.' });
         userId = user.id;
+        presentedIsLive = true;
       } else {
         const tokenHash = hashToken(issueToken());
         const user = users.createUser(tokenHash, config.initialCredits);
@@ -1434,10 +1657,29 @@ async function startServer() {
           ownerEmail: ownerAttempt.ownerEmail,
         });
       }
-      const token = issueToken();
+      // Hand back the token the caller already proved it holds. A refresh must
+      // not append a second hash to users.tokenHashes for the same session;
+      // addToken stays idempotent and still refreshes lastSeenAt.
+      const token = selectSessionToken(existing, presentedIsLive) ?? issueToken();
       users.addToken(userId, hashToken(token));
       const user = users.getById(userId);
       const freeTrialsUsed = freeTrialsUsedFor(user);
+      // Monthly login analytics: one event per genuine session. A browser
+      // refresh re-hits this route with the same token and is collapsed by the
+      // service's refresh-dedup window, so it cannot inflate the counts.
+      // Observational only: a failure here must never break session creation.
+      try {
+        loginActivity.record({
+          userId,
+          email: user?.email ?? undefined,
+          method: isAdminBootstrap ? 'OWNER_BOOTSTRAP' : 'SESSION',
+          outcome: 'SUCCESS',
+          ip: req.ip,
+          userAgent: String(req.headers['user-agent'] ?? ''),
+        });
+      } catch (e) {
+        nestedLog.warn('login activity record failed', { message: redact((e as Error).message) });
+      }
       res.json({
         userId,
         token,
@@ -1507,10 +1749,35 @@ async function startServer() {
     try {
       const result = loginAccount(accountBroker, req.body ?? {});
       if (!result.ok || !result.user) {
+        // A FAILED sign-in is recorded with no user, no email and no request
+        // metadata: the caller is unauthenticated, so the submitted address and
+        // device are untrusted input and are not persisted.
+        try {
+          loginActivity.record({
+            userId: '',
+            method: 'ACCOUNT_LOGIN',
+            outcome: 'FAILURE',
+            failureCode: result.code ?? 'INVALID_CREDENTIALS',
+          });
+        } catch (e) {
+          nestedLog.warn('failed-login record error', { message: redact((e as Error).message) });
+        }
         return res.status(401).json({ error: result.error, code: result.code ?? 'INVALID_CREDENTIALS' });
       }
       const token = issueToken();
       users.addToken(result.user.id, hashToken(token));
+      try {
+        loginActivity.record({
+          userId: result.user.id,
+          email: result.user.email ?? undefined,
+          method: 'ACCOUNT_LOGIN',
+          outcome: 'SUCCESS',
+          ip: req.ip,
+          userAgent: String(req.headers['user-agent'] ?? ''),
+        });
+      } catch (e) {
+        nestedLog.warn('login activity record failed', { message: redact((e as Error).message) });
+      }
       return res.json(sessionPayload(result.user, token));
     } catch (err: any) {
       nestedLog.error('account login failed', { message: redact(err.message) });
@@ -1536,13 +1803,16 @@ async function startServer() {
 
   // Upload -> validate -> charge credits server-side -> enqueue (async worker).
   // No long audio is transcribed inside this request.
-  app.post('/api/jobs', auth(), upload.single('mediaFile'), (req, res) => {
-    void (async () => {
-      try {
-        const user = res.locals.user;
-        if (!uploadLimiter.isAllowed(`${user.id}:${req.ip || ''}`)) {
-          return res.status(429).json({ error: 'Upload rate limit exceeded. Please try again later.', code: 'RATE_LIMITED' });
-        }
+  // The middleware chain is kept on one line and UNCHANGED: `auth()` must run
+  // before `upload.single()` (an unauthenticated caller must never get a file
+  // buffered to disk), and a route-registration guard asserts that literal
+  // ordering. Only the handler itself gained the asyncRoute() wrapper.
+  app.post('/api/jobs', auth(), upload.single('mediaFile'), asyncRoute(async (req, res) => {
+    try {
+      const user = res.locals.user;
+      if (!uploadLimiter.isAllowed(`${user.id}:${req.ip || ''}`)) {
+        return res.status(429).json({ error: 'Upload rate limit exceeded. Please try again later.', code: 'RATE_LIMITED' });
+      }
         const file = req.file;
         if (!file) {
           return res.status(400).json({
@@ -1574,7 +1844,7 @@ async function startServer() {
         const sha256 = createHash('sha256').update(buffer).digest('hex');
         // Charge BEFORE enqueueing; chargeJob is idempotent per jobId, so a
         // client retry can never double-charge.
-        const charged = credits.chargeJob({
+        const charged = await credits.chargeJob({
           userId: user.id,
           jobId,
           amount: config.creditsPerJob,
@@ -1584,7 +1854,7 @@ async function startServer() {
         try {
           await storage.put(storageKey, buffer);
         } catch (putErr) {
-          credits.refundFinishedJob(user.id, jobId, 'refund_storage_failure');
+          await credits.refundFinishedJob(user.id, jobId, 'refund_storage_failure');
           throw putErr;
         }
 
@@ -1626,8 +1896,8 @@ async function startServer() {
         nestedLog.error('job enqueue failed', { message: redact(err.message) });
         return res.status(500).json({ error: 'Failed to enqueue job.' });
       }
-    })();
-  });
+    })
+  );
 
   // List own jobs (ownership-filtered), optional ?status= filter.
   app.get('/api/jobs', auth(), (req, res) => {
@@ -1661,7 +1931,7 @@ async function startServer() {
   });
 
   // Cancel an unstarted/running own job (refunds the charge).
-  app.post('/api/jobs/:id/cancel', auth(), (req, res) => {
+  app.post('/api/jobs/:id/cancel', auth(), asyncRoute(async (req, res) => {
     const user = res.locals.user;
     const job = jobs.getForUser(req.params.id, user.id);
     if (!job) return res.status(404).json({ error: 'Job not found.' });
@@ -1669,14 +1939,14 @@ async function startServer() {
       return res.status(409).json({ error: `Job cannot be cancelled (status: ${job.status}).` });
     }
     jobs.update(job.id, { status: 'CANCELLED', completedAt: new Date().toISOString() });
-    credits.refundFinishedJob(user.id, job.id, 'refund_cancelled_job');
+    await credits.refundFinishedJob(user.id, job.id, 'refund_cancelled_job');
     nestedLog.info('job cancelled', { jobId: job.id, userId: user.id });
     const updated = jobs.getForUser(job.id, user.id) as JobRecord;
     res.json({ job: publicJob(updated) });
-  });
+  }));
 
   // Own credit balance + ledger (server-authoritative; never client values).
-  app.get('/api/credits/me', auth(), (req, res) => {
+  app.get('/api/credits/me', auth(), asyncRoute(async (req, res) => {
     const user = res.locals.user;
     const fresh = users.getById(user.id);
     res.json({
@@ -1685,17 +1955,219 @@ async function startServer() {
       role: fresh?.role ?? 'USER',
       creditMode: fresh?.creditMode ?? 'NORMAL',
       unlimited: (fresh?.creditMode ?? 'NORMAL') === 'UNLIMITED',
-      transactions: credits.getTransactions(user.id, 25),
+      transactions: await credits.getTransactions(user.id, 25),
       provider: getAsrProviderName(),
     });
-  });
+  }));
 
   // Credit PACK CATALOG (public). These are PRODUCT DEFINITIONS ONLY: there is
   // no payment gateway yet, so every pack is a placeholder ("Coming Soon" in the
   // UI) and no transaction can actually create credits. Prices are display-only.
   app.get('/api/credits/packs', (_req, res) => {
-    res.json({ packs: CREDIT_PACKS });
+    res.json({ packs: CREDIT_PLANS });
   });
+
+  // ----------------------------------------------------
+  // CREDIT PURCHASE — Razorpay integration (server-verified)
+  // Test mode by default; requires RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET,
+  // RAZORPAY_WEBHOOK_SECRET in .env. Returns 503 if not configured.
+  // ---------------------------------------------------------------------------
+
+  // Create a Razorpay order for a credit purchase.
+  // Client provides ONLY the plan ID; server resolves amount/credits from locked plans.
+  app.post('/api/credits/purchase/order', auth(), async (req, res) => {
+    if (!razorpayEnabled || !razorpay) {
+      return res.status(503).json({
+        error: 'Payment system is not configured. Please contact the operator.',
+        code: 'PAYMENT_UNAVAILABLE',
+      });
+    }
+    const user = res.locals.user;
+    const planId = String(req.body?.planId ?? '').trim();
+    if (!planId) {
+      return res.status(400).json({ error: 'Plan ID is required.', code: 'MISSING_PLAN' });
+    }
+    const plan = getPlanById(planId);
+    if (!plan) {
+      return res.status(400).json({ error: 'Invalid plan ID.', code: 'INVALID_PLAN' });
+    }
+
+    try {
+      const result = await createRazorpayOrder(razorpay!, {
+        userId: user.id,
+        planId: plan.id,
+        userEmail: user.email,
+        receiptPrefix: 'credits',
+      });
+      // Return only safe data needed for frontend checkout
+      res.json({
+        orderId: result.orderId,
+        amount: result.amount, // in paise
+        currency: result.currency,
+        keyId: razorpayConfig!.keyId,
+        plan: {
+          id: result.plan.id,
+          name: result.plan.name,
+          credits: result.plan.credits,
+          priceInr: result.plan.priceInr,
+        },
+      });
+    } catch (err) {
+      nestedLog.error('razorpay order creation failed', { message: String(err) });
+      return res.status(500).json({ error: 'Failed to create payment order.', code: 'ORDER_FAILED' });
+    }
+  });
+
+  // Verify payment after Razorpay checkout redirect / callback.
+  // Client sends orderId, paymentId, signature from Razorpay checkout.
+  // Server verifies signature with Razorpay secret before crediting.
+  app.post('/api/credits/purchase/verify', auth(), asyncRoute(async (req, res) => {
+    if (!razorpayEnabled || !razorpay) {
+      return res.status(503).json({ error: 'Payment system is not configured.', code: 'PAYMENT_UNAVAILABLE' });
+    }
+    const user = res.locals.user;
+    const { orderId, paymentId, signature, planId } = req.body ?? {};
+    if (!orderId || !paymentId || !signature || !planId) {
+      return res.status(400).json({ error: 'Missing required fields.', code: 'MISSING_FIELDS' });
+    }
+    const plan = getPlanById(planId);
+    if (!plan) {
+      return res.status(400).json({ error: 'Invalid plan ID.', code: 'INVALID_PLAN' });
+    }
+
+    // Verify Razorpay payment signature
+    const isValid = verifyPaymentSignature(razorpayConfig!.keySecret, orderId, paymentId, signature);
+    if (!isValid) {
+      nestedLog.warn('razorpay signature verification failed', { userId: user.id, orderId, paymentId });
+      return res.status(400).json({ error: 'Invalid payment signature.', code: 'INVALID_SIGNATURE' });
+    }
+
+    // Fetch payment details from Razorpay to confirm amount/currency/status
+    let paymentDetails;
+    try {
+      paymentDetails = await razorpay!.payments.fetch(paymentId);
+    } catch (err) {
+      nestedLog.error('razorpay fetch payment failed', { paymentId, message: String(err) });
+      return res.status(500).json({ error: 'Failed to verify payment.', code: 'VERIFY_FAILED' });
+    }
+
+    // Verify the payment belongs to the expected order and plan
+    if (paymentDetails.order_id !== orderId) {
+      return res.status(400).json({ error: 'Order mismatch.', code: 'ORDER_MISMATCH' });
+    }
+    if (paymentDetails.status !== 'captured') {
+      return res.status(400).json({ error: `Payment not captured (status: ${paymentDetails.status}).`, code: 'PAYMENT_NOT_CAPTURED' });
+    }
+    if (paymentDetails.amount !== plan.priceInr * 100) {
+      return res.status(400).json({ error: 'Amount mismatch.', code: 'AMOUNT_MISMATCH' });
+    }
+    if (paymentDetails.currency !== 'INR') {
+      return res.status(400).json({ error: 'Currency mismatch.', code: 'CURRENCY_MISMATCH' });
+    }
+
+    // Use the credit service's recordPurchase method (handles idempotency, ledger, etc.)
+    const result = await credits.recordPurchase({
+      userId: user.id,
+      planId: plan.id,
+      paymentId,
+      orderId,
+      amountInr: plan.priceInr,
+      currency: 'INR',
+      planName: plan.name,
+      email: user.email,
+    });
+
+    res.json({
+      success: true,
+      transaction: result.transaction,
+      credits: result.credits,
+      alreadyProcessed: result.alreadyProcessed,
+    });
+  }));
+
+  // Razorpay webhook endpoint — receives payment.captured, payment.failed, etc.
+  // Verifies webhook signature before processing.
+  app.post('/api/credits/purchase/webhook', express.raw({ type: 'application/json' }), asyncRoute(async (req, res) => {
+    if (!razorpayEnabled || !razorpay) {
+      return res.status(503).json({ error: 'Payment system not configured.' });
+    }
+
+    const signature = req.headers['x-razorpay-signature'] as string;
+    if (!signature) {
+      nestedLog.warn('razorpay webhook missing signature');
+      return res.status(400).json({ error: 'Missing signature.' });
+    }
+
+    const rawBody = req.body as Buffer;
+    if (!verifyWebhookSignature(razorpayConfig!.webhookSecret, rawBody, signature)) {
+      nestedLog.warn('razorpay webhook signature verification failed');
+      return res.status(400).json({ error: 'Invalid webhook signature.' });
+    }
+
+    let payload;
+    try {
+      payload = JSON.parse(rawBody.toString());
+    } catch {
+      return res.status(400).json({ error: 'Invalid JSON payload.' });
+    }
+
+    const payment = parseWebhookPayload(payload);
+    if (!payment) {
+      // Not a payment event we care about (e.g., order.paid, refund.processed)
+      return res.json({ received: true });
+    }
+
+    // Only process successful captures
+    if (payment.status !== 'captured') {
+      nestedLog.info('razorpay webhook: non-captured payment', { status: payment.status, paymentId: payment.paymentId });
+      return res.json({ received: true });
+    }
+
+    // Idempotency: check if already processed
+    const existing = creditsRepo.findByPaymentId?.(payment.paymentId);
+    if (existing) {
+      return res.json({ received: true, alreadyProcessed: true });
+    }
+
+    // Verify the user exists
+    const user = users.getById(payment.userId);
+    if (!user) {
+      nestedLog.warn('razorpay webhook: unknown user', { userId: payment.userId });
+      return res.json({ received: true, error: 'Unknown user' });
+    }
+
+    const plan = getPlanById(payment.planId);
+    if (!plan) {
+      nestedLog.warn('razorpay webhook: invalid plan', { planId: payment.planId });
+      return res.json({ received: true, error: 'Invalid plan' });
+    }
+
+    // Verify amount matches
+    if (payment.amount !== plan.priceInr) {
+      nestedLog.warn('razorpay webhook: amount mismatch', { expected: plan.priceInr, got: payment.amount });
+      return res.json({ received: true, error: 'Amount mismatch' });
+    }
+
+    // Use the credit service's recordPurchase method (handles idempotency, ledger, etc.)
+    const result = await credits.recordPurchase({
+      userId: payment.userId,
+      planId: payment.planId,
+      paymentId: payment.paymentId,
+      orderId: payment.orderId,
+      amountInr: payment.amount,
+      currency: payment.currency,
+      planName: plan.name,
+      email: payment.email,
+    });
+
+    nestedLog.info('razorpay webhook: credits added', {
+      userId: payment.userId,
+      paymentId: payment.paymentId,
+      credits: plan.credits,
+    });
+
+    res.json({ received: true, creditsAdded: plan.credits, alreadyProcessed: result.alreadyProcessed });
+  }));
 
   // ---------------------------------------------------------------------------
   // COMMUNITY & SUPPORT (additive).
@@ -1881,7 +2353,12 @@ async function startServer() {
   };
 
   // Public projection for admin listings (never token hashes, never secrets).
-  function adminUserView(userId: string) {
+  /**
+   * Async because the lifetime credit aggregates are credit-ledger reads, which are
+   * async on the libSQL provider. Returning a Promise keeps ONE implementation
+   * that is correct for both providers.
+   */
+  async function adminUserView(userId: string) {
     const u = users.getById(userId);
     if (!u) return null;
     return {
@@ -1892,8 +2369,8 @@ async function startServer() {
       credits: u.credits,
       purchasedCredits: u.purchasedCredits ?? 0,
       bonusCredits: u.bonusCredits ?? 0,
-      totalGranted: credits.sumGrants(userId),
-      totalUsed: credits.sumUsed(userId),
+      totalGranted: await credits.sumGrants(userId),
+      totalUsed: await credits.sumUsed(userId),
       createdAt: u.createdAt,
       lastSeenAt: u.lastSeenAt ?? null,
       // Only verified owner accounts carry an email; it is shown to admins so an
@@ -1930,28 +2407,75 @@ async function startServer() {
 
   // List all users with balance + lifetime aggregates (admin dashboard).
   // `?q=` searches by user id or by a verified owner email (server-side match).
-  app.get('/api/admin/users', auth(), requireAdmin, (req, res) => {
+  app.get('/api/admin/users', auth(), requireAdmin, asyncRoute(async (req, res) => {
     const limit = Math.min(Number(req.query.limit) || 100, 500);
     const query = typeof req.query.q === 'string' ? req.query.q.trim() : '';
     const list = query ? users.searchUsers(query, limit) : users.listUsers().slice(0, limit);
-    res.json({ users: list.map((u) => adminUserView(u.id)), query });
-  });
+    const views = await Promise.all(list.map((u) => adminUserView(u.id)));
+    res.json({ users: views, query });
+  }));
 
   // Single user detail incl. recent ledger (admin dashboard).
-  app.get('/api/admin/users/:id', auth(), requireAdmin, (req, res) => {
-    const view = adminUserView(req.params.id);
+  app.get('/api/admin/users/:id', auth(), requireAdmin, asyncRoute(async (req, res) => {
+    const view = await adminUserView(req.params.id);
     if (!view) return res.status(404).json({ error: 'User not found.' });
-    res.json({ user: view, transactions: credits.getTransactions(req.params.id, 50) });
-  });
+    const transactions = await credits.getTransactions(req.params.id, 50);
+    res.json({ user: view, transactions });
+  }));
 
   // All transactions across users (admin Transaction History).
-  app.get('/api/admin/transactions', auth(), requireAdmin, (req, res) => {
+  app.get('/api/admin/transactions', auth(), requireAdmin, asyncRoute(async (req, res) => {
     const limit = Math.min(Number(req.query.limit) || 200, 500);
     const userId = typeof req.query.userId === 'string' ? req.query.userId : undefined;
-    let list = credits.getAllTransactions(limit);
+    let list = await credits.getAllTransactions(limit);
     if (userId) list = list.filter((t) => t.userId === userId);
     res.json({ transactions: list });
+  }));
+
+
+  // ---------------------------------------------------- monthly login activity
+
+  // Month-wise login analytics for the admin dashboard. `?month=YYYY-MM`
+  // defaults to the current IST month; `?q=` searches id/email/date; the table
+  // is paginated, but the numbers always describe the WHOLE month.
+  app.get('/api/admin/login-activity', auth(), requireAdmin, (req, res) => {
+    try {
+      const month = resolveMonth(req.query.month);
+      const result = loginActivity.queryMonth({
+        month,
+        q: typeof req.query.q === 'string' ? req.query.q : undefined,
+        page: Number(req.query.page) || 1,
+        pageSize: Number(req.query.pageSize) || 50,
+      });
+      res.json({ ...result, availableMonths: loginActivity.availableMonths() });
+    } catch (err) {
+      nestedLog.error('admin login activity failed', { err: String(err) });
+      res.status(500).json({ error: 'LOGIN_ACTIVITY_FAILED' });
+    }
   });
+
+  // The daily "yesterday's logins" alert log, newest first.
+  app.get('/api/admin/login-alerts', auth(), requireAdmin, (req, res) => {
+    try {
+      res.json({ alerts: loginActivityRepo.listAlerts(60) });
+    } catch (err) {
+      nestedLog.error('admin login alerts failed', { err: String(err) });
+      res.status(500).json({ error: 'LOGIN_ALERTS_FAILED' });
+    }
+  });
+
+  // Manual trigger for the same idempotent job the scheduler runs. Used by the
+  // admin button and by ops; re-running for an already-reported day is a no-op.
+  app.post('/api/admin/login-alerts/run', auth(), requireAdmin, asyncRoute(async (_req, res) => {
+    try {
+      const { alert, duplicate } = await runLoginAlert(loginActivity, loginActivityRepo, {});
+      res.json({ alert, duplicate });
+    } catch (err) {
+      nestedLog.error('manual login alert failed', { err: String(err) });
+      res.status(500).json({ error: 'LOGIN_ALERT_FAILED' });
+    }
+  }));
+
 
   // All jobs across users (admin Jobs dashboard).
   app.get('/api/admin/jobs', auth(), requireAdmin, (req, res) => {
@@ -1972,10 +2496,10 @@ async function startServer() {
    * idempotencyKey. The admin's email is taken from res.locals (their own
    * verified account), never from the request body.
    */
-  const applyAdminAdjustment = (req: express.Request, res: express.Response) => {
+  const applyAdminAdjustment = asyncRoute(async (req: express.Request, res: express.Response) => {
     const admin = res.locals.user;
     try {
-      const result = credits.adminAdjustCredits({
+      const result = await credits.adminAdjustCredits({
         adminUserId: admin.id,
         adminEmail: admin.ownerEmail,
         userId: String(req.body?.userId || ''),
@@ -1995,7 +2519,7 @@ async function startServer() {
       res.json({
         transaction: result.transaction,
         applied: result.applied,
-        user: adminUserView(result.transaction.userId),
+        user: await adminUserView(result.transaction.userId),
       });
     } catch (err: any) {
       if (err instanceof CreditError) {
@@ -2004,7 +2528,7 @@ async function startServer() {
       nestedLog.error('admin credit adjustment failed', { message: redact(err.message) });
       res.status(500).json({ error: 'Failed to apply the credit adjustment.' });
     }
-  };
+  });
 
   app.post('/api/admin/credits/adjust', auth(), requireAdmin, applyAdminAdjustment);
 
@@ -2012,9 +2536,9 @@ async function startServer() {
   app.post('/api/admin/credits/grant', auth(), requireAdmin, applyAdminAdjustment);
 
   // Admin credit debit (idempotent via idempotencyKey; reason mandatory; never negative).
-  app.post('/api/admin/credits/debit', auth(), requireAdmin, (req, res) => {
+  app.post('/api/admin/credits/debit', auth(), requireAdmin, asyncRoute(async (req, res) => {
     try {
-      const result = credits.adminDebitCredits({
+      const result = await credits.adminDebitCredits({
         adminUserId: res.locals.user.id,
         adminEmail: res.locals.user.ownerEmail,
         userId: String(req.body?.userId || ''),
@@ -2030,7 +2554,7 @@ async function startServer() {
       nestedLog.error('admin debit failed', { message: redact(err.message) });
       res.status(500).json({ error: 'Failed to debit credits.' });
     }
-  });
+  }));
 
   // Provider safety state: status, reason, timestamps, last error, balance
   // honesty flag. Read-only; includes the local state-change history.
@@ -2222,6 +2746,15 @@ async function startServer() {
     const distPath = path.join(process.cwd(), 'dist');
     const indexHtml = path.join(distPath, 'index.html');
 
+    // Explicit 404 for known legacy paths — MUST run before static middleware
+    // to prevent express.static from serving index.html for these paths.
+    app.get('/legacy', (_req, res) => {
+      res.status(404).type('text/plain').send('404 Not Found');
+    });
+    app.get('/old-ui', (_req, res) => {
+      res.status(404).type('text/plain').send('404 Not Found');
+    });
+
     // Hashed build assets are safe to cache forever; everything that can change
     // which app you get is revalidated every time. This is what stops a browser
     // from pinning an old UI shell after a redeploy.
@@ -2361,13 +2894,31 @@ async function startServer() {
         `[Server] Admin Dashboard (owner only)         |  http://localhost:${PORT}/admin\n` +
         `[Server] serving: ${process.cwd()}`,
     );
-    if (config.enableJobQueue) {
-      queue.rehydrate();
-      queue.start();
-      nestedLog.info('job queue worker started', { provider: getAsrProviderName() });
-    } else {
-      nestedLog.warn('job queue disabled (ENABLE_JOB_QUEUE=false) job endpoints will not process work');
+      if (config.enableJobQueue) {
+        queue.rehydrate();
+        queue.start();
+        nestedLog.info('job queue worker started', { provider: getAsrProviderName() });
+      } else {
+        nestedLog.warn('job queue disabled (ENABLE_JOB_QUEUE=false) job endpoints will not process work');
+      }
+
+// Build Telegram transport if configured (reads from .env at startup).
+    const telegramConfig = readTelegramConfig();
+    const transports: Record<string, import('./server/services/loginAlertService').LoginAlertTransport> = {};
+    if (telegramConfig) {
+      const tg = createTelegramTransport(telegramConfig);
+      if (tg) transports.telegram = toLoginAlertTransport(tg);
     }
+
+    // Daily "yesterday's login activity" alert, shortly after IST midnight.
+    // Idempotency is persisted (keyed on the reported day), so restarts and
+    // repeated ticks cannot emit twice. If Telegram is configured, the alert
+    // is also sent there; otherwise it records NOT_CONFIGURED to the admin log.
+    startDailyLoginAlertScheduler(loginActivity, loginActivityRepo, {
+      transports,
+      onError: (e) => nestedLog.warn('daily login alert tick failed', { message: redact(String(e)) }),
+    });
+
   });
 
   // A port collision is the exact failure that hid the real app behind a stale
