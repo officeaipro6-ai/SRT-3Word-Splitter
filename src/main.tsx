@@ -3,6 +3,7 @@ import {createRoot} from 'react-dom/client';
 import App from './App.tsx';
 import {AdminApp} from './components/AdminApp.tsx';
 import {RouteNotFound} from './components/RouteNotFound.tsx';
+import {ErrorBoundary} from './components/ErrorBoundary.tsx';
 import {resolveRouteTarget} from './routeTarget.ts';
 import './index.css';
 
@@ -31,4 +32,8 @@ document.title =
       ? 'Odia SRT — Audio/Video → Tagged SRT'
       : 'Page not found — Odia SRT';
 
-createRoot(document.getElementById('root')!).render(<StrictMode>{surface}</StrictMode>);
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <ErrorBoundary>{surface}</ErrorBoundary>
+  </StrictMode>
+);

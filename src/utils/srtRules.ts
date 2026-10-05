@@ -686,7 +686,13 @@ export function auditRuleCompliance(segments: SubtitleSegment[]): {
     ruleD: { passed: boolean; count: number; description: string };
     ruleE: { passed: boolean; count: number; description: string; ignoredCount: number };
     ruleMB: { passed: boolean; count: number; description: string };
-    wordLimitRule: { passed: boolean; maxWords: number; nonCompliantCount: number; description: string };
+    timingRule: {
+      passed: boolean;
+      minDuration: number;
+      maxDuration: number;
+      nonCompliantCount: number;
+      description: string;
+    };
   };
   warnings: string[];
 } {

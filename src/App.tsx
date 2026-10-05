@@ -12,6 +12,7 @@ import { SubtitleTable } from './components/SubtitleTable';
 import { RawSrtViewer } from './components/RawSrtViewer';
 import { RuleComplianceAudit } from './components/RuleComplianceAudit';
 import { ExportToolbar } from './components/ExportToolbar';
+import { RotateCcw } from 'lucide-react';
 import { RulesGuideModal } from './components/RulesGuideModal';
 import { CreditsWidget } from './components/CreditsWidget';
 import { CommunitySupport } from './components/CommunitySupport';
@@ -829,6 +830,37 @@ export default function App() {
               copied={copied}
               onReset={handleReset}
             />
+          </div>
+        )}
+
+        {/* COMPLETED WITH NO SUBTITLES: the pipeline finished successfully but the
+            audio produced no subtitle cues (e.g. no speech was detected). Without
+            this state the landing page is hidden (a result exists), the progress
+            view is hidden (processing finished) and the results view is hidden
+            (zero segments), which left the page completely blank. */}
+        {!isProcessing && transcriptionResult && segments.length === 0 && (
+          <div className="rounded-2xl border-2 border-amber-300 bg-amber-50 p-6 space-y-3">
+            <div className="text-sm font-extrabold uppercase tracking-wide text-amber-900">
+              No subtitles were generated
+            </div>
+            <p className="text-sm text-amber-900">
+              Processing finished, but no speech could be transcribed from this file, so there are no
+              subtitle cues to preview or download.
+            </p>
+            <p className="text-xs text-amber-800">
+              Language: {transcriptionResult.languageName} ({transcriptionResult.languageCode}). This
+              usually means the upload contains only music, noise or complete silence, or the speech is
+              too quiet or too unclear for the transcription provider to recognise.
+            </p>
+            <button
+              type="button"
+              onClick={handleReset}
+              id="btn-empty-result-reset"
+              className="inline-flex items-center gap-2 rounded-xl bg-amber-600 px-4 py-2 text-xs font-bold text-white transition hover:bg-amber-700"
+            >
+              <RotateCcw className="w-4 h-4" />
+              <span>Try another file</span>
+            </button>
           </div>
         )}
       </main>

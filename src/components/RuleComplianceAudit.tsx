@@ -40,7 +40,7 @@ export const RuleComplianceAudit: React.FC<RuleComplianceAuditProps> = ({ segmen
           <div className="flex items-center justify-between">
             <span className="font-bold text-xs text-indigo-950">Timing Rule (2–4s)</span>
             <span className="font-mono text-xs font-bold px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-800">
-              {audit.ruleChecks.wordLimitRule.passed ? '✓ Compliant' : `${audit.ruleChecks.wordLimitRule.nonCompliantCount} Exceeds`}
+              {audit.ruleChecks.timingRule.passed ? '✓ Compliant' : `${audit.ruleChecks.timingRule.nonCompliantCount} Exceeds`}
             </span>
           </div>
           <p className="text-[11px] text-indigo-900/80">
