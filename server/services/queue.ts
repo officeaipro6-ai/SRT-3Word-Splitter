@@ -105,9 +105,12 @@ export class JobQueue {
    */
   async rehydrate(): Promise<void> {
     const now = new Date().toISOString();
-    for (const job of this.repo.listProcessing()) {
+    // Async: JobRepo.listProcessing() awaits the libSQL provider's
+    // getProcessingJobs(). Calling it without await is what threw
+    // "Cannot read properties of undefined (reading 'filter')" in production.
+    for (const job of await this.repo.listProcessing()) {
       await this.credits.refundFinishedJob(job.userId, job.id, 'refund_interrupted_job');
-      this.repo.update(job.id, {
+      await this.repo.update(job.id, {
         status: 'FAILED',
         errorCode: 'INTERRUPTED',
         lastError: 'Server restarted while the job was processing.',
@@ -136,9 +139,9 @@ start(): void {
   /** Process at most one job per tick (single concurrency). */
   async tick(): Promise<void> {
     if (this.busy) return;
-    const job = this.repo
-      .listEligibleQueued(new Date().toISOString())
-      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0];
+    const job = (
+      await this.repo.listEligibleQueued(new Date().toISOString())
+    ).sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0];
     if (!job) return;
     this.busy = true;
     try {
@@ -149,7 +152,7 @@ start(): void {
   }
 
   private async processWithTimeout(job: JobRecord): Promise<void> {
-    if (!this.repo.update(job.id, { status: 'PROCESSING', startedAt: new Date().toISOString(), nextRetryAt: undefined })) {
+    if (!(await this.repo.update(job.id, { status: 'PROCESSING', startedAt: new Date().toISOString(), nextRetryAt: undefined }))) {
       return;
     }
     const timeout = new Promise<never>((_, reject) => {
@@ -158,7 +161,7 @@ start(): void {
     try {
       const result = await Promise.race([this.processOne(job), timeout]);
       const now = new Date().toISOString();
-      this.repo.update(job.id, {
+      await this.repo.update(job.id, {
         status: 'COMPLETED',
         output: {
           srtKey: srtKey(job.id),
@@ -244,7 +247,7 @@ start(): void {
         : transient
           ? 'TRANSIENT'
           : 'TRANSCRIPTION_FAILED';
-    this.repo.update(job.id, {
+    await this.repo.update(job.id, {
       status: 'FAILED',
       completedAt: now,
       lastError: message.slice(0, 2000),

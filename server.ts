@@ -1840,8 +1840,8 @@ const loginActivity = new LoginActivityService(loginActivityRepo);
           });
         }
         validateUpload({ mimeType: file.mimetype || 'audio/wav', sizeBytes: file.size });
-        const active = jobs.countActiveForUser(user.id);
-        assertWithinActiveJobLimit(active);
+const active = await jobs.countActiveForUser(user.id);
+      assertWithinActiveJobLimit(active);
 
         // Provider safety gate: while the LOCALLY STORED state is BLOCKED (a
         // reliable 402 / insufficient-quota report, or the operator
@@ -1878,10 +1878,10 @@ const loginActivity = new LoginActivityService(loginActivityRepo);
           throw putErr;
         }
 
-        const now = new Date().toISOString();
-        jobs.create({
-          id: jobId,
-          userId: user.id,
+const now = new Date().toISOString();
+      await jobs.create({
+        id: jobId,
+        userId: user.id,
           status: 'QUEUED',
           provider: getAsrProviderName(),
           input: {
@@ -1897,8 +1897,8 @@ const loginActivity = new LoginActivityService(loginActivityRepo);
           createdAt: now,
           retryCount: 0,
         });
-        const job = jobs.getForUser(jobId, user.id) as JobRecord;
-        nestedLog.info('job enqueued', { jobId, userId: user.id, sizeBytes: file.size });
+const job = (await jobs.getForUser(jobId, user.id)) as JobRecord;
+      nestedLog.info('job enqueued', { jobId, userId: user.id, sizeBytes: file.size });
         return res.status(202).json({ job: publicJob(job) });
       } catch (err: any) {
         if (err instanceof UploadError) {
@@ -1920,26 +1920,26 @@ const loginActivity = new LoginActivityService(loginActivityRepo);
   );
 
   // List own jobs (ownership-filtered), optional ?status= filter.
-  app.get('/api/jobs', auth(), (req, res) => {
+  app.get('/api/jobs', auth(), asyncRoute(async (req, res) => {
     const user = res.locals.user;
     const statusParam = String(req.query.status || '').trim().toUpperCase();
     const status = isJobStatus(statusParam) ? statusParam : undefined;
-    const list = jobs.listForUser(user.id, status).map(publicJob);
+    const list = (await jobs.listForUser(user.id, status)).map(publicJob);
     res.json({ jobs: list });
-  });
+  }));
 
   // Own-job detail (ownership-checked; 404 for other users' jobs).
-  app.get('/api/jobs/:id', auth(), (req, res) => {
+  app.get('/api/jobs/:id', auth(), asyncRoute(async (req, res) => {
     const user = res.locals.user;
-    const job = jobs.getForUser(req.params.id, user.id);
+    const job = await jobs.getForUser(req.params.id, user.id);
     if (!job) return res.status(404).json({ error: 'Job not found.' });
     res.json({ job: publicJob(job) });
-  });
+  }));
 
   // Stream own completed SRT (ownership-checked).
-  app.get('/api/jobs/:id/srt', auth(), (req, res) => {
+  app.get('/api/jobs/:id/srt', auth(), asyncRoute(async (req, res) => {
     const user = res.locals.user;
-    const job = jobs.getForUser(req.params.id, user.id);
+    const job = await jobs.getForUser(req.params.id, user.id);
     if (!job) return res.status(404).json({ error: 'Job not found.' });
     if (job.status !== 'COMPLETED' || !job.output) {
       return res.status(409).json({ error: `SRT is not ready yet (job status: ${job.status}).` });
@@ -1948,20 +1948,20 @@ const loginActivity = new LoginActivityService(loginActivityRepo);
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
     res.send(job.output.rawSrt);
-  });
+  }));
 
   // Cancel an unstarted/running own job (refunds the charge).
   app.post('/api/jobs/:id/cancel', auth(), asyncRoute(async (req, res) => {
     const user = res.locals.user;
-    const job = jobs.getForUser(req.params.id, user.id);
+    const job = await jobs.getForUser(req.params.id, user.id);
     if (!job) return res.status(404).json({ error: 'Job not found.' });
     if (job.status === 'COMPLETED' || job.status === 'FAILED' || job.status === 'CANCELLED') {
       return res.status(409).json({ error: `Job cannot be cancelled (status: ${job.status}).` });
     }
-    jobs.update(job.id, { status: 'CANCELLED', completedAt: new Date().toISOString() });
+    await jobs.update(job.id, { status: 'CANCELLED', completedAt: new Date().toISOString() });
     await credits.refundFinishedJob(user.id, job.id, 'refund_cancelled_job');
     nestedLog.info('job cancelled', { jobId: job.id, userId: user.id });
-    const updated = jobs.getForUser(job.id, user.id) as JobRecord;
+    const updated = (await jobs.getForUser(job.id, user.id)) as JobRecord;
     res.json({ job: publicJob(updated) });
   }));
 
@@ -2498,13 +2498,13 @@ const loginActivity = new LoginActivityService(loginActivityRepo);
 
 
   // All jobs across users (admin Jobs dashboard).
-  app.get('/api/admin/jobs', auth(), requireAdmin, (req, res) => {
+  app.get('/api/admin/jobs', auth(), requireAdmin, asyncRoute(async (req, res) => {
     const limit = Math.min(Number(req.query.limit) || 200, 500);
     const userId = typeof req.query.userId === 'string' ? req.query.userId : undefined;
-    let list = jobs.listAll(limit);
+    let list = await jobs.listAll(limit);
     if (userId) list = list.filter((j) => j.userId === userId);
     res.json({ jobs: list.map(adminJobView) });
-  });
+  }));
 
   /**
    * CANONICAL manual credit adjustment.

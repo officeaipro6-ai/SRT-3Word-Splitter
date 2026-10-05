@@ -40,16 +40,16 @@ test('users: create/find-by-token touch correctly', async () => {
 test('jobs: ownership filtering and status transitions', async () => {
   const { store, jobs } = makeRepos();
   await store.init();
-  const a = jobs.create(sampleJob('u1'));
-  const b = jobs.create(sampleJob('u2'));
-  jobs.update(a.id, { status: 'PROCESSING' });
-  assert.equal(jobs.getForUser(a.id, 'u1')?.status, 'PROCESSING');
-  assert.equal(jobs.getForUser(a.id, 'u2'), null); // other user cannot see it
-  assert.equal(jobs.countActiveForUser('u1'), 1);
-  assert.equal(jobs.listForUser('u2').length, 1);
-  jobs.update(a.id, { status: 'COMPLETED', output: { srtKey: 'srt/a.srt', rawSrt: '', segmentCount: 1, wordCount: 3, provider: 'sarvam' } });
-  assert.equal(jobs.countActiveForUser('u1'), 0);
-  assert.equal(jobs.listForUser('u1', 'COMPLETED').length, 1);
+  const a = await jobs.create(sampleJob('u1'));
+  const b = await jobs.create(sampleJob('u2'));
+  await jobs.update(a.id, { status: 'PROCESSING' });
+  assert.equal((await jobs.getForUser(a.id, 'u1'))?.status, 'PROCESSING');
+  assert.equal(await jobs.getForUser(a.id, 'u2'), null); // other user cannot see it
+  assert.equal(await jobs.countActiveForUser('u1'), 1);
+  assert.equal((await jobs.listForUser('u2')).length, 1);
+  await jobs.update(a.id, { status: 'COMPLETED', output: { srtKey: 'srt/a.srt', rawSrt: '', segmentCount: 1, wordCount: 3, provider: 'sarvam' } });
+  assert.equal(await jobs.countActiveForUser('u1'), 0);
+  assert.equal((await jobs.listForUser('u1', 'COMPLETED')).length, 1);
   assert.equal(isJobStatus('FAILED'), true);
   assert.equal(isJobStatus('wat'), false);
 });
@@ -57,10 +57,10 @@ test('jobs: ownership filtering and status transitions', async () => {
 test('jobs: retry backoff gates queue eligibility', async () => {
   const { store, jobs } = makeRepos();
   await store.init();
-  const queued = jobs.create(sampleJob('u1'));
-  const pending = jobs.create(sampleJob('u2'));
-  jobs.update(pending.id, { nextRetryAt: new Date(Date.now() + 60_000).toISOString() });
-  const eligible = jobs.listEligibleQueued(new Date().toISOString()).map((j) => j.id);
+  const queued = await jobs.create(sampleJob('u1'));
+  const pending = await jobs.create(sampleJob('u2'));
+  await jobs.update(pending.id, { nextRetryAt: new Date(Date.now() + 60_000).toISOString() });
+  const eligible = (await jobs.listEligibleQueued(new Date().toISOString())).map((j) => j.id);
   assert.ok(eligible.includes(queued.id));
   assert.ok(!eligible.includes(pending.id)); // backoff not elapsed -> not eligible
 });
@@ -134,62 +134,62 @@ test('users: payment-ready fields are optional and persisted', async () => {
 // ---------------------------------------------------------------------------
 
 /** Two jobs with distinct, assertable field values. */
-function seedJobs(jobs: JobRepo) {
-  const a = jobs.create(sampleJob('u1'));
-  const b = jobs.create(sampleJob('u2'));
+async function seedJobs(jobs: JobRepo) {
+  const a = await jobs.create(sampleJob('u1'));
+  const b = await jobs.create(sampleJob('u2'));
   return { a, b };
 }
 
 test('5C5-A1. a normal job update still works end to end', async () => {
   const { store, jobs } = makeRepos();
   await store.init();
-  const { a, b } = seedJobs(jobs);
+  const { a, b } = await seedJobs(jobs);
 
-  const updated = jobs.update(a.id, { status: 'PROCESSING', startedAt: '2026-01-02T00:00:00.000Z' });
+  const updated = await jobs.update(a.id, { status: 'PROCESSING', startedAt: '2026-01-02T00:00:00.000Z' });
   assert.equal(updated!.id, a.id);
   assert.equal(updated!.status, 'PROCESSING');
   assert.equal(updated!.startedAt, '2026-01-02T00:00:00.000Z');
-  assert.equal(jobs.get(a.id)!.status, 'PROCESSING', 'the write is readable back');
-  assert.equal(jobs.get(b.id)!.status, 'QUEUED', 'the other job is untouched');
+  assert.equal((await jobs.get(a.id))!.status, 'PROCESSING', 'the write is readable back');
+  assert.equal((await jobs.get(b.id))!.status, 'QUEUED', 'the other job is untouched');
 });
 
 test('5C5-A2. patch.id cannot rewrite the job primary key', async () => {
   const { store, jobs } = makeRepos();
   await store.init();
-  const { a, b } = seedJobs(jobs);
+  const { a, b } = await seedJobs(jobs);
 
   // The patch names b while the argument names a.
-  const updated = jobs.update(a.id, { id: b.id, status: 'FAILED' } as Partial<JobRecord>);
+  const updated = await jobs.update(a.id, { id: b.id, status: 'FAILED' } as Partial<JobRecord>);
 
   assert.equal(updated!.id, a.id, 'the ARGUMENT id is authoritative');
   assert.equal(updated!.status, 'FAILED', 'the other fields still merge');
-  assert.equal(jobs.get(a.id)!.id, a.id, 'a keeps its own id');
-  assert.equal(jobs.get(b.id)!.id, b.id, 'b keeps its own id');
-  assert.equal(jobs.get(b.id)!.status, 'QUEUED', 'b is not redirected-to or modified');
-  assert.equal(jobs.listAll().length, 2, 'no record is created or lost');
+  assert.equal((await jobs.get(a.id))!.id, a.id, 'a keeps its own id');
+  assert.equal((await jobs.get(b.id))!.id, b.id, 'b keeps its own id');
+  assert.equal((await jobs.get(b.id))!.status, 'QUEUED', 'b is not redirected-to or modified');
+  assert.equal((await jobs.listAll()).length, 2, 'no record is created or lost');
 });
 
 test('5C5-A3. an id-only patch is a no-op', async () => {
   const { store, jobs } = makeRepos();
   await store.init();
-  const { a } = seedJobs(jobs);
-  const before = jobs.get(a.id)!;
+  const { a } = await seedJobs(jobs);
+  const before = (await jobs.get(a.id))!;
 
-  const updated = jobs.update(a.id, { id: 'someone-else' } as Partial<JobRecord>);
+  const updated = await jobs.update(a.id, { id: 'someone-else' } as Partial<JobRecord>);
 
   assert.equal(updated!.id, a.id);
-  assert.deepEqual(jobs.get(a.id), before, 'nothing about the job changed');
+  assert.deepEqual(await jobs.get(a.id), before, 'nothing about the job changed');
 });
 
 test('5C5-A4. unrelated fields remain unchanged', async () => {
   const { store, jobs } = makeRepos();
   await store.init();
-  const { a } = seedJobs(jobs);
-  const before = jobs.get(a.id)!;
+  const { a } = await seedJobs(jobs);
+  const before = (await jobs.get(a.id))!;
 
-  jobs.update(a.id, { status: 'COMPLETED', completedAt: '2026-01-03T00:00:00.000Z' });
+  await jobs.update(a.id, { status: 'COMPLETED', completedAt: '2026-01-03T00:00:00.000Z' });
 
-  const after = jobs.get(a.id)!;
+  const after = (await jobs.get(a.id))!;
   assert.equal(after.status, 'COMPLETED');
   assert.equal(after.completedAt, '2026-01-03T00:00:00.000Z');
   assert.equal(after.userId, before.userId, 'userId untouched');
@@ -203,43 +203,43 @@ test('5C5-A4. unrelated fields remain unchanged', async () => {
 test('5C5-A5. an unknown job id changes nothing', async () => {
   const { store, jobs } = makeRepos();
   await store.init();
-  const { a } = seedJobs(jobs);
-  const before = jobs.listAll();
+  const { a } = await seedJobs(jobs);
+  const before = await jobs.listAll();
 
-  const updated = jobs.update('no-such-job', { status: 'COMPLETED' });
+  const updated = await jobs.update('no-such-job', { status: 'COMPLETED' });
 
   assert.equal(updated, null, 'unknown id returns null, as before');
-  assert.deepEqual(jobs.listAll(), before, 'no record was added or modified');
-  assert.equal(jobs.get(a.id)!.status, 'QUEUED');
+  assert.deepEqual(await jobs.listAll(), before, 'no record was added or modified');
+  assert.equal((await jobs.get(a.id))!.status, 'QUEUED');
 });
 
 test('5C5-A6. input/output and other JSON-ish fields still merge unchanged', async () => {
   const { store, jobs } = makeRepos();
   await store.init();
-  const { a } = seedJobs(jobs);
+  const { a } = await seedJobs(jobs);
   const output = { srtKey: 'srt/a.srt', rawSrt: '1\nx\n', segmentCount: 1, wordCount: 1, provider: 'sarvam' };
   const input = { storageKey: 'uploads/y.mp3', originalName: 'y.mp3', mimeType: 'audio/mpeg', sizeBytes: 20, sha256: 'h2', durationSeconds: 3 };
 
-  const updated = jobs.update(a.id, { output, input, retryCount: 2, nextRetryAt: undefined, lastError: 'boom' } as Partial<JobRecord>);
+  const updated = await jobs.update(a.id, { output, input, retryCount: 2, nextRetryAt: undefined, lastError: 'boom' } as Partial<JobRecord>);
 
   assert.deepEqual(updated!.output, output, 'output merges verbatim');
   assert.deepEqual(updated!.input, input, 'input merges verbatim');
   assert.equal(updated!.retryCount, 2);
   assert.equal(updated!.nextRetryAt, undefined, 'explicit undefined still clears the field');
   assert.equal(updated!.lastError, 'boom');
-  assert.equal(jobs.get(a.id)!.retryCount, 2, 'persisted');
+  assert.equal((await jobs.get(a.id))!.retryCount, 2, 'persisted');
 });
 
 test('5C5-A7. the returned record is a defensive clone, not the live row', async () => {
   const { store, jobs } = makeRepos();
   await store.init();
-  const { a } = seedJobs(jobs);
+  const { a } = await seedJobs(jobs);
 
-  const first = jobs.update(a.id, { status: 'PROCESSING' })!;
+  const first = (await jobs.update(a.id, { status: 'PROCESSING' }))!;
   first.status = 'FAILED';
   first.retryCount = 999;
 
-  const fresh = jobs.get(a.id)!;
+  const fresh = (await jobs.get(a.id))!;
   assert.equal(fresh.status, 'PROCESSING', 'mutating the clone must not affect storage');
   assert.equal(fresh.retryCount, 0);
 });

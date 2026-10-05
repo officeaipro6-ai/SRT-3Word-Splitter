@@ -7,6 +7,7 @@
  */
 import { randomUUID } from 'crypto';
 import { DataStore, normalizeProviderSafety } from './store';
+import type { TursoStore } from './tursoStore';
   import {
     type UserRecord,
     type JobRecord,
@@ -458,27 +459,86 @@ return txn ? structuredClone(txn) : null;
   }
 }
 
+/**
+ * The per-entity async surface JobRepo needs when the libSQL provider is
+ * mounted. Declared structurally and TYPE-ONLY so this file keeps zero runtime
+ * dependency on the libSQL driver (the same discipline `dataStore.ts` follows);
+ * the guard below detects it by shape, never by importing the class.
+ */
+type TursoJobStore = Pick<
+  TursoStore,
+  | 'createJob'
+  | 'getJobById'
+  | 'getJobsByUser'
+  | 'updateJob'
+  | 'getEligibleQueued'
+  | 'getProcessingJobs'
+  | 'getQueuedJobs'
+  | 'getAllJobs'
+>;
+
+/**
+ * True when the mounted store is the libSQL provider.
+ *
+ * `TursoStore.snapshot()` is async and `mutate()` throws by design, so every
+ * synchronous snapshot() read in this file returns `undefined` against it — the
+ * production crash `Cannot read properties of undefined (reading 'filter')` in
+ * JobRepo.listProcessing() was exactly that. Detection is structural because a
+ * value import of TursoStore would drag the libSQL driver into the JSON path.
+ */
+function isTursoJobStore(store: DataStore): store is DataStore & TursoJobStore {
+  return typeof (store as unknown as Partial<TursoJobStore>).getProcessingJobs === 'function';
+}
+
+/**
+ * Jobs repository over BOTH providers.
+ *
+ * Every method is async. That is the one deliberate change to this class, and it
+ * mirrors the credit layer: `AsyncCreditService` already wraps the JSON
+ * provider's synchronous methods so one call site serves both providers (a sync
+ * throw becomes a rejection at the same `await`). The JSON provider's ordering
+ * and behaviour are untouched — the synchronous work still happens on the same
+ * tick, it is merely awaited at the call site.
+ *
+ * The libSQL branch uses the per-entity async methods TursoStore already
+ * exposes (getProcessingJobs, getEligibleQueued, updateJob, ...). It never
+ * calls snapshot()/mutate(), which that provider does not support.
+ */
 export class JobRepo {
   constructor(private readonly store: DataStore) {}
 
-  create(job: JobRecord): JobRecord {
+  async create(job: JobRecord): Promise<JobRecord> {
+    if (isTursoJobStore(this.store)) {
+      await this.store.createJob(job);
+      return structuredClone(job);
+    }
     this.store.mutate((db) => {
       db.jobs.push(structuredClone(job));
     });
     return structuredClone(job);
   }
 
-  get(id: string): JobRecord | null {
+  async get(id: string): Promise<JobRecord | null> {
+    if (isTursoJobStore(this.store)) {
+      return (await this.store.getJobById(id)) ?? null;
+    }
     return this.store.snapshot().jobs.find((j) => j.id === id) ?? null;
   }
 
-  getForUser(id: string, userId: string): JobRecord | null {
-    const job = this.get(id);
+  async getForUser(id: string, userId: string): Promise<JobRecord | null> {
+    const job = await this.get(id);
     if (!job || job.userId !== userId) return null;
     return structuredClone(job);
   }
 
-  listForUser(userId: string, status?: JobStatus): JobRecord[] {
+  async listForUser(userId: string, status?: JobStatus): Promise<JobRecord[]> {
+    if (isTursoJobStore(this.store)) {
+      const rows = await this.store.getJobsByUser(userId);
+      return rows
+        .filter((j) => !status || j.status === status)
+        .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
+        .map((j) => structuredClone(j));
+    }
     return this.store
       .snapshot()
       .jobs.filter((j) => j.userId === userId && (!status || j.status === status))
@@ -486,32 +546,50 @@ export class JobRepo {
       .map((j) => structuredClone(j));
   }
 
-  countActiveForUser(userId: string): number {
+  async countActiveForUser(userId: string): Promise<number> {
+    if (isTursoJobStore(this.store)) {
+      const rows = await this.store.getJobsByUser(userId);
+      return rows.filter((j) => j.status === 'QUEUED' || j.status === 'PROCESSING').length;
+    }
     return this.store
       .snapshot()
       .jobs.filter((j) => j.userId === userId && (j.status === 'QUEUED' || j.status === 'PROCESSING'))
       .length;
   }
 
-  update(id: string, patch: Partial<JobRecord>): JobRecord | null {
+  async update(id: string, patch: Partial<JobRecord>): Promise<JobRecord | null> {
+    // A job id is minted once (randomUUID at enqueue) and is load-bearing
+    // outside this record: srtKey()/uploadKey() derive storage object paths
+    // from it, and creditTxnId / refundFinishedJob() key on it. Object.assign
+    // would copy a patch.id straight over the primary key, which silently
+    // orphans those storage objects and desynchronises the credit ledger.
+    // The explicit `id` argument stays authoritative; every other field in
+    // the patch is merged exactly as before. Mirrors TursoStore.updateJob().
+    const { id: _ignoredPatchId, ...mergeable } = patch;
+
+    if (isTursoJobStore(this.store)) {
+      // updateJob() reports nothing, so the not-found case is settled by an
+      // explicit existence read: the JSON branch returns null for a missing id
+      // and callers (queue claim, cancel) branch on that null.
+      if (!(await this.store.getJobById(id))) return null;
+      await this.store.updateJob(id, mergeable);
+      return (await this.store.getJobById(id)) ?? null;
+    }
+
     return this.store.mutate((db) => {
       const job = db.jobs.find((j) => j.id === id);
       if (!job) return null;
-      // A job id is minted once (randomUUID at enqueue) and is load-bearing
-      // outside this record: srtKey()/uploadKey() derive storage object paths
-      // from it, and creditTxnId / refundFinishedJob() key on it. Object.assign
-      // would copy a patch.id straight over the primary key, which silently
-      // orphans those storage objects and desynchronises the credit ledger.
-      // The explicit `id` argument stays authoritative; every other field in
-      // the patch is merged exactly as before. Mirrors TursoStore.updateJob().
-      const { id: _ignoredPatchId, ...mergeable } = patch;
       Object.assign(job, mergeable);
       return structuredClone(job);
     });
   }
 
   /** All QUEUED jobs that are eligible now (respecting retry backoff). */
-  listEligibleQueued(nowIso: string): JobRecord[] {
+  async listEligibleQueued(nowIso: string): Promise<JobRecord[]> {
+    if (isTursoJobStore(this.store)) {
+      const rows = await this.store.getEligibleQueued(nowIso);
+      return rows.map((j) => structuredClone(j));
+    }
     return this.store
       .snapshot()
       .jobs.filter(
@@ -523,16 +601,28 @@ export class JobRepo {
   }
 
   /** All PROCESSING jobs (for rehydration on boot). */
-  listProcessing(): JobRecord[] {
+  async listProcessing(): Promise<JobRecord[]> {
+    if (isTursoJobStore(this.store)) {
+      const rows = await this.store.getProcessingJobs();
+      return rows.map((j) => structuredClone(j));
+    }
     return this.store.snapshot().jobs.filter((j) => j.status === 'PROCESSING').map((j) => structuredClone(j));
   }
 
-  listQueued(): JobRecord[] {
+  async listQueued(): Promise<JobRecord[]> {
+    if (isTursoJobStore(this.store)) {
+      const rows = await this.store.getQueuedJobs();
+      return rows.map((j) => structuredClone(j));
+    }
     return this.store.snapshot().jobs.filter((j) => j.status === 'QUEUED').map((j) => structuredClone(j));
   }
 
   /** All jobs across all users (admin Jobs dashboard), newest first. */
-  listAll(limit = 200): JobRecord[] {
+  async listAll(limit = 200): Promise<JobRecord[]> {
+    if (isTursoJobStore(this.store)) {
+      const rows = await this.store.getAllJobs(limit);
+      return rows.map((j) => structuredClone(j));
+    }
     return this.store
       .snapshot()
       .jobs.slice()

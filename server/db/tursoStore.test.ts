@@ -1683,22 +1683,22 @@ test('5C4-F. the JSON JobRepo now matches Turso: patch.id cannot rewrite the key
   await jsonStore.init();
   const repo = new JobRepo(jsonStore);
   const input = { storageKey: 'uploads/a.wav', originalName: 'a.mp3', mimeType: 'audio/mpeg', sizeBytes: 1, sha256: 'x', durationSeconds: 0 };
-  repo.create({ id: 'job-1', userId: 'u1', status: 'QUEUED', provider: 'sarvam', input, createdAt: '2026-01-01T00:00:00.000Z', retryCount: 0 } as any);
-  repo.create({ id: 'job-2', userId: 'u1', status: 'PROCESSING', provider: 'sarvam', input, createdAt: '2026-01-01T00:00:00.000Z', retryCount: 2 } as any);
+  await repo.create({ id: 'job-1', userId: 'u1', status: 'QUEUED', provider: 'sarvam', input, createdAt: '2026-01-01T00:00:00.000Z', retryCount: 0 } as any);
+  await repo.create({ id: 'job-2', userId: 'u1', status: 'PROCESSING', provider: 'sarvam', input, createdAt: '2026-01-01T00:00:00.000Z', retryCount: 2 } as any);
 
-  const updated = repo.update('job-1', { status: 'COMPLETED', completedAt: '2026-01-03T00:00:00.000Z' });
+  const updated = await repo.update('job-1', { status: 'COMPLETED', completedAt: '2026-01-03T00:00:00.000Z' });
   assert.equal(updated!.status, 'COMPLETED');
   assert.equal(updated!.id, 'job-1', 'id preserved on a normal patch');
-  assert.equal(repo.get('job-2')!.status, 'PROCESSING', 'the other job is untouched');
-  assert.equal(repo.get('job-1')!.retryCount, 0, 'unpatched fields preserved');
+  assert.equal((await repo.get('job-2'))!.status, 'PROCESSING', 'the other job is untouched');
+  assert.equal((await repo.get('job-1'))!.retryCount, 0, 'unpatched fields preserved');
 
   // Stage 5C-5 Part A closed the divergence this test used to document: JSON's
   // Object.assign copied patch.id and persisted two rows sharing one id, while
   // Turso refused it. Both backends now refuse it, so assert the aligned contract.
-  repo.update('job-1', { id: 'job-2' } as any);
-  assert.equal(repo.get('job-1')!.id, 'job-1', 'the job keeps its own id');
-  assert.equal(repo.get('job-2')!.status, 'PROCESSING', 'job-2 is not written through');
-  assert.equal(repo.listAll().length, 2, 'no duplicate id is produced');
+  await repo.update('job-1', { id: 'job-2' } as any);
+  assert.equal((await repo.get('job-1'))!.id, 'job-1', 'the job keeps its own id');
+  assert.equal((await repo.get('job-2'))!.status, 'PROCESSING', 'job-2 is not written through');
+  assert.equal((await repo.listAll()).length, 2, 'no duplicate id is produced');
 
   // And it is persisted: two DISTINCT primary keys on disk. mutate() only queues
   // its write, so flush via the public async variant before reading, otherwise
@@ -1827,4 +1827,133 @@ test('5C5-B3. it matches JSON forJobAndType on the same seeded ledger', async ()
   assert.equal(await store.getTransactionByJobAndType('u1', 'job-1', 'ADMIN_CREDIT'), null);
   // ...but the idempotency path still finds it, which is why both are needed.
   assert.equal((await store.getTransactionByIdempotencyKey('adm-1', 'u1'))!.id, 't-admin');
+});
+
+// ---------------------------------------------------------------------------
+// Production crash regression: JobRepo over the libSQL provider.
+//
+// `TypeError: Cannot read properties of undefined (reading 'filter')` at
+// JobRepo.listProcessing() crashed the Render boot inside
+// JobQueue.rehydrate() on the Turso deployment. Cause: every JobRepo read was
+// `this.store.snapshot().jobs`, and TursoStore.snapshot() is ASYNC, so `.jobs`
+// was undefined on a synchronous access. JobRepo now dispatches to the
+// per-entity async methods; these tests pin that dispatch, because the old
+// synchronous reads silently degraded to "no jobs" anywhere they were merely
+// undefined rather than throwing (the tick loop swallowed them via
+// runDetached), so the queue would have silently stopped processing jobs.
+// ---------------------------------------------------------------------------
+
+/** A realistic job row; only the fields these tests assert on matter. */
+function tursoJob(id: string, status: string, extra: Record<string, unknown> = {}) {
+  return {
+    id,
+    userId: 'u1',
+    status,
+    provider: 'sarvam',
+    input: { storageKey: `uploads/${id}.mp3`, originalName: `${id}.mp3`, mimeType: 'audio/mpeg', sizeBytes: 1, sha256: 'x', durationSeconds: 0 },
+    createdAt: '2026-01-01T00:00:00.000Z',
+    retryCount: 0,
+    ...extra,
+  } as any;
+}
+
+/** Seed the user a job's FK points at, so createJob() satisfies the constraint. */
+async function seedJobUser(store: TursoStore, userId: string): Promise<void> {
+  if (!(await store.getUserById(userId))) {
+    await store.createUser({ id: userId, email: `${userId}@example.test`, role: 'USER', credits: 0, tokenHashes: [], createdAt: '2026-01-01T00:00:00.000Z' } as any);
+  }
+}
+
+test('6B-J1. listProcessing() returns PROCESSING jobs over libSQL (the boot-crash regression)', async () => {
+  const { store } = await openStore();
+  const repo = new JobRepo(store as unknown as DataStore);
+  await seedJobUser(store, 'u1');
+  await repo.create(tursoJob('j-q', 'QUEUED'));
+  await repo.create(tursoJob('j-p1', 'PROCESSING'));
+  await repo.create(tursoJob('j-d', 'COMPLETED'));
+  await repo.create(tursoJob('j-p2', 'PROCESSING'));
+
+  const processing = await repo.listProcessing();
+  assert.deepEqual(processing.map((j) => j.id).sort(), ['j-p1', 'j-p2']);
+  // The fields rehydrate() reads to refund + mark FAILED must survive intact.
+  assert.equal(processing[0].userId, 'u1');
+  assert.equal(typeof processing[0].input.storageKey, 'string');
+});
+
+test('6B-J2. listProcessing() on an empty table resolves to [] rather than throwing', async () => {
+  const { store } = await openStore();
+  const repo = new JobRepo(store as unknown as DataStore);
+  // This exact shape is what production hit: an empty jobs table made
+  // snapshot().jobs undefined, and `.filter` on it was the crash.
+  assert.deepEqual(await repo.listProcessing(), []);
+});
+
+test('6B-J3. every JobRepo read dispatches to libSQL per-entity methods', async () => {
+  const { store } = await openStore();
+  const repo = new JobRepo(store as unknown as DataStore);
+  await seedJobUser(store, 'u1');
+  await seedJobUser(store, 'u2');
+  await repo.create(tursoJob('j-q', 'QUEUED'));
+  await repo.create(tursoJob('j-p', 'PROCESSING', { userId: 'u2' }));
+
+  assert.equal((await repo.get('j-q'))!.status, 'QUEUED');
+  assert.equal(await repo.get('no-such-job'), null);
+  assert.equal((await repo.getForUser('j-p', 'u2'))!.id, 'j-p');
+  assert.equal(await repo.getForUser('j-p', 'u1'), null, 'ownership is still enforced on libSQL');
+  assert.equal((await repo.listForUser('u1')).length, 1);
+  assert.equal((await repo.listForUser('u1', 'QUEUED')).length, 1);
+  assert.equal(await repo.countActiveForUser('u1'), 1);
+  assert.deepEqual((await repo.listQueued()).map((j) => j.id), ['j-q']);
+  assert.equal((await repo.listAll()).length, 2);
+
+  // Backoff gating is the queue's eligibility rule, so it must match too.
+  await repo.create(tursoJob('j-later', 'QUEUED', { nextRetryAt: '2999-01-01T00:00:00.000Z' }));
+  const eligible = (await repo.listEligibleQueued('2026-01-02T00:00:00.000Z')).map((j) => j.id);
+  assert.ok(eligible.includes('j-q'));
+  assert.ok(!eligible.includes('j-later'), 'a future nextRetryAt is not eligible');
+});
+
+test('6B-J4. update() persists over libSQL and still returns null for an unknown id', async () => {
+  const { store } = await openStore();
+  const repo = new JobRepo(store as unknown as DataStore);
+  await seedJobUser(store, 'u1');
+  await repo.create(tursoJob('j-1', 'PROCESSING'));
+
+  const updated = await repo.update('j-1', {
+    status: 'FAILED',
+    errorCode: 'INTERRUPTED',
+    completedAt: '2026-01-03T00:00:00.000Z',
+  });
+  assert.equal(updated!.status, 'FAILED', 'the persisted row is read back');
+  assert.equal(updated!.errorCode, 'INTERRUPTED');
+  assert.equal((await store.getJobById('j-1'))!.status, 'FAILED', 'the write really landed');
+  assert.equal(await repo.update('no-such-job', { status: 'COMPLETED' }), null);
+});
+
+test('6B-J5. JobRepo over libSQL matches the JSON provider on the same job set', async () => {
+  // The two providers must not diverge on anything rehydrate()/tick() reads.
+  const file = join(mkdtempSync(join(tmpdir(), 'jobrepo-parity-')), 'app.db.json');
+  const jsonStore = new DataStore(file);
+  await jsonStore.init();
+  const json = new JobRepo(jsonStore);
+  const { store } = await openStore();
+  const turso = new JobRepo(store as unknown as DataStore);
+  await seedJobUser(store, 'u1');
+
+  for (const repo of [json, turso]) {
+    await repo.create(tursoJob('j-q', 'QUEUED'));
+    await repo.create(tursoJob('j-p', 'PROCESSING'));
+    await repo.create(tursoJob('j-d', 'COMPLETED'));
+  }
+
+  assert.deepEqual(
+    (await turso.listProcessing()).map((j) => j.id),
+    (await json.listProcessing()).map((j) => j.id),
+  );
+  assert.deepEqual((await turso.listQueued()).map((j) => j.id), (await json.listQueued()).map((j) => j.id));
+  assert.equal(await turso.countActiveForUser('u1'), await json.countActiveForUser('u1'));
+  assert.deepEqual(
+    (await turso.listAll()).map((j) => j.id).sort(),
+    (await json.listAll()).map((j) => j.id).sort(),
+  );
 });
