@@ -62,6 +62,13 @@ import {
   createTursoCreditFacade,
   type AsyncCreditService,
 } from './server/services/creditFacade';
+import {
+  createFileAccountFacade,
+  createTursoAccountFacade,
+  type AsyncAccountService,
+} from './server/services/accountFacade';
+import { TursoAccountService } from './server/services/tursoAccountService';
+import { TursoCreditService } from './server/services/tursoCreditService';
 import { asyncRoute, runDetached } from './server/http/asyncRoute';
 import {
   readRazorpayConfig,
@@ -655,15 +662,31 @@ async function startServer() {
 // ---------------------------------------------------------------------------
 // Initialize database provider
 let store: DataStoreProvider;
+let accounts: AsyncAccountService;
+let credits: AsyncCreditService;
 if (config.databaseProvider === 'turso') {
   if (!config.tursoDatabaseUrl || !config.tursoAuthToken) {
     throw new Error('Turso configuration required: TURSO_DATABASE_URL and TURSO_AUTH_TOKEN must be set when DATABASE_PROVIDER=turso');
   }
   const { createTursoStore } = await import('./server/db/tursoStore');
-  store = await createTursoStore(config.tursoDatabaseUrl, config.tursoAuthToken);
+  const tursoStore = await createTursoStore(config.tursoDatabaseUrl, config.tursoAuthToken);
+  store = tursoStore;
+  // Production runs the libSQL provider, which cannot back the SYNCHRONOUS
+  // `UserRepo` (`snapshot()` is a Promise there and `mutate()` throws). Mount
+  // the async account facade for this provider so signup/login/session resolve
+  // against real rows instead of throwing a 500.
+  accounts = createTursoAccountFacade(new TursoAccountService(tursoStore));
+  // The credit surface must be selected from the SAME provider as `accounts`.
+  // Leaving `FileCreditService` wired here was the second half of the outage:
+  // `CreditRepo.listForUser` reads the synchronous `snapshot()`, so `/api/credits/me`
+  // threw `Cannot read properties of undefined (reading 'filter')` and answered 500
+  // even once identity resolution had been fixed.
+  credits = createTursoCreditFacade(new TursoCreditService(tursoStore));
 } else {
   const { DataStore } = await import('./server/db/store');
   store = new DataStore(config.dbFile);
+  accounts = createFileAccountFacade(new UserRepo(store), new CreditRepo(store));
+  credits = createFileCreditFacade(new FileCreditService(new UserRepo(store), new CreditRepo(store)));
 }
 await store.init();
 
@@ -681,11 +704,9 @@ const moderationRepo = new ModerationRepo(store);
  * async. Nothing downstream branches on which store is mounted, and no handler
  * has to be rewritten when the provider changes.
  *
- * The JSON provider remains the behaviourally-identical default. Wiring the
- * Turso provider in is a one-line change here, but it is deliberately NOT enabled
- * in this stage — see the migration report.
+ * `credits` is assigned in the provider block above so it can never disagree with
+ * `accounts` about which backend is live.
  */
-const credits: AsyncCreditService = createFileCreditFacade(new FileCreditService(users, creditsRepo));
 
 // Initialize storage provider.
 //
@@ -806,20 +827,41 @@ const loginActivity = new LoginActivityService(loginActivityRepo);
 
   const uploadLimiter = new SlidingWindowLimiter(config.uploadRateLimitWindowMs, config.uploadRateLimitMax);
 
-  /** Bearer-token auth: resolves identity, verifies ownership, records access. */
+  /**
+   * Bearer-token auth: resolves identity, verifies ownership, records access.
+   *
+   * ASYNC on purpose. Identity resolution goes through `accounts` (the
+   * provider-aware facade), so on the production libSQL provider the lookup is
+   * an awaited round trip rather than a synchronous read that cannot work.
+   *
+   * The middleware rejects rather than calling `next(err)`: a database failure
+   * while resolving identity must not fall through to a handler that assumes
+   * `res.locals.user` is populated. Express 4 never awaits middleware, so the
+   * promise chain below is fully self-contained — every path calls `next()`
+   * exactly once or writes the response.
+   */
   function auth() {
     return (req: express.Request, res: express.Response, next: express.NextFunction) => {
       const token = extractToken(req);
       if (!isValidTokenShape(token)) {
         return res.status(401).json({ error: 'Missing or invalid bearer token. Create a session via POST /api/session.' });
       }
-      const user = users.getByToken(hashToken(token as string));
-      if (!user) {
-        return res.status(401).json({ error: 'Unknown or expired session. Create a session via POST /api/session.' });
-      }
-      users.touch(user.id);
-      res.locals.user = user;
-      next();
+      void (async () => {
+        const user = await accounts.getByToken(hashToken(token as string));
+        if (!user) {
+          res.status(401).json({ error: 'Unknown or expired session. Create a session via POST /api/session.' });
+          return;
+        }
+        // Activity tracking must never fail an authorized request.
+        await accounts.touch(user.id).catch((e) => {
+          nestedLog.warn('session touch failed', { message: redact((e as Error).message) });
+        });
+        res.locals.user = user;
+        next();
+      })().catch((err) => {
+        nestedLog.error('auth middleware failed', { message: redact((err as Error).message) });
+        if (!res.headersSent) res.status(500).json({ error: 'Failed to verify session.' });
+      });
     };
   }
 
@@ -964,12 +1006,17 @@ const loginActivity = new LoginActivityService(loginActivityRepo);
         if (!isValidTokenShape(rawToken)) {
           return res.status(401).json({ error: 'Missing or invalid bearer token. Create a session via POST /api/session.' });
         }
-        const identity = users.getByToken(hashToken(rawToken));
+        // Same provider-aware resolution `auth()` uses, so a signed-in customer
+        // is recognised on the transcription route too. Free-trial and credit
+        // accounting below is unchanged; only HOW the identity is looked up.
+        const identity = await accounts.getByToken(hashToken(rawToken));
         if (!identity) {
           return res.status(401).json({ error: 'Unknown or expired session. Create a session via POST /api/session.' });
         }
         sessionUser = identity;
-        users.touch(identity.id);
+        await accounts.touch(identity.id).catch((e) => {
+          nestedLog.warn('session touch failed', { message: redact((e as Error).message) });
+        });
       }
       const freeTrialsUsed = freeTrialsUsedFor(sessionUser);
 
@@ -1432,6 +1479,10 @@ const loginActivity = new LoginActivityService(loginActivityRepo);
           jobId: paidReservation.jobId,
         });
       } else if (sessionUser && spendDecision.kind === 'FREE_TRIAL') {
+        // UNCHANGED free-trial accounting. Left exactly as it was: this task is
+        // the auth/session/database fix, and the increment keeps going through
+        // the synchronous `users` repo on purpose so no free-trial policy
+        // behaviour can shift as a side effect.
         const incremented = users.incrementFreeTrialsUsed(sessionUser.id);
         if (incremented !== null) {
           usage.freeTrialsUsed = incremented;
@@ -1630,7 +1681,7 @@ const loginActivity = new LoginActivityService(loginActivityRepo);
   // grants nothing, and an allowlisted email without the secret is REFUSED with
   // 403. This is the ONLY path that assigns a role — client-supplied
   // role/creditMode fields are never read.
-  app.post('/api/session', (req, res) => {
+  app.post('/api/session', asyncRoute(async (req, res) => {
     try {
       const existing = extractToken(req);
       const ownerAttempt = authorizeOwnerSession({
@@ -1648,31 +1699,20 @@ const loginActivity = new LoginActivityService(loginActivityRepo);
       let userId: string;
       let presentedIsLive = false;
       if (existing && isValidTokenShape(existing)) {
-        const user = users.getByToken(hashToken(existing));
+        const user = await accounts.getByToken(hashToken(existing));
         if (!user) return res.status(401).json({ error: 'Unknown or expired session token.' });
         userId = user.id;
         presentedIsLive = true;
       } else {
         const tokenHash = hashToken(issueToken());
-        const user = users.createUser(tokenHash, config.initialCredits);
-        if (config.initialCredits > 0) {
-          creditsRepo.add({
-            userId: user.id,
-            amount: config.initialCredits,
-            type: 'CREDIT',
-            reason: 'initial_grant',
-            jobId: undefined,
-            balanceBefore: 0,
-            balanceAfter: user.credits,
-          });
-        }
+        const user = await accounts.createSessionUser(tokenHash, config.initialCredits);
         userId = user.id;
       }
       if (isAdminBootstrap) {
         // Persist the CANONICAL allowlisted email (not the raw claim).
-        users.setRole(userId, 'ADMIN');
-        users.setCreditMode(userId, 'UNLIMITED');
-        users.setOwnerEmail(userId, ownerAttempt.ownerEmail);
+        await accounts.setRole(userId, 'ADMIN');
+        await accounts.setCreditMode(userId, 'UNLIMITED');
+        await accounts.setOwnerEmail(userId, ownerAttempt.ownerEmail);
         nestedLog.info('admin role granted via verified owner bootstrap', {
           userId,
           ownerEmail: ownerAttempt.ownerEmail,
@@ -1682,8 +1722,8 @@ const loginActivity = new LoginActivityService(loginActivityRepo);
       // not append a second hash to users.tokenHashes for the same session;
       // addToken stays idempotent and still refreshes lastSeenAt.
       const token = selectSessionToken(existing, presentedIsLive) ?? issueToken();
-      users.addToken(userId, hashToken(token));
-      const user = users.getById(userId);
+      await accounts.addToken(userId, hashToken(token));
+      const user = await accounts.getById(userId);
       const freeTrialsUsed = freeTrialsUsedFor(user);
       // Monthly login analytics: one event per genuine session. A browser
       // refresh re-hits this route with the same token and is collapsed by the
@@ -1721,13 +1761,11 @@ const loginActivity = new LoginActivityService(loginActivityRepo);
       nestedLog.error('session creation failed', { message: redact(err.message) });
       res.status(500).json({ error: 'Failed to create session.' });
     }
-  });
+  }));
 
   // Normal email/password USER accounts — a separate auth surface from the
   // ADMIN bootstrap (authorizeOwnerSession). Users never need the bootstrap
   // token and signup always produces a plain USER account (never ADMIN).
-  const accountBroker: AccountBroker = { users, credits: creditsRepo };
-
   // Shared session body so /api/session and the account endpoints stay in sync.
   function sessionPayload(user: UserRecord | null | undefined, token: string) {
     const freeTrialsUsed = freeTrialsUsedFor(user);
@@ -1749,26 +1787,31 @@ const loginActivity = new LoginActivityService(loginActivityRepo);
     };
   }
 
-  app.post('/api/account/signup', (req, res) => {
+  // `asyncRoute` is mandatory here: `accounts.*` returns Promises on BOTH
+  // providers, so a rejection (a duplicate email racing two signups, a libSQL
+  // write failure) would otherwise escape Express 4's synchronous error capture
+  // and, on Node 15+, terminate the process. No mock auth, no fabricated
+  // success: a failure still surfaces as 5xx from the catch below.
+  app.post('/api/account/signup', asyncRoute(async (req, res) => {
     try {
-      const result = signupAccount(accountBroker, req.body ?? {}, config.initialCredits);
+      const result = await accounts.signup(req.body ?? {}, config.initialCredits);
       if (!result.ok || !result.user) {
         const status = result.code === 'EMAIL_TAKEN' ? 409 : 400;
         return res.status(status).json({ error: result.error, code: result.code ?? 'VALIDATION' });
       }
       const token = issueToken();
-      users.addToken(result.user.id, hashToken(token));
-      const user = users.getById(result.user.id);
+      await accounts.addToken(result.user.id, hashToken(token));
+      const user = await accounts.getById(result.user.id);
       return res.status(201).json(sessionPayload(user, token));
     } catch (err: any) {
       nestedLog.error('account signup failed', { message: redact(err.message) });
       return res.status(500).json({ error: 'Failed to create account.' });
     }
-  });
+  }));
 
-  app.post('/api/account/login', (req, res) => {
+  app.post('/api/account/login', asyncRoute(async (req, res) => {
     try {
-      const result = loginAccount(accountBroker, req.body ?? {});
+      const result = await accounts.login(req.body ?? {});
       if (!result.ok || !result.user) {
         // A FAILED sign-in is recorded with no user, no email and no request
         // metadata: the caller is unauthenticated, so the submitted address and
@@ -1786,7 +1829,7 @@ const loginActivity = new LoginActivityService(loginActivityRepo);
         return res.status(401).json({ error: result.error, code: result.code ?? 'INVALID_CREDENTIALS' });
       }
       const token = issueToken();
-      users.addToken(result.user.id, hashToken(token));
+      await accounts.addToken(result.user.id, hashToken(token));
       try {
         loginActivity.record({
           userId: result.user.id,
@@ -1804,23 +1847,25 @@ const loginActivity = new LoginActivityService(loginActivityRepo);
       nestedLog.error('account login failed', { message: redact(err.message) });
       return res.status(500).json({ error: 'Failed to sign in.' });
     }
-  });
+  }));
 
   // Logout: revoke the presented token server-side (the client also clears its
-  // stored token). Revocation is immediate — the token cannot be reused.
-  app.post('/api/account/logout', auth(), (req, res) => {
+  // stored token). Revocation is immediate — the token cannot be reused, and
+  // the revocation is awaited so the 200 genuinely means "this token is dead"
+  // rather than "we accepted a request to delete it".
+  app.post('/api/account/logout', auth(), asyncRoute(async (req, res) => {
     try {
       const user = res.locals.user;
       const raw = extractToken(req);
       if (user && raw && isValidTokenShape(raw)) {
-        users.revokeToken(user.id, hashToken(raw));
+        await accounts.revokeToken(user.id, hashToken(raw));
       }
       return res.json({ ok: true });
     } catch (err: any) {
       nestedLog.error('account logout failed', { message: redact(err.message) });
       return res.status(500).json({ error: 'Failed to sign out.' });
     }
-  });
+  }));
 
   // Upload -> validate -> charge credits server-side -> enqueue (async worker).
   // No long audio is transcribed inside this request.
@@ -1969,7 +2014,10 @@ const job = (await jobs.getForUser(jobId, user.id)) as JobRecord;
   // Own credit balance + ledger (server-authoritative; never client values).
   app.get('/api/credits/me', auth(), asyncRoute(async (req, res) => {
     const user = res.locals.user;
-    const fresh = users.getById(user.id);
+    // Provider-aware read: on the libSQL provider the balance lives in the row
+    // and `users.getById` cannot work, so the wallet a signed-in customer sees
+    // must come through the facade or it silently reads as zero.
+    const fresh = await accounts.getById(user.id);
     res.json({
       userId: user.id,
       credits: fresh?.credits ?? 0,
