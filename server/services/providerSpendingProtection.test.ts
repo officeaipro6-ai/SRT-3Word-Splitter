@@ -48,6 +48,19 @@ function withSwitch<T>(value: string | undefined, fn: () => T): T {
   }
 }
 
+/** The operator kill-switch, which is a SEPARATE variable since the split. */
+function withKillSwitch<T>(value: string | undefined, fn: () => T): T {
+  const previous = process.env.PROVIDER_KILL_SWITCH;
+  if (value === undefined) delete process.env.PROVIDER_KILL_SWITCH;
+  else process.env.PROVIDER_KILL_SWITCH = value;
+  try {
+    return fn();
+  } finally {
+    if (previous === undefined) delete process.env.PROVIDER_KILL_SWITCH;
+    else process.env.PROVIDER_KILL_SWITCH = previous;
+  }
+}
+
 /** A real service on a throwaway store whose stored state is healthy AVAILABLE. */
 function makeService() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'odia-psp-on-'));
@@ -96,11 +109,11 @@ test('1c. the kill switch is configurable, not hard-coded', () => {
 
 /* ── 2. a BLOCKED provider prevents any ASR call ─────────────────────────── */
 
-test('2. with the switch ON, a healthy AVAILABLE state still blocks the provider', () => {
+test('2. with the KILL SWITCH on, a healthy AVAILABLE state still blocks the provider', () => {
   const { service, repo } = makeService();
-  // Stored state is healthy — only the switch is blocking.
+  // Stored state is healthy — only the operator kill-switch is blocking.
   assert.equal(repo.get('sarvam').status, 'AVAILABLE');
-  withSwitch('true', () => {
+  withKillSwitch('true', () => {
     const view = service.view();
     assert.equal(view.status, 'BLOCKED');
     assert.equal(view.blocked, true);
@@ -108,6 +121,57 @@ test('2. with the switch ON, a healthy AVAILABLE state still blocks the provider
     assert.equal(service.isBlocked(), true);
     assert.throws(() => service.assertProviderSpendingAllowed(), ProviderSpendingError);
   });
+});
+
+/* ── 2z. THE SPLIT: spending protection ON + kill-switch OFF is NOT blocked ── */
+
+test('2z. PROVIDER_SPENDING_PROTECTION=true with PROVIDER_KILL_SWITCH=false does NOT block the provider', () => {
+  // This is the regression the split exists to fix: the old single flag made it
+  // impossible to keep the money-safety posture on while transcribing.
+  const { service, repo } = makeService();
+  assert.equal(repo.get('sarvam').status, 'AVAILABLE', 'stored state is healthy');
+  withSwitch('true', () =>
+    withKillSwitch('false', () => {
+      assert.equal(config.providerSpendingProtection, true, 'posture stays ON');
+      assert.equal(config.providerKillSwitch, false, 'hard stop stays OFF');
+      const view = service.view();
+      assert.equal(view.status, 'AVAILABLE', 'not blocked merely because protection is on');
+      assert.equal(view.blocked, false);
+      assert.equal(view.reason, null);
+      assert.equal(service.isBlocked(), false);
+      assert.doesNotThrow(() => service.assertProviderSpendingAllowed());
+    })
+  );
+});
+
+test('2z2. the KILL SWITCH still overrides even with spending protection OFF', () => {
+  // The kill-switch is fail-closed and independent in BOTH directions.
+  const { service } = makeService();
+  withSwitch('false', () =>
+    withKillSwitch('true', () => {
+      assert.equal(config.providerSpendingProtection, false);
+      assert.equal(service.isBlocked(), true);
+      assert.equal(service.view().reason, 'KILL_SWITCH');
+      assert.throws(() => service.assertProviderSpendingAllowed(), ProviderSpendingError);
+    })
+  );
+});
+
+test('2z3. PROVIDER_KILL_SWITCH defaults to false and is read lazily', () => {
+  const src = fs.readFileSync(new URL('../config.ts', import.meta.url), 'utf8');
+  // A dedicated, typed, env-driven getter — not a rename of the old flag.
+  assert.match(src, /get providerKillSwitch\(\)/);
+  assert.match(src, /envBool\('PROVIDER_KILL_SWITCH',\s*false\)/);
+  withKillSwitch(undefined, () => assert.equal(config.providerKillSwitch, false));
+  withKillSwitch('true', () => assert.equal(config.providerKillSwitch, true));
+  withKillSwitch('OFF', () => assert.equal(config.providerKillSwitch, false));
+});
+
+test('2z4. providerSafety gates on the KILL SWITCH, not on spending protection', () => {
+  // Guards against the two concerns being re-coupled in a future edit.
+  const safety = fs.readFileSync(new URL('./providerSafety.ts', import.meta.url), 'utf8');
+  assert.doesNotMatch(safety, /config\.providerSpendingProtection\s*\?\s*'KILL_SWITCH'/);
+  assert.match(safety, /config\.providerKillSwitch/);
 });
 
 test('2b. the pre-call gate refuses the request, so the ASR mock is never invoked', () => {
@@ -118,7 +182,7 @@ test('2b. the pre-call gate refuses the request, so the ASR mock is never invoke
     return { text: 'should never happen' };
   };
 
-  withSwitch('true', () => {
+  withKillSwitch('true', () => {
     // The exact pre-flight both real entry points perform, in order.
     const decision = decideAudioSpend({
       user: { id: 'u1', creditMode: 'NORMAL', freeTrialsUsed: 0, credits: 100 },
@@ -139,12 +203,12 @@ test('2b. the pre-call gate refuses the request, so the ASR mock is never invoke
     assert.throws(() => service.assertProviderSpendingAllowed(), ProviderSpendingError);
   });
 
-  assert.equal(asrCalls, 0, 'the ASR provider must never be called while the switch is ON');
+  assert.equal(asrCalls, 0, 'the ASR provider must never be called while the kill-switch is ON');
 });
 
 test('2c. UNLIMITED/ADMIN and free-trial callers get no exemption', () => {
   const { service } = makeService();
-  withSwitch('true', () => {
+  withKillSwitch('true', () => {
     const blocked = service.isBlocked();
     for (const user of [
       { id: 'admin', creditMode: 'UNLIMITED' as const, freeTrialsUsed: 0, credits: 0 },
@@ -164,21 +228,42 @@ test('2c. UNLIMITED/ADMIN and free-trial callers get no exemption', () => {
   });
 });
 
-test('2d. the 402 / insufficient_quota state blocks on its own, even with the switch OFF', () => {
+test('2d. the 402 / insufficient_quota state blocks on its own, even with BOTH switches OFF', () => {
   const { service, repo } = makeService();
-  withSwitch('false', () => {
-    // Fail-safe: an observed 402 is persisted, so the gate closes without the
-    // operator switch and survives a restart.
-    service.reportFailure({
-      kind: 'QUOTA_EXHAUSTED',
-      message: 'Sarvam job initiate failed (HTTP 402): insufficient_quota_error',
-      transient: false,
-      httpStatus: 402,
-    });
-    assert.equal(repo.get('sarvam').status, 'BLOCKED');
-    assert.equal(service.isBlocked(), true);
-    assert.throws(() => service.assertProviderSpendingAllowed(), ProviderSpendingError);
-  });
+  withSwitch('false', () =>
+    withKillSwitch('false', () => {
+      // Fail-safe: an observed 402 is persisted, so the gate closes without the
+      // operator switch and survives a restart.
+      service.reportFailure({
+        kind: 'QUOTA_EXHAUSTED',
+        message: 'Sarvam job initiate failed (HTTP 402): insufficient_quota_error',
+        transient: false,
+        httpStatus: 402,
+      });
+      assert.equal(repo.get('sarvam').status, 'BLOCKED');
+      assert.equal(service.isBlocked(), true);
+      assert.throws(() => service.assertProviderSpendingAllowed(), ProviderSpendingError);
+    })
+  );
+});
+
+test('2e. a real 402 STILL blocks while spending protection is ON and kill-switch is OFF', () => {
+  // Requirement C/E: the production posture (protection=true, kill=false) must
+  // not weaken quota blocking.
+  const { service } = makeService();
+  withSwitch('true', () =>
+    withKillSwitch('false', () => {
+      service.reportFailure({
+        kind: 'QUOTA_EXHAUSTED',
+        message: 'Sarvam job initiate failed (HTTP 402): insufficient_quota_error',
+        transient: false,
+        httpStatus: 402,
+      });
+      assert.equal(service.view().status, 'BLOCKED');
+      assert.equal(service.view().reason, 'QUOTA_EXHAUSTED', 'reason is the real cause, not KILL_SWITCH');
+      assert.throws(() => service.assertProviderSpendingAllowed(), ProviderSpendingError);
+    })
+  );
 });
 
 /* ── 3. no automatic retry ───────────────────────────────────────────────── */
@@ -223,7 +308,7 @@ test('4. nothing in the provider-safety path can recharge or buy credits', () =>
   // Enabling the switch must not touch any user wallet either.
   const { service, repo } = makeService();
   const creditsBefore = repo.get('sarvam');
-  withSwitch('true', () => {
+  withKillSwitch('true', () => {
     assert.throws(() => service.assertProviderSpendingAllowed(), ProviderSpendingError);
   });
   assert.deepEqual(repo.get('sarvam'), creditsBefore);
@@ -241,10 +326,13 @@ test('4b. no outbound request was made by any test above (fetch tripwire)', asyn
 
 /* ── 5. the switch is documented and reversible ──────────────────────────── */
 
-test('5. .env.example documents the switch, the fail-safe and the no-spend rules', () => {
+test('5. .env.example documents both controls, the fail-safe and the no-spend rules', () => {
   const example = fs.readFileSync(path.resolve(process.cwd(), '.env.example'), 'utf8');
-  assert.match(example, /PROVIDER_SPENDING_PROTECTION="false"/);
-  assert.match(example, /HARD kill-switch: when true, NO provider/i);
+  // Spending protection is the posture; the kill-switch is the hard stop.
+  assert.match(example, /PROVIDER_SPENDING_PROTECTION="true"/);
+  assert.match(example, /PROVIDER_KILL_SWITCH="false"/);
+  assert.match(example, /HARD operator kill-switch, SEPARATE from/i);
+  assert.match(example, /when true, NO provider/i);
   assert.match(example, /OWNER_EMAILS/);
   assert.match(example, /does NOT auto-recharge/i);
 });
@@ -261,4 +349,11 @@ test('6. nothing that must not change was changed by this configuration', () => 
   const raw = env.PROVIDER_SPENDING_PROTECTION?.trim().toLowerCase();
   const expected = !['0', 'false', 'no', 'off'].includes(raw ?? '');
   assert.equal(expected, config.providerSpendingProtection);
+});
+
+test('7. render.yaml keeps spending protection ON and the kill-switch OFF', () => {
+  const yaml = fs.readFileSync(path.resolve(process.cwd(), 'render.yaml'), 'utf8');
+  // The production posture the split was requested for, pinned in config.
+  assert.match(yaml, /- key: PROVIDER_SPENDING_PROTECTION\n\s+value: "true"/);
+  assert.match(yaml, /- key: PROVIDER_KILL_SWITCH\n\s+value: "false"/);
 });

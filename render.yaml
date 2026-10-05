@@ -46,8 +46,15 @@ services:
       - key: B2_BUCKET
         value: odia-srt-production-storage
       # Provider spending protection (recommended ON for production)
+      # This is the money-safety POSTURE only. It does NOT stop transcription:
+      # credits, free trials, quota and 402 blocking are always enforced.
       - key: PROVIDER_SPENDING_PROTECTION
         value: "true"
+      # Operator kill-switch: the hard stop for ALL ASR calls.
+      # "true" => BLOCKED/KILL_SWITCH for every caller, incl. ADMIN/UNLIMITED.
+      # Keep "false" to allow Sarvam to process while spending protection stays on.
+      - key: PROVIDER_KILL_SWITCH
+        value: "false"
       # Job timeout (ms) - 15 minutes default
       - key: JOB_TIMEOUT_MS
         value: "900000"

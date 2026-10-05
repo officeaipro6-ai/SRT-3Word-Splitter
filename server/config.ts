@@ -77,11 +77,21 @@ export const config = {
   },
 
   /**
-   * HARD provider-spending protection kill-switch. When true, NO provider job
-   * is ever started for ANY caller (including ADMIN/UNLIMITED). Purpose:
-   * prevent uncontrolled spending from the operator's ASR account while the app
-   * is not yet generating revenue. The user-facing copy is "Processing
-   * temporarily unavailable. Please try again later."
+   * GLOBAL SPENDING-PROTECTION LAYER flag (the operator's declaration that
+   * money-safety enforcement is switched on for this deployment).
+   *
+   * IMPORTANT — this flag is NOT the hard stop. It used to be: the gate in
+   * providerSafety.ts keyed off this value, so a single boolean was doing two
+   * unrelated jobs and the app could not spend-safely while transcribing. The
+   * hard stop now lives in `providerKillSwitch` below; this flag is kept as the
+   * declared spending-safety posture and is reported on /api/health.
+   *
+   * The actual per-request spending safety is enforced independently and is NOT
+   * affected by either flag: credit balance checks and reservations
+   * (creditService / decideAudioSpend), the free-trial count and the 2-minute
+   * per-trial duration cap (freeTrialPolicy), the per-user active-job cap, the
+   * upload rate limit, and the persisted 402 / QUOTA_EXHAUSTED /
+   * PAYMENT_REQUIRED block in ProviderSafetyService.
    *
    * This MUST stay a getter: `server.ts` calls `dotenv.config()` in its module
    * body, which runs AFTER every static import has been evaluated. A static
@@ -91,6 +101,26 @@ export const config = {
    */
   get providerSpendingProtection(): boolean {
     return envBool('PROVIDER_SPENDING_PROTECTION', false);
+  },
+
+  /**
+   * OPERATOR KILL-SWITCH. When true, NO provider job is ever started for ANY
+   * caller (including ADMIN/UNLIMITED): the gate in providerSafety.ts forces
+   * BLOCKED with reason `KILL_SWITCH`. Purpose: let the operator stop all ASR
+   * billing in one action (e.g. a runaway provider incident or suspected key
+   * compromise) WITHOUT having to turn the money-safety posture off.
+   *
+   * Default false, so a deployment that sets nothing is never silently blocked.
+   * This is deliberately a SEPARATE variable from PROVIDER_SPENDING_PROTECTION
+   * so the two concerns cannot be conflated again: with this switch OFF and
+   * PROVIDER_SPENDING_PROTECTION=true, transcription runs normally while every
+   * credit, free-trial, quota and 402 protection stays fully enforced.
+   *
+   * It is still a fail-closed switch: `true` always wins over the stored state.
+   * Same getter requirement as above (dotenv load order).
+   */
+  get providerKillSwitch(): boolean {
+    return envBool('PROVIDER_KILL_SWITCH', false);
   },
 
   /**

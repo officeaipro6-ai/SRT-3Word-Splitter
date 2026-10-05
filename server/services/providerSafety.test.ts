@@ -254,18 +254,84 @@ test('the kill switch forces BLOCKED even with a healthy stored state', () => {
   // Drive the REAL env -> config path (server.ts loads dotenv after imports, so
   // the switch is a lazy getter; assigning the config field directly is no
   // longer possible, and would not prove the .env value is honoured).
-  const previous = process.env.PROVIDER_SPENDING_PROTECTION;
-  process.env.PROVIDER_SPENDING_PROTECTION = 'true';
+  const previous = process.env.PROVIDER_KILL_SWITCH;
+  process.env.PROVIDER_KILL_SWITCH = 'true';
   try {
-    assert.equal(config.providerSpendingProtection, true);
+    assert.equal(config.providerKillSwitch, true);
     assert.equal(service.view().status, 'BLOCKED');
     assert.equal(service.view().reason, 'KILL_SWITCH');
     assert.throws(() => service.assertProviderSpendingAllowed(), ProviderSpendingError);
   } finally {
-    if (previous === undefined) delete process.env.PROVIDER_SPENDING_PROTECTION;
-    else process.env.PROVIDER_SPENDING_PROTECTION = previous;
+    if (previous === undefined) delete process.env.PROVIDER_KILL_SWITCH;
+    else process.env.PROVIDER_KILL_SWITCH = previous;
   }
   assert.equal(service.view().status, 'AVAILABLE');
+});
+
+test('spending protection ON no longer blocks on its own (the two controls are separate)', () => {
+  const { service } = makeService();
+  const prevSpend = process.env.PROVIDER_SPENDING_PROTECTION;
+  const prevKill = process.env.PROVIDER_KILL_SWITCH;
+  process.env.PROVIDER_SPENDING_PROTECTION = 'true';
+  process.env.PROVIDER_KILL_SWITCH = 'false';
+  try {
+    assert.equal(config.providerSpendingProtection, true);
+    assert.equal(config.providerKillSwitch, false);
+    assert.equal(service.view().status, 'AVAILABLE');
+    assert.equal(service.view().reason, null);
+    assert.doesNotThrow(() => service.assertProviderSpendingAllowed());
+  } finally {
+    if (prevSpend === undefined) delete process.env.PROVIDER_SPENDING_PROTECTION;
+    else process.env.PROVIDER_SPENDING_PROTECTION = prevSpend;
+    if (prevKill === undefined) delete process.env.PROVIDER_KILL_SWITCH;
+    else process.env.PROVIDER_KILL_SWITCH = prevKill;
+  }
+});
+
+test('a persisted BLOCKED/KILL_SWITCH row is NOT auto-cleared — only an admin reset opens it', () => {
+  // The old implementation wrote this row whenever PROVIDER_SPENDING_PROTECTION
+  // was on. It must stay closed (fail-safe) until an operator resets it.
+  const { service, repo } = makeService();
+  repo.setStatus('sarvam', 'BLOCKED', 'KILL_SWITCH', { blockedAt: '2026-01-01T00:00:00.000Z' });
+  const prev = process.env.PROVIDER_KILL_SWITCH;
+  process.env.PROVIDER_KILL_SWITCH = 'false';
+  try {
+    // Still blocked: the split must not silently reopen the provider.
+    assert.equal(service.view().status, 'BLOCKED');
+    assert.equal(service.isBlocked(), true);
+    assert.throws(() => service.assertProviderSpendingAllowed(), ProviderSpendingError);
+    // ...and the reason is honest about needing an admin reset.
+    assert.match(service.view().reasonText, /admin reset is required/i);
+    // A provider success must not silently clear it either.
+    service.reportSuccess();
+    assert.equal(service.view().status, 'BLOCKED', 'BLOCKED is sticky until an admin reset');
+    // The audited reset is the only way out.
+    const after = service.resetToAvailable('owner@example.test');
+    assert.equal(after.status, 'AVAILABLE');
+    assert.equal(after.reason, null);
+    assert.equal(after.lastResetBy, 'owner@example.test');
+  } finally {
+    if (prev === undefined) delete process.env.PROVIDER_KILL_SWITCH;
+    else process.env.PROVIDER_KILL_SWITCH = prev;
+  }
+});
+
+test('a genuine persisted QUOTA_EXHAUSTED block is never mistaken for the kill-switch', () => {
+  // Requirement J: real safety blocks must survive the split untouched.
+  const { service, repo } = makeService();
+  repo.setStatus('sarvam', 'BLOCKED', 'QUOTA_EXHAUSTED', { lastHttpStatus: 402 });
+  const prev = process.env.PROVIDER_KILL_SWITCH;
+  process.env.PROVIDER_KILL_SWITCH = 'false';
+  try {
+    const view = service.view();
+    assert.equal(view.status, 'BLOCKED');
+    assert.equal(view.reason, 'QUOTA_EXHAUSTED', 'the real cause is preserved');
+    assert.equal(view.lastHttpStatus, 402);
+    assert.match(view.reasonText, /exhausted credits\/quota/i);
+  } finally {
+    if (prev === undefined) delete process.env.PROVIDER_KILL_SWITCH;
+    else process.env.PROVIDER_KILL_SWITCH = prev;
+  }
 });
 
 /** No recharge/auto-buy/paid-fallback capability may exist in this layer. */

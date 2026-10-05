@@ -868,6 +868,7 @@ const loginActivity = new LoginActivityService(loginActivityRepo);
       hasApiKey,
       hasFallback,
       providerSpendingProtection: config.providerSpendingProtection,
+      providerKillSwitch: config.providerKillSwitch,
       providerSafety: providerSafety.view(),
       // Backward-compatible flag names for existing clients.
       providerSpendingBlocked: providerSafety.isBlocked(),

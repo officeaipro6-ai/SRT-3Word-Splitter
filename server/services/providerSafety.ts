@@ -14,6 +14,14 @@
  *                persisted, so a restart cannot silently re-enable billing. Only
  *                an explicit admin reset returns it to AVAILABLE.
  *
+ * Two independent operator controls feed this layer:
+ *   - PROVIDER_KILL_SWITCH (default false) is the "stop all ASR billing now"
+ *     switch. It forces BLOCKED/KILL_SWITCH regardless of stored state.
+ *   - PROVIDER_SPENDING_PROTECTION is the declared money-safety posture. It does
+ *     NOT force BLOCKED: with the kill-switch off, transcription runs normally
+ *     while the real spending protections (credits, free trials, quota, 402)
+ *     continue to be enforced on every request.
+ *
  * Honesty rules encoded here:
  *   - Balance is `known: false` unless a verified provider balance/quota source
  *     exists. Sarvam exposes no such endpoint in this integration, so no balance
@@ -258,9 +266,18 @@ export class ProviderSafetyService {
     return this.deps.now ? this.deps.now() : new Date().toISOString();
   }
 
-  /** Effective status, including the env kill-switch (which forces BLOCKED). */
+  /**
+   * Effective status, including the env kill-switch (which forces BLOCKED).
+   *
+   * The kill-switch is `PROVIDER_KILL_SWITCH`, NOT
+   * `PROVIDER_SPENDING_PROTECTION`: the operator's money-safety posture and the
+   * operator's "stop all ASR billing" switch are separate concerns. With the
+   * kill-switch OFF this returns the persisted state, so a real 402 /
+   * QUOTA_EXHAUSTED / PAYMENT_REQUIRED block still closes the gate even though
+   * PROVIDER_SPENDING_PROTECTION is true.
+   */
   effectiveStatus(record = this.deps.get()): ProviderSafetyStatus {
-    if (config.providerSpendingProtection) return 'BLOCKED';
+    if (config.providerKillSwitch) return 'BLOCKED';
     return record.status;
   }
 
@@ -282,7 +299,8 @@ export class ProviderSafetyService {
   reportFailure(failure: ProviderFailure): ProviderSafetyView {
     const current = this.deps.get();
     const failuresBefore = current.consecutiveFailures ?? 0;
-    const killSwitch = config.providerSpendingProtection;
+    // The operator kill-switch, independent of PROVIDER_SPENDING_PROTECTION.
+    const killSwitch = config.providerKillSwitch;
     const next = nextProviderState({
       current: current.status,
       failure,
@@ -388,17 +406,24 @@ export class ProviderSafetyService {
 
   /** Full, safe-to-serve view (no credentials, no balance invention). */
   view(record = this.deps.get()): ProviderSafetyView {
+    const killSwitchOn = config.providerKillSwitch;
     const status = this.effectiveStatus(record);
     const blocked = status === 'BLOCKED';
-    const reason = config.providerSpendingProtection
+    const reason = killSwitchOn
       ? 'KILL_SWITCH'
       : blocked
         ? (record.reason ?? 'QUOTA_EXHAUSTED')
         : null;
     const reasonText = blocked
-      ? config.providerSpendingProtection
-        ? 'Operator kill-switch is on (PROVIDER_SPENDING_PROTECTION).'
-        : 'Provider reported exhausted credits/quota (HTTP 402). Transcription is stopped until an admin resets the provider.'
+      ? killSwitchOn
+        ? 'Operator kill-switch is on (PROVIDER_KILL_SWITCH).'
+        : record.reason === 'KILL_SWITCH'
+          // A row persisted by the OLD implementation, which used
+          // PROVIDER_SPENDING_PROTECTION as the kill-switch. It was never
+          // necessarily a real provider problem, but it is deliberately NOT
+          // auto-cleared: safety state is only left via the audited admin reset.
+          ? 'Blocked by a persisted kill-switch state from a previous run. An admin reset is required to reopen the provider.'
+          : 'Provider reported exhausted credits/quota (HTTP 402). Transcription is stopped until an admin resets the provider.'
       : status === 'WARNING'
         ? 'Repeated provider failures were observed. Calls still allowed.'
         : 'No known provider problem.';

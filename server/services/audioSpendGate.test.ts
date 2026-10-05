@@ -418,8 +418,8 @@ test('kill switch blocks EVERY caller (no bypass) with the exact product message
   const safety = await makeSafety();
   // Drive the real env -> config path: the switch is a lazy getter, so it must be
   // exercised through process.env rather than by assigning the config field.
-  const previous = process.env.PROVIDER_SPENDING_PROTECTION;
-  process.env.PROVIDER_SPENDING_PROTECTION = 'true';
+  const previous = process.env.PROVIDER_KILL_SWITCH;
+  process.env.PROVIDER_KILL_SWITCH = 'true';
   try {
     for (const user of [
       { id: 'n', creditMode: 'NORMAL', freeTrialsUsed: 0, credits: 100 } as UserRecord, // free trial
@@ -446,8 +446,63 @@ test('kill switch blocks EVERY caller (no bypass) with the exact product message
     assert.equal(view.status, 'BLOCKED');
     assert.equal(view.reason, 'KILL_SWITCH');
   } finally {
-    if (previous === undefined) delete process.env.PROVIDER_SPENDING_PROTECTION;
-    else process.env.PROVIDER_SPENDING_PROTECTION = previous;
+    if (previous === undefined) delete process.env.PROVIDER_KILL_SWITCH;
+    else process.env.PROVIDER_KILL_SWITCH = previous;
+  }
+});
+
+test('spending protection ON does NOT block: free-trial and paid callers both pass the gate', async () => {
+  // The production posture (protection=true, kill-switch=false) must allow
+  // transcription while every credit/trial rule below still applies.
+  const safety = await makeSafety();
+  const prevSpend = process.env.PROVIDER_SPENDING_PROTECTION;
+  const prevKill = process.env.PROVIDER_KILL_SWITCH;
+  process.env.PROVIDER_SPENDING_PROTECTION = 'true';
+  process.env.PROVIDER_KILL_SWITCH = 'false';
+  try {
+    assert.equal(safety.isBlocked(), false);
+    // A free-trial user with credits left is allowed (trial budget available).
+    const trial = decideAudioSpend({
+      ...ctx({ id: 'n', creditMode: 'NORMAL', freeTrialsUsed: 0, credits: 0 } as UserRecord, 60),
+      providerBlocked: safety.isBlocked(),
+    });
+    assert.equal(trial.ok, true);
+    assert.equal(trial.kind, 'FREE_TRIAL');
+    // F: the trial COUNT cap is still enforced — a user who used both trials
+    // falls through to the PAID path and can never get a third free run.
+    const usedUp = decideAudioSpend({
+      ...ctx({ id: 'n2', creditMode: 'NORMAL', freeTrialsUsed: 2, credits: 100 } as UserRecord, 60),
+      providerBlocked: safety.isBlocked(),
+    });
+    assert.equal(usedUp.kind, 'PAID', 'trials exhausted -> must pay, not run free');
+    // H: an empty wallet still cannot spend.
+    const broke = decideAudioSpend({
+      ...ctx({ id: 'n4', creditMode: 'NORMAL', freeTrialsUsed: 2, credits: 0 } as UserRecord, 60),
+      providerBlocked: safety.isBlocked(),
+    });
+    assert.equal(broke.ok, false);
+    assert.equal(broke.kind, 'NEED_CREDITS');
+    assert.equal(broke.status, 402);
+    // G: the 2-MINUTE per-trial duration cap is still enforced (2:01 refused,
+    // and the trial is NOT consumed by that refusal).
+    const tooLong = decideAudioSpend({
+      ...ctx({ id: 'n3', creditMode: 'NORMAL', freeTrialsUsed: 0, credits: 0 } as UserRecord, 121),
+      providerBlocked: safety.isBlocked(),
+    });
+    assert.equal(tooLong.ok, false);
+    assert.equal(tooLong.kind, 'FREE_TRIAL_DURATION_LIMIT');
+    // 2:00 exactly is still accepted — the cap must not be tightened by accident.
+    const edge = decideAudioSpend({
+      ...ctx({ id: 'n5', creditMode: 'NORMAL', freeTrialsUsed: 0, credits: 0 } as UserRecord, 120),
+      providerBlocked: safety.isBlocked(),
+    });
+    assert.equal(edge.ok, true);
+    assert.equal(edge.kind, 'FREE_TRIAL');
+  } finally {
+    if (prevSpend === undefined) delete process.env.PROVIDER_SPENDING_PROTECTION;
+    else process.env.PROVIDER_SPENDING_PROTECTION = prevSpend;
+    if (prevKill === undefined) delete process.env.PROVIDER_KILL_SWITCH;
+    else process.env.PROVIDER_KILL_SWITCH = prevKill;
   }
 });
 

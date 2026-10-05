@@ -155,8 +155,13 @@ start(): void {
     if (!(await this.repo.update(job.id, { status: 'PROCESSING', startedAt: new Date().toISOString(), nextRetryAt: undefined }))) {
       return;
     }
+    // The handle is kept so it can be cleared when the job settles: a leftover
+    // 15-minute timer would keep the event loop alive after the job finished.
+    // Clearing it does NOT weaken the timeout — the race below still rejects with
+    // the same message at the same deadline while the job is in flight.
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_, reject) => {
-      setTimeout(() => reject(new Error(`Job timed out after ${Math.floor(config.jobTimeoutMs / 1000)}s.`)), config.jobTimeoutMs);
+      timer = setTimeout(() => reject(new Error(`Job timed out after ${Math.floor(config.jobTimeoutMs / 1000)}s.`)), config.jobTimeoutMs);
     });
     try {
       const result = await Promise.race([this.processOne(job), timeout]);
@@ -179,6 +184,8 @@ start(): void {
       this.providerSafety.reportSuccess();
     } catch (err: any) {
       await this.handleFailure(job, err);
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 

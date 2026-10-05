@@ -17,13 +17,19 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createClient } from '@libsql/client';
+import { readFileSync } from 'node:fs';
 
+import { config } from '../config';
 import { JobRepo } from '../db/repos';
 import { TursoStore } from '../db/tursoStore';
 import { JobQueue, type JobQueueDeps } from './queue';
+import { ProviderSafetyService } from './providerSafety';
 import type { AsyncCreditService } from './creditFacade';
 import type { StorageProvider } from './storage';
 import type { TranscriptionProvider } from '../providers/types';
+
+/** The worker's own source, for structural timeout assertions. */
+const queueSrc = readFileSync(new URL('./queue.ts', import.meta.url), 'utf8');
 
 function job(id: string, status: string, extra: Record<string, unknown> = {}) {
   return {
@@ -107,6 +113,88 @@ function recordingCredits() {
     },
   } as unknown as AsyncCreditService;
   return { credits, refunds };
+}
+
+/**
+ * A queue whose provider can actually run, so the pre-call gate and the job
+ * timeout can be exercised through the real tick() path. `transcribeCalls`
+ * counts how many times the provider was reached: it must stay 0 while the
+ * operator kill-switch is on.
+ */
+async function openRunnableQueue(): Promise<{
+  queue: JobQueue;
+  repo: JobRepo;
+  transcribeCalls: () => number;
+}> {
+  const client = createClient({ url: 'file::memory:' });
+  const store = new TursoStore(client);
+  await store.init();
+  await store.createUser({
+    id: 'u1',
+    email: 'u1@example.test',
+    role: 'USER',
+    credits: 0,
+    tokenHashes: [],
+    createdAt: '2026-01-01T00:00:00.000Z',
+  } as any);
+
+  const repo = new JobRepo(store as unknown as import('../db/store').DataStore);
+  const { credits } = recordingCredits();
+  let calls = 0;
+  // A REAL ProviderSafetyService so the gate is the production one; only its
+  // storage is in-memory (ProviderSafetyRepo is still synchronous and cannot
+  // read the async libSQL provider).
+  const safetyRecord = {
+    provider: 'sarvam',
+    status: 'AVAILABLE' as const,
+    reason: null,
+    lastError: undefined,
+    lastHttpStatus: undefined,
+    lastErrorAt: undefined,
+    blockedAt: undefined,
+    updatedAt: '2026-01-01T00:00:00.000Z',
+    consecutiveFailures: 0,
+    balance: { known: false, percent: null, source: null, unit: null, updatedAt: null },
+  };
+  const safety = new ProviderSafetyService({
+    provider: 'sarvam',
+    get: () => safetyRecord,
+    patch: (p) => Object.assign(safetyRecord, p),
+    setStatus: (provider, status, reason, patch) =>
+      Object.assign(safetyRecord, { provider, status, reason }, patch) as typeof safetyRecord,
+    notifyOwner: () => ({ delivered: false }),
+  });
+  const deps: JobQueueDeps = {
+    repo,
+    credits,
+    storage: {
+      get: async () => Buffer.from('fake-audio'),
+    } as unknown as StorageProvider,
+    getProvider: () =>
+      ({
+        name: 'sarvam',
+        transcribe: async () => {
+          calls += 1;
+          return { text: 'hello', segments: [] };
+        },
+      }) as unknown as TranscriptionProvider,
+    runPipeline: async () => ({ rawSrt: '1\nx\n', segmentCount: 1, wordCount: 1, provider: 'sarvam' }),
+    providerSafety: safety,
+  };
+  return { queue: new JobQueue(deps), repo, transcribeCalls: () => calls };
+}
+
+/** Set/restore an env var around a test body. */
+async function withEnv<T>(key: string, value: string | undefined, fn: () => Promise<T>): Promise<T> {
+  const previous = process.env[key];
+  if (value === undefined) delete process.env[key];
+  else process.env[key] = value;
+  try {
+    return await fn();
+  } finally {
+    if (previous === undefined) delete process.env[key];
+    else process.env[key] = previous;
+  }
 }
 
 async function openQueue(): Promise<{
@@ -196,4 +284,48 @@ test('6B-Q4. rehydrate() is idempotent across restarts (a job is never refunded 
 
   assert.equal(refunds.length, firstRefundCount, 'no second refund');
   assert.equal((await repo.get('j-p'))!.status, 'FAILED');
+});
+
+/* ── Operator kill-switch vs. spending protection, through the real worker ── */
+
+test('6B-K1. kill-switch ON fails the queued job as PROVIDER_BLOCKED and never calls the provider', async () => {
+  await withEnv('PROVIDER_KILL_SWITCH', 'true', async () => {
+    const { queue, repo, transcribeCalls } = await openRunnableQueue();
+    await repo.create(job('j-q', 'QUEUED'));
+
+    await (queue as unknown as { tick(): Promise<void> }).tick();
+
+    const failed = (await repo.get('j-q'))!;
+    assert.equal(failed.status, 'FAILED');
+    assert.equal(failed.errorCode, 'PROVIDER_BLOCKED', 'the gate rejection is terminal, not retried');
+    assert.equal(transcribeCalls(), 0, 'the ASR provider must never be reached while the switch is ON');
+    // Still zero active jobs afterwards.
+    assert.equal(await repo.countActiveForUser('u1'), 0);
+  });
+});
+
+test('6B-K2. spending protection ON + kill-switch OFF lets the job run', async () => {
+  // The production posture after the split: protection on, transcription works.
+  await withEnv('PROVIDER_SPENDING_PROTECTION', 'true', () =>
+    withEnv('PROVIDER_KILL_SWITCH', 'false', async () => {
+      const { queue, repo, transcribeCalls } = await openRunnableQueue();
+      await repo.create(job('j-q', 'QUEUED'));
+
+      await (queue as unknown as { tick(): Promise<void> }).tick();
+
+      const done = (await repo.get('j-q'))!;
+      assert.equal(done.status, 'COMPLETED', 'spending protection alone must not block');
+      assert.equal(transcribeCalls(), 1, 'the provider was reached exactly once');
+    })
+  );
+});
+
+test('6B-K3. the Sarvam job timeout protection is still wired in', async () => {
+  // I: the kill-switch change must not weaken the job timeout. The timeout is
+  // 15 minutes, so it is asserted structurally rather than by waiting it out.
+  assert.match(queueSrc, /const timeout = new Promise<never>/);
+  assert.match(queueSrc, /await Promise\.race\(\[this\.processOne\(job\), timeout\]\)/);
+  assert.match(queueSrc, /config\.jobTimeoutMs/);
+  assert.match(queueSrc, /jobTimeoutMs: config\.jobTimeoutMs/, 'the timeout is passed to the provider call');
+  assert.equal(config.jobTimeoutMs, 15 * 60 * 1000, 'default is 15 minutes');
 });
