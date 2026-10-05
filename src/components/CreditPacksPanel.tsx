@@ -24,8 +24,9 @@ export interface WalletView {
 
 /**
  * DISPLAY copy only — the server is the single source of truth and enforces the
- * limit. Keep in sync with FREE_TRIAL_MAX_DURATION_SECONDS in
- * server/services/freeTrialPolicy.ts (120 seconds = 2 minutes per trial).
+ * limit. Keep in sync with FREE_TRIAL_LIMIT in server/config.ts (frozen to 1)
+ * and FREE_TRIAL_MAX_DURATION_SECONDS in server/services/freeTrialPolicy.ts
+ * (120 seconds = 2 minutes for that single trial).
  */
 const FREE_TRIAL_MAX_MINUTES = 2;
 
@@ -177,7 +178,9 @@ export const CreditPacksPanel: React.FC<Props> = ({ wallet, freeTrialsRemaining,
       {freeTrialsRemaining !== null && freeTrialLimit > 0 && (
         <div className="rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-2 text-[11px] text-slate-600 space-y-0.5">
           <p className="font-semibold text-slate-700">
-            {freeTrialLimit} Free Trials — Up to {FREE_TRIAL_MAX_MINUTES} minutes each
+            {freeTrialLimit} Free Trial{freeTrialLimit === 1 ? '' : 's'} — Up to {FREE_TRIAL_MAX_MINUTES}{' '}
+            minute{FREE_TRIAL_MAX_MINUTES === 1 ? '' : 's'}
+            {freeTrialLimit === 1 ? '' : ' each'}
           </p>
           <p>Total free usage: up to {freeTrialLimit * FREE_TRIAL_MAX_MINUTES} minutes</p>
           <p className="text-slate-500">

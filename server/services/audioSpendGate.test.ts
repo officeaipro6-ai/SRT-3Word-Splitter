@@ -15,6 +15,8 @@ import {
   FREE_TRIAL_MAX_DURATION_SECONDS,
   exceedsFreeTrialDuration,
   freeTrialTotalMaxDurationSeconds,
+  isFreeTrialExhausted,
+  freeTrialsRemaining,
 } from './freeTrialPolicy.ts';
 import { ProviderSafetyService, classifyProviderFailure } from './providerSafety.ts';
 import { ProviderSafetyRepo } from '../db/repos.ts';
@@ -47,7 +49,9 @@ function ctx(user: UserRecord, measuredDurationSeconds: number, extra: Record<st
       credits: user.credits,
     },
     measuredDurationSeconds,
-    freeTrialLimit: 2,
+    // Track the REAL frozen policy (FREE_TRIAL_LIMIT) instead of a hardcoded
+    // number, so these tests can never drift from production again.
+    freeTrialLimit: config.freeTrialLimit,
     ...extra,
   } as AudioSpendContext;
 }
@@ -183,33 +187,32 @@ test('reservation is idempotent per jobId (a client retry cannot reserve twice)'
   assert.equal(service.getTransactions(user.id).filter((t) => t.type === 'RESERVATION').length, 1);
 });
 
-test('free trials: #1 and #2 are allowed free, #3 requires credits (failures never consume)', async () => {
+test('free trial: exactly ONE free trial, the 2nd transcription requires credits', async () => {
   const { service, users, user } = await makeWallet(0);
   const fresh = () => users.getById(user.id) as UserRecord;
 
-  // Trial #1 — allowed free (100s <= the 2-minute per-trial cap), consumes nothing.
+  // Trial #1 — the single free trial, allowed free (100s <= the 2-minute cap).
   let d = decideAudioSpend(ctx(fresh(), 100));
   assert.equal(d.ok, true);
   assert.equal(d.kind, 'FREE_TRIAL');
-  assert.equal(d.freeTrialsRemaining, 2);
-  users.incrementFreeTrialsUsed(fresh().id);
-
-  // Trial #2 — allowed free.
-  d = decideAudioSpend(ctx(fresh(), 100));
-  assert.equal(d.ok, true);
-  assert.equal(d.kind, 'FREE_TRIAL');
+  assert.equal(d.freeTrialLimit, 1);
   assert.equal(d.freeTrialsRemaining, 1);
+  assert.equal(fresh().freeTrialsUsed, 0, 'deciding does not consume: only success does');
   users.incrementFreeTrialsUsed(fresh().id);
 
-  // Trial #3 — must pay with credits (0 in the wallet -> 402).
+  // Trial #2 — the single trial is now consumed, so credits are required.
   d = decideAudioSpend(ctx(fresh(), 100));
   assert.equal(d.ok, false);
   assert.equal(d.kind, 'NEED_CREDITS');
+  assert.equal(d.code, 'NOT_ENOUGH_CREDITS');
   assert.equal(d.requiredCredits, 2); // 100s = 2 minutes
+  assert.equal(d.freeTrialsUsed, 1);
+  assert.equal(d.freeTrialsRemaining, 0);
+
   // Free trials never move credits and never write a credit ledger entry.
   assert.equal(service.getBalance(fresh().id), 0);
-  assert.equal(allTxns(service,fresh().id).length, 0);
-  assert.equal(fresh().freeTrialsUsed, 2);
+  assert.equal(allTxns(service, fresh().id).length, 0);
+  assert.equal(fresh().freeTrialsUsed, 1);
 });
 
 test('free trial duration cap: 1:00 and 2:00 are allowed, 2:01 is blocked before any provider call', () => {
@@ -224,7 +227,7 @@ test('free trial duration cap: 1:00 and 2:00 are allowed, 2:01 is blocked before
   const twoMinutes = decideAudioSpend(ctx(freshUser(), 120));
   assert.equal(twoMinutes.ok, true);
   assert.equal(twoMinutes.kind, 'FREE_TRIAL');
-  assert.equal(exceedsFreeTrialDuration(120, 2), false);
+  assert.equal(exceedsFreeTrialDuration(120, config.freeTrialLimit), false);
 
   // 2:01 — one second over: refused, and refused as a DURATION problem with
   // the exact product message (not the generic "out of trials" message).
@@ -237,8 +240,8 @@ test('free trial duration cap: 1:00 and 2:00 are allowed, 2:01 is blocked before
   assert.equal(twoOhOne.requiredCredits, 3); // 121s rounds UP to 3 minutes
   assert.equal(twoOhOne.balance, 0);
   assert.equal(twoOhOne.freeTrialsUsed, 0);
-  assert.equal(twoOhOne.freeTrialsRemaining, 2);
-  assert.equal(exceedsFreeTrialDuration(121, 2), true);
+  assert.equal(twoOhOne.freeTrialsRemaining, 1);
+  assert.equal(exceedsFreeTrialDuration(121, config.freeTrialLimit), true);
   assert.equal(FREE_TRIAL_MAX_DURATION_SECONDS, 120);
   assert.equal(twoOhOne.message, FREE_TRIAL_DURATION_LIMIT_MESSAGE);
   assert.equal(
@@ -253,35 +256,28 @@ test('free trial duration cap: 1:00 and 2:00 are allowed, 2:01 is blocked before
     assert.equal(again.ok, false);
     assert.equal(again.kind, 'FREE_TRIAL_DURATION_LIMIT');
     assert.equal(again.freeTrialsUsed, 0);
-    assert.equal(again.freeTrialsRemaining, 2);
+    assert.equal(again.freeTrialsRemaining, 1);
   }
 });
 
-test('free trial counter and total free allowance: 2 trials x 2 minutes = 4 minutes', async () => {
+test('total free allowance is 1 trial x 2 minutes = 2 minutes, never more', async () => {
   const { service, users, user } = await makeWallet(0);
   const fresh = () => users.getById(user.id) as UserRecord;
 
-  // Trial #1 available: 2 minutes usable, 2 trials remaining.
+  // The single free trial covers at most 2:00 of audio.
   let d = decideAudioSpend(ctx(fresh(), 120));
   assert.equal(d.kind, 'FREE_TRIAL');
-  assert.equal(d.freeTrialsRemaining, 2);
-  users.incrementFreeTrialsUsed(fresh().id);
-
-  // After trial #1 is used: 1 trial remaining.
-  d = decideAudioSpend(ctx(fresh(), 120));
-  assert.equal(d.kind, 'FREE_TRIAL');
-  assert.equal(d.freeTrialsUsed, 1);
   assert.equal(d.freeTrialsRemaining, 1);
   users.incrementFreeTrialsUsed(fresh().id);
 
-  // Both trials are now spent: even a 120s file must use credits, and the
-  // refusal is the generic one because the trials (not the duration) are gone.
+  // The trial is spent: even a 120s file must now use credits, and the refusal
+  // is the generic one because the TRIAL (not the duration) is gone.
   d = decideAudioSpend(ctx(fresh(), 120));
   assert.equal(d.ok, false);
   assert.equal(d.kind, 'NEED_CREDITS');
   assert.equal(d.message, NOT_ENOUGH_CREDITS_MESSAGE);
   assert.equal(d.code, 'NOT_ENOUGH_CREDITS');
-  assert.equal(d.freeTrialsUsed, 2);
+  assert.equal(d.freeTrialsUsed, 1);
   assert.equal(d.freeTrialsRemaining, 0);
 
   // A short file is refused identically: exhaustion, not duration, is the cause.
@@ -290,12 +286,79 @@ test('free trial counter and total free allowance: 2 trials x 2 minutes = 4 minu
   assert.equal(d.kind, 'NEED_CREDITS');
   assert.equal(d.freeTrialsRemaining, 0);
 
-  // Total free audio allowance across both trials.
-  assert.equal(freeTrialTotalMaxDurationSeconds(2), 240);
-  assert.equal(freeTrialTotalMaxDurationSeconds(2) / 60, 4);
+  // Total free audio allowance for the whole lifetime of the account: 2 minutes.
+  assert.equal(freeTrialTotalMaxDurationSeconds(1), 120);
+  assert.equal(freeTrialTotalMaxDurationSeconds(1) / 60, 2);
+  assert.equal(freeTrialTotalMaxDurationSeconds(config.freeTrialLimit), 120);
   // Free trials never move credits or write a credit ledger entry.
   assert.equal(service.getBalance(fresh().id), 0);
   assert.equal(allTxns(service, fresh().id).length, 0);
+});
+
+test('FROZEN POLICY: FREE_TRIAL_LIMIT is 1 and the per-trial cap is 2 minutes', () => {
+  assert.equal(config.freeTrialLimit, 1);
+  assert.equal(FREE_TRIAL_MAX_DURATION_SECONDS, 120);
+  // There is no way to obtain a second free trial.
+  assert.equal(isFreeTrialExhausted(0, config.freeTrialLimit), false);
+  assert.equal(isFreeTrialExhausted(1, config.freeTrialLimit), true);
+  assert.equal(freeTrialsRemaining(1, config.freeTrialLimit), 0);
+  assert.equal(freeTrialsRemaining(5, config.freeTrialLimit), 0);
+  // Total free usage can never exceed 2:00.
+  assert.equal(freeTrialTotalMaxDurationSeconds(config.freeTrialLimit), 120);
+});
+
+test('a >2-minute file can never be split across multiple free trials', async () => {
+  const { users, user } = await makeWallet(0);
+  const fresh = () => users.getById(user.id) as UserRecord;
+
+  // A 10-minute upload is refused outright and repeatedly. Even after 5
+  // attempts the counter is untouched, so no amount of retrying yields free
+  // audio, and the file is never chopped up to fit the 2-minute trial.
+  for (let i = 0; i < 5; i += 1) {
+    const d = decideAudioSpend(ctx(fresh(), 600));
+    assert.equal(d.ok, false);
+    assert.equal(d.kind, 'FREE_TRIAL_DURATION_LIMIT');
+    assert.equal(d.freeTrialsUsed, 0, 'a refused over-length request never consumes the trial');
+    assert.equal(fresh().freeTrialsUsed, 0);
+  }
+  // The refusal message points the user at credits.
+  const d = decideAudioSpend(ctx(fresh(), 600));
+  assert.equal(d.message, FREE_TRIAL_DURATION_LIMIT_MESSAGE);
+});
+
+test('a FAILED run never consumes the trial: the counter is only incremented on success', () => {
+  // Structural guarantee on server.ts: the single incrementFreeTrialsUsed()
+  // call must sit INSIDE the post-success accounting block and AFTER the
+  // provider transcription, so any thrown provider/API/server error jumps to
+  // the catch block and skips the increment entirely.
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const src = fs.readFileSync(path.join(here, '..', '..', 'server.ts'), 'utf8');
+
+  const increment = src.indexOf('users.incrementFreeTrialsUsed(');
+  const successMarker = src.indexOf('Success accounting');
+  const transcription = src.indexOf('const rawTranscript =');
+  const catchBlock = src.indexOf('} catch (error: any) {');
+
+  assert.ok(increment > -1, 'server.ts must increment the free-trial counter somewhere');
+  assert.ok(successMarker > -1, 'server.ts must keep the success-accounting block');
+  assert.ok(transcription > -1, 'server.ts must transcribe before accounting');
+  assert.ok(catchBlock > -1, 'server.ts must wrap the pipeline in try/catch');
+
+  assert.ok(
+    transcription < increment,
+    'the trial must be counted only AFTER the provider transcription succeeded'
+  );
+  assert.ok(
+    increment > successMarker && increment < catchBlock,
+    'the trial increment must live inside the post-success block, before the catch handler'
+  );
+
+  // The failure path releases a paid reservation and must NOT touch the trial.
+  const catchBody = src.slice(catchBlock, catchBlock + 2200);
+  assert.ok(
+    !catchBody.includes('incrementFreeTrialsUsed'),
+    'the failure/catch path must never consume a free trial'
+  );
 });
 
 test('a refused over-length free trial does not consume the trial (only success does)', async () => {
@@ -313,7 +376,7 @@ test('a refused over-length free trial does not consume the trial (only success 
   // A later file that fits still runs on trial #1.
   const ok = decideAudioSpend(ctx(fresh(), 60));
   assert.equal(ok.kind, 'FREE_TRIAL');
-  assert.equal(ok.freeTrialsRemaining, 2);
+  assert.equal(ok.freeTrialsRemaining, 1);
 });
 
 test('a user WITH credits may still process a >2:00 file (paid, not free)', () => {
@@ -324,7 +387,7 @@ test('a user WITH credits may still process a >2:00 file (paid, not free)', () =
   assert.equal(d.requiredCredits, 5); // 1 credit = 1 minute, rounded up
   // The trial is untouched: paying does not burn free allowance.
   assert.equal(d.freeTrialsUsed, 0);
-  assert.equal(d.freeTrialsRemaining, 2);
+  assert.equal(d.freeTrialsRemaining, 1);
 });
 
 test('an unmeasurable duration cannot be served by a free trial (fails closed)', () => {

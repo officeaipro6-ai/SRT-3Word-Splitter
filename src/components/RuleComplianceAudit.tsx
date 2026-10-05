@@ -35,16 +35,17 @@ export const RuleComplianceAudit: React.FC<RuleComplianceAuditProps> = ({ segmen
 
       {/* Rules Checklist Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-        {/* Word Limit Rule */}
+        {/* Frozen segmentation rule: max 3 spoken words per segment */}
         <div className="p-3 rounded-xl border border-indigo-200 bg-indigo-50/40 space-y-1">
           <div className="flex items-center justify-between">
-            <span className="font-bold text-xs text-indigo-950">Timing Rule (2–4s)</span>
+            <span className="font-bold text-xs text-indigo-950">Timing Rule (Max 3 Words)</span>
             <span className="font-mono text-xs font-bold px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-800">
               {audit.ruleChecks.timingRule.passed ? '✓ Compliant' : `${audit.ruleChecks.timingRule.nonCompliantCount} Exceeds`}
             </span>
           </div>
           <p className="text-[11px] text-indigo-900/80">
-            Every subtitle segment targets 2–4 seconds duration.
+            Maximum {audit.ruleChecks.timingRule.maxWords} spoken words per segment (2–3 preferred);
+            duration follows natural speech timing.
           </p>
         </div>
 

@@ -70,7 +70,7 @@ services:
       - key: INITIAL_CREDITS
         value: "0"
       - key: FREE_TRIAL_LIMIT
-        value: "2"
+        value: "1"
       - key: CREDITS_PER_JOB
         value: "1"
       - key: MAX_UPLOAD_BYTES
@@ -80,9 +80,10 @@ services:
       # Provider selection (default: sarvam)
       - key: ASR_PROVIDER
         value: sarvam
-      # Free trial policy
+      # Free trial policy: exactly 1 trial, max 2 minutes, so total free usage
+      # is capped at 2 minutes per user. Keep the two keys in sync.
       - key: FREE_TRIAL_LIMIT
-        value: "2"
+        value: "1"
       # Credit policy
       - key: CREDITS_PER_JOB
         value: "1"

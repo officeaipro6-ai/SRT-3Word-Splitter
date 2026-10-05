@@ -62,7 +62,10 @@ export const config = {
    * Counted server-side, only for successfully-processed audios; never for
    * failed uploads/API errors. UNLIMITED (operator/ADMIN) accounts are exempt.
    */
-  freeTrialLimit: envInt('FREE_TRIAL_LIMIT', 2),
+  // FROZEN FREE-TRIAL POLICY: exactly ONE free trial per user, covering at
+  // most FREE_TRIAL_MAX_DURATION_SECONDS (2 minutes) of server-measured audio.
+  // Total free usage is therefore capped at 2 minutes, ever.
+  freeTrialLimit: envInt('FREE_TRIAL_LIMIT', 1),
 
 /**
    * Optional operator-only bootstrap secret. When a session is created with

@@ -415,7 +415,7 @@ export default function App() {
       next.splice(targetIndex, 1, ...split);
       return enforceMaxWordsPerSegment(next, 3);
     });
-    addLog(`Segment #${id} split naturally with speech timing alignment (max 3 words).`);
+    addLog(`Segment #${id} split at a natural word boundary (maximum 3 spoken words).`);
   };
 
   // Auto-split all segments exceeding word limit

@@ -118,7 +118,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({ children }) => {
       <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-xs text-slate-500">
         <span className="inline-flex items-center gap-1.5">
           <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-          2–4 seconds per segment (no word limit)
+          Maximum 3 spoken words per segment
         </span>
         <span className="inline-flex items-center gap-1.5">
           <CheckCircle2 className="w-4 h-4 text-emerald-600" />

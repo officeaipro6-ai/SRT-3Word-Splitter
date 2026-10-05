@@ -181,23 +181,118 @@ export function applyTaggingRule(
 }
 
 /**
- * @deprecated Use findOptimalTimeChunks instead. Kept for backward compatibility.
+ * FROZEN production segmentation constant: the maximum number of SPOKEN words a
+ * normal subtitle segment may contain. Word count is the PRIMARY segmentation
+ * constraint (duration follows natural speech timing).
  */
-export function findOptimalNaturalWordChunks(words: string[], maxWords: number = 3): string[][] {
-  // Delegate to the new time-based function with default 2-4s limits
-  // Note: This ignores word timings and uses estimation since we can't access them here
-  return estimateTimeBasedChunks(words);
+export const MAX_SPOKEN_WORDS_PER_SEGMENT = 3;
+
+/**
+ * Exact, non-overlapping partition of `words` into consecutive groups of at most
+ * `maxWords`.
+ *
+ * This is the single place subtitle words are grouped, so the guarantees that
+ * the frozen rules depend on are enforced here once:
+ *   - every input word is emitted EXACTLY ONCE (no loss, no duplication)
+ *   - words keep their original order
+ *   - no word is ever split down the middle (splitting is on whole array items)
+ *   - no word is invented, reordered or rewritten
+ *
+ * The step size MUST equal the slice width. Using a smaller stride than the
+ * slice width re-emits the boundary word in the next chunk, which is how
+ * "word X" previously appeared at the end of one segment AND at the start of
+ * the next.
+ */
+export function chunkWordsByCount(
+  words: string[],
+  maxWords: number = MAX_SPOKEN_WORDS_PER_SEGMENT
+): string[][] {
+  const limit = Math.max(1, Math.floor(maxWords));
+  if (words.length === 0) return [];
+
+  const chunks: string[][] = [];
+  for (let i = 0; i < words.length; i += limit) {
+    chunks.push(words.slice(i, i + limit));
+  }
+  return chunks;
 }
 
 /**
- * @deprecated Use enforceTimeLimitsPerSegment instead. Kept for backward compatibility.
+ * Group consecutive spoken words into segments of at most `maxWords` words.
+ * Honours the requested limit (this function previously discarded `maxWords`
+ * and always returned 7-8 word groups).
+ */
+export function findOptimalNaturalWordChunks(
+  words: string[],
+  maxWords: number = MAX_SPOKEN_WORDS_PER_SEGMENT
+): string[][] {
+  return chunkWordsByCount(words, maxWords);
+}
+
+/**
+ * Split any spoken segment that exceeds `maxWords` spoken words into consecutive
+ * parts of at most `maxWords` words.
+ *
+ * Timing is NOT changed by the frozen rule, so an oversized segment is divided
+ * proportionally across its own existing [startSeconds, endSeconds] span: the
+ * first part keeps the original start, the last part keeps the original end.
+ * No absolute timestamp is ever invented from outside the segment.
+ *
+ * Tags are re-applied through the exact same `applyTaggingRule` used by
+ * `generateSrtContent`, so a `<NOISE>spoken text</NOISE>` segment keeps its
+ * tag on every part, and `<SIL></SIL>` / `<FIL>...</FIL>` are never split
+ * inside a tag. Non-spoken cues carry no spoken words and are passed through.
  */
 export function enforceMaxWordsPerSegment(
   segments: SubtitleSegment[],
-  maxWords: number = 3
+  maxWords: number = MAX_SPOKEN_WORDS_PER_SEGMENT
 ): SubtitleSegment[] {
-  // Delegate to the new time-based function with default 1-4s limits
-  return enforceTimeLimitsPerSegment(segments, 1.0, 4.0);
+  const limit = Math.max(1, Math.floor(maxWords));
+  const out: SubtitleSegment[] = [];
+
+  for (const seg of segments) {
+    const words = extractWords(seg.text || seg.taggedText);
+    if (words.length <= limit) {
+      out.push(seg);
+      continue;
+    }
+
+    const span = seg.endSeconds - seg.startSeconds;
+    let offset = 0;
+    for (const chunk of chunkWordsByCount(words, limit)) {
+      const start = Number(
+        (seg.startSeconds + (offset / words.length) * span).toFixed(3)
+      );
+      const end = Number(
+        (seg.startSeconds + ((offset + chunk.length) / words.length) * span).toFixed(3)
+      );
+
+      const text = chunk.join(' ');
+      const { taggedText } = applyTaggingRule(
+        text,
+        seg.classification,
+        end > start ? end - start : 0.001
+      );
+
+      out.push({
+        ...seg,
+        startSeconds: start,
+        endSeconds: end > start ? end : start + 0.001,
+        text,
+        taggedText,
+        wordTimings: undefined,
+      });
+
+      offset += chunk.length;
+    }
+  }
+
+  return out.map((seg, idx) => ({
+    ...seg,
+    id: idx + 1,
+    startTimeFormatted: formatSrtTimestamp(seg.startSeconds),
+    endTimeFormatted: formatSrtTimestamp(seg.endSeconds),
+  }));
 }
 
 /**
@@ -228,11 +323,13 @@ function cleanPunctuation(word: string): { root: string; hasPunctuation: boolean
 }
 
 /**
- * Timing-aware chunking algorithm:
- * Partitions words into natural segments of 2-4 seconds duration.
- * Groups words that naturally fit within the 2-4 second window.
- * Splits at natural speech boundaries (punctuation, clause boundaries).
- * No maximum word count - only timing constraints.
+ * Segment chunking entry point.
+ *
+ * The FROZEN production rule is a maximum of MAX_SPOKEN_WORDS_PER_SEGMENT
+ * spoken words per normal segment (2-3 preferred); duration follows natural
+ * speech timing. Per-word timings are still honoured when they line up 1:1,
+ * but the word-count ceiling is what is actually enforced downstream, so the
+ * no-timing fallback partitions by word count instead of guessing durations.
  */
 export function findOptimalTimeChunks(
   words: string[],
@@ -249,13 +346,16 @@ export function findOptimalTimeChunks(
     return findTimeBasedChunks(words, wordTimings);
   }
 
-  // Fallback: estimate timing proportionally when word timings unavailable
-  return estimateTimeBasedChunks(words);
+  // Fallback: no usable per-word timing, so fall back to the frozen word-count
+  // rule rather than inventing duration-based groups.
+  return chunkWordsByCount(words, MAX_SPOKEN_WORDS_PER_SEGMENT);
 }
 
 /**
  * Time-based chunking using actual word timings.
- * Groups consecutive words that fit within 2-4 second windows.
+ * Groups consecutive words into natural speech windows, but the frozen
+ * word-count rule stays primary: a chunk never holds more than
+ * MAX_SPOKEN_WORDS_PER_SEGMENT spoken words, even when the audio is slow.
  */
 function findTimeBasedChunks(
   words: string[],
@@ -267,40 +367,37 @@ function findTimeBasedChunks(
   const chunks: string[][] = [];
   let chunkStart = 0;
 
-  for (let i = 0; i < words.length; i++) {
-    const wordStart = wordTimings[i].startSeconds;
-    const wordEnd = wordTimings[i].endSeconds;
+  for (let i = 0; i < n; i++) {
     const chunkStartTime = wordTimings[chunkStart].startSeconds;
-    const currentDuration = wordTimings[i].endSeconds - wordTimings[chunkStart].startSeconds;
+    const chunkDuration = wordTimings[i].endSeconds - chunkStartTime;
 
-    // Check if adding this word would exceed 4 seconds
-    const wouldExceedMax = wordTimings[i].endSeconds - wordTimings[chunkStart].startSeconds > 4.0;
-
-    // Check if we've reached minimum duration and next word would be a natural break
-    const chunkDuration = wordTimings[i].endSeconds - wordTimings[chunkStart].startSeconds;
+    // Cut BEFORE this word when the current window already ran past 4s.
+    const wouldExceedMaxDuration = chunkDuration > 4.0;
     const isAtLeastMinDuration = chunkDuration >= 2.0;
 
-    // Check for natural break points (punctuation, clause boundaries)
-    const isNaturalBreak = i < words.length - 1 && isNaturalBreakPoint(i);
+    // Natural break points (punctuation, clause boundaries) between words.
+    const isNaturalBreak = i < n - 1 && isNaturalBreakPoint(i);
+    const isLastWord = i === n - 1;
 
-    // Decide whether to cut here:
-    // 1. If adding this word exceeds 4 seconds -> cut before this word
-    // 2. If we're at minimum duration AND there's a natural break -> can break
-    // 3. If this is the last word, always include it
-    const isLastWord = i === wordTimings.length - 1;
-    const shouldBreak = isLastWord || 
-      (wouldBreakMax && i > 0) ||
-      (isAtLeastMinDuration && isNaturalBreakPoint && i > 0);
+    // PRIMARY RULE: never let the chunk exceed the spoken-word maximum.
+    const chunkWordCount = i - chunkStart + 1;
+    const wouldBreakMaxWords =
+      chunkWordCount >= MAX_SPOKEN_WORDS_PER_SEGMENT && i > chunkStart;
 
-    if (shouldBreak && i > 0) {
-      // Create chunk from chunkStart to i (inclusive)
+    const shouldBreak =
+      isLastWord ||
+      wouldBreakMaxWords ||
+      (i > chunkStart && wouldExceedMaxDuration) ||
+      (i > chunkStart && isAtLeastMinDuration && isNaturalBreak);
+
+    if (shouldBreak && i > chunkStart) {
       chunks.push(words.slice(chunkStart, i + 1));
       chunkStart = i + 1;
     }
   }
 
   // Handle any remaining words
-  if (chunkStart < words.length) {
+  if (chunkStart < n) {
     chunks.push(words.slice(chunkStart));
   }
 
@@ -317,29 +414,11 @@ function isNaturalBreakPoint(index: number): boolean {
 }
 
 /**
- * Fallback: estimate timing when word timings unavailable.
- * Distributes words proportionally to fit 2-4 second windows.
- */
-function estimateTimeBasedChunks(words: string[]): string[][] {
-  const n = words.length;
-  if (n <= 4) return [words]; // Small sentences stay together
-
-  // Heuristic: ~2.5 words per second average speech rate
-  // Target 2-4 seconds = ~5-10 words per segment
-  const wordsPerSegment = 7; // Aim for ~7 words (~2.5-3 seconds)
-  const chunks: string[][] = [];
-
-  for (let i = 0; i < words.length; i += wordsPerSegment) {
-    const chunk = words.slice(i, Math.min(i + 8, words.length)); // Max 8 words
-    chunks.push(chunk);
-  }
-
-  return chunks;
-}
-
-/**
- * Split a single subtitle segment based on time limits (2-4 seconds).
- * No maximum word count - splits are based on timing and natural speech boundaries.
+ * Split a single subtitle segment that is too long in DURATION.
+ *
+ * The frozen production rule is a maximum of MAX_SPOKEN_WORDS_PER_SEGMENT
+ * spoken words, so the split is always taken at a whole-word boundary and the
+ * result never exceeds that word maximum.
  *
  * TIMESTAMP RULE: a split subtitle's START is the first word's start and its
  * END is the last word's end, taken from the segment's own word-level timing
@@ -394,8 +473,8 @@ export function splitSegmentByTimeLimit(
     wordTimings.length === words.length &&
     wordTimings.every((w) => Number.isFinite(w?.startSeconds) && Number.isFinite(w?.endSeconds));
 
-  // Split the words into natural chunks based on time (2-4 seconds).
-  const chunks = findOptimalTimeChunks(words, wordTimings);
+// Split the words at whole-word boundaries (maximum 3 spoken words).
+    const chunks = findOptimalTimeChunks(words, wordTimings);
 
   if (chunks.length === 0) {
     return [seg];
@@ -480,9 +559,10 @@ export function splitSegmentByWordLimit(
 }
 
 /**
- * Enforces 2-4 second duration limits per segment across all segments.
- * Splits segments longer than 4 seconds, merges segments shorter than 2 seconds
- * when possible. No word count limits.
+ * Enforces the segment length limits across all segments: splits segments that
+ * exceed `maxDuration` in seconds, and merges adjacent same-classification
+ * segments shorter than `minDuration` **only when the merged result still
+ * respects MAX_SPOKEN_WORDS_PER_SEGMENT spoken words**.
  * Re-indexes all segment IDs sequentially (1, 2, 3...).
  */
 export function enforceTimeLimitsPerSegment(
@@ -516,7 +596,12 @@ export function enforceTimeLimitsPerSegment(
       // Only merge if same classification and adjacent
       if (
         prev.classification === seg.classification &&
-        seg.startSeconds - prev.endSeconds < 0.5
+        seg.startSeconds - prev.endSeconds < 0.5 &&
+        // The frozen rule caps spoken words per segment at 3, so never merge
+        // two short cues into one that would exceed that maximum.
+        countWords(prev.text || prev.taggedText) +
+          countWords(seg.text || seg.taggedText) <=
+          MAX_SPOKEN_WORDS_PER_SEGMENT
       ) {
         // Merge with previous
         merged[merged.length - 1] = {
@@ -551,7 +636,12 @@ export function enforceTimeLimitsPerSegment(
  */
 export function generateSrtContent(segments: SubtitleSegment[]): string {
   // Enforce 2-4 second duration limits per segment
-  const enforcedSegments = enforceTimeLimitsPerSegment(segments, 1.0, 4.0);
+  const timeLimited = enforceTimeLimitsPerSegment(segments, 1.0, 4.0);
+
+  // Word count is the PRIMARY rule, so re-apply it AFTER the time-based split:
+  // the time splitter groups words by speech duration and can otherwise leave a
+  // cue holding more than the maximum when 1:1 word timings are present.
+  const enforcedSegments = enforceMaxWordsPerSegment(timeLimited, MAX_SPOKEN_WORDS_PER_SEGMENT);
 
   // Filter out silence segments shorter than 1.00s as mandated by Rule E
   const validSegments = enforcedSegments.filter((seg) => {
@@ -580,7 +670,10 @@ export function generateSrtContent(segments: SubtitleSegment[]): string {
  * Generate WebVTT format with 2-4 second segment timing limits.
  */
 export function generateVttContent(segments: SubtitleSegment[]): string {
-  const enforcedSegments = enforceTimeLimitsPerSegment(segments, 1.0, 4.0);
+  const enforcedSegments = enforceMaxWordsPerSegment(
+    enforceTimeLimitsPerSegment(segments, 1.0, 4.0),
+    MAX_SPOKEN_WORDS_PER_SEGMENT
+  );
 
   const validSegments = enforcedSegments.filter((seg) => {
     if (seg.classification === 'SILENCE') {
@@ -675,7 +768,8 @@ export function calculateTranscriptionStats(segments: SubtitleSegment[]): Transc
 }
 
 /**
- * Validate SRT integrity and Rule compliance including the Max 3 Words Rule
+ * Validate SRT integrity and Rule compliance, including the frozen maximum of
+ * MAX_SPOKEN_WORDS_PER_SEGMENT spoken words per segment.
  */
 export function auditRuleCompliance(segments: SubtitleSegment[]): {
   isFullyCompliant: boolean;
@@ -688,8 +782,8 @@ export function auditRuleCompliance(segments: SubtitleSegment[]): {
     ruleMB: { passed: boolean; count: number; description: string };
     timingRule: {
       passed: boolean;
-      minDuration: number;
-      maxDuration: number;
+      maxWords: number;
+      maxWordsObserved: number;
       nonCompliantCount: number;
       description: string;
     };
@@ -714,14 +808,18 @@ export function auditRuleCompliance(segments: SubtitleSegment[]): {
       maxWordsObserved = wordCount;
     }
 
-    const segmentDuration = seg.endSeconds - seg.startSeconds;
-    if (seg.classification !== 'SILENCE' && seg.classification !== 'MUSIC_ONLY' && seg.classification !== 'NOISE_ONLY') {
-      if (segmentDuration < 2.0) {
-        // Soft warning: <2s spoken segments should be combined with adjacent when possible
-        warnings.push(`Segment #${seg.id || idx + 1}: Duration ${segmentDuration.toFixed(2)}s is below 2.0s (consider merging with adjacent)`);
-      } else if (segmentDuration > 4.0) {
-        warnings.push(`Segment #${seg.id || idx + 1}: Duration ${segmentDuration.toFixed(2)}s exceeds 4.0s maximum (must split at natural boundary)`);
-      }
+    // FROZEN segmentation rule: a normal spoken segment holds at most
+    // MAX_SPOKEN_WORDS_PER_SEGMENT spoken words (2-3 preferred). Duration is
+    // NOT a rule - natural speech timing is allowed to vary.
+    const isSpokenCue =
+      seg.classification !== 'SILENCE' &&
+      seg.classification !== 'MUSIC_ONLY' &&
+      seg.classification !== 'NOISE_ONLY';
+    if (isSpokenCue && wordCount > MAX_SPOKEN_WORDS_PER_SEGMENT) {
+      nonCompliantWordLimitCount++;
+      warnings.push(
+        `Segment #${seg.id || idx + 1}: ${wordCount} spoken words exceeds the maximum of ${MAX_SPOKEN_WORDS_PER_SEGMENT} spoken words per segment`
+      );
     }
     
     // Check start < end
@@ -801,11 +899,11 @@ export function auditRuleCompliance(segments: SubtitleSegment[]): {
         description: 'Unintelligible or music-masked speech outputs plain transcript text (never invented words, never <MB>).',
       },
       timingRule: {
-        passed: warnings.filter(w => w.includes('Duration')).length === 0,
-        minDuration: 1.0,
-        maxDuration: 4.0,
-        nonCompliantCount: warnings.filter(w => w.includes('Duration')).length,
-        description: 'Spoken segments >4s must split at natural boundary; <2s should merge with adjacent when possible; silence >=1s is valid <SIL></SIL>.',
+        passed: nonCompliantWordLimitCount === 0,
+        maxWords: MAX_SPOKEN_WORDS_PER_SEGMENT,
+        maxWordsObserved,
+        nonCompliantCount: nonCompliantWordLimitCount,
+        description: `Maximum ${MAX_SPOKEN_WORDS_PER_SEGMENT} spoken words per normal subtitle segment (2-3 words preferred). Duration follows natural speech timing and is not itself a rule.`,
       },
     },
     warnings,

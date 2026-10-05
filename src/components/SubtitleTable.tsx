@@ -370,7 +370,7 @@ export const SubtitleTable: React.FC<SubtitleTableProps> = ({
                         {isOverLimit ? (
                           <div className="flex items-center gap-1.5 text-[11px] text-amber-800 font-semibold">
                             <AlertTriangle className="w-3 h-3 text-amber-600" />
-                            <span>{wordCount} words (Limit: Max 3)</span>
+                            <span>{wordCount} words (Maximum 3)</span>
                             {onSplitSegment && (
                               <button
                                 onClick={() => onSplitSegment(seg.id)}

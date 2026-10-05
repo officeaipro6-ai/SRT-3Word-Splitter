@@ -35,23 +35,24 @@ export const RulesGuideModal: React.FC<RulesGuideModalProps> = ({ isOpen, onClos
 
         {/* Modal Body */}
         <div className="p-6 overflow-y-auto space-y-6 text-sm text-slate-700">
-          {/* 3-Word Limit Mandatory Rule */}
+          {/* 3-Word Maximum Mandatory Rule */}
           <div className="p-4 rounded-xl bg-indigo-50/80 border border-indigo-200 space-y-2">
             <div className="flex items-center justify-between">
               <span className="font-bold text-indigo-950 flex items-center gap-1.5">
                 <CheckCircle2 className="w-4 h-4 text-indigo-600" />
-                MANDATORY RULE — 2–4 Second Duration Per Subtitle Segment
+                MANDATORY RULE — Maximum 3 Spoken Words Per Subtitle Segment
               </span>
               <span className="text-xs font-mono font-medium px-2 py-0.5 rounded bg-indigo-200 text-indigo-900">
-                2–4 Seconds / Segment
+                Max 3 Words / Segment
               </span>
             </div>
             <p className="text-xs text-indigo-950/90">
-              Each subtitle segment targets <strong>2–4 seconds</strong>. There is <strong>NO maximum word count</strong>. Segments naturally fit spoken words within the timing boundary. If a segment exceeds 4 seconds, it is split at a natural speech boundary. Segments under 2 seconds may be merged with adjacent spoken content.
+              Each subtitle segment contains <strong>at most 3 spoken words</strong> (2–3 preferred). Word count is the primary segmentation rule; segment <strong>duration follows natural speech timing</strong> and is not itself a rule. Long speech is divided at natural word boundaries so no spoken word is split, lost, reordered or invented.
             </p>
             <ul className="text-xs list-disc list-inside space-y-1 text-indigo-900">
               <li>Original Unicode text is preserved exactly (no rewriting, translation, or omissions).</li>
               <li>Words are never split across segments.</li>
+              <li>Every spoken word appears exactly once — never duplicated at a segment boundary.</li>
               <li>Timestamps are recalculated proportionally and remain continuous.</li>
               <li><code>&lt;NOISE&gt;</code>, <code>&lt;FILLER&gt;</code>, and <code>&lt;SILENCE&gt;</code> tags remain intact on all split segments. (Tags do not count toward the 3-word limit).</li>
             </ul>

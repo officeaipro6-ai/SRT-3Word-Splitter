@@ -5,9 +5,10 @@
  *
  * Semantics:
  *  - A NORMAL user may successfully process exactly `limit` audio jobs for
- *    free. The counter increments server-side ONLY after a successful pipeline
- *    run, so failed uploads / API errors never consume a trial and a browser
- *    refresh cannot reset it (the session token is stable in localStorage).
+ *    free. The FROZEN limit is 1: one free trial per user, ever. The counter
+ *    increments server-side ONLY after a successful pipeline run, so failed
+ *    uploads / API errors never consume a trial and a browser refresh cannot
+ *    reset it (the session token is stable in localStorage).
  *  - Each individual free trial may cover at most
  *    `FREE_TRIAL_MAX_DURATION_SECONDS` (2 minutes) of SERVER-MEASURED audio. A
  *    longer file can never be served by a free trial: it is refused with a
@@ -26,9 +27,9 @@ import { config } from '../config';
 export const FREE_TRIAL_LIMIT = config.freeTrialLimit;
 
 /**
- * Maximum SERVER-MEASURED duration, in seconds, that ONE free trial may
- * process: 2 minutes. With the default 2 trials this caps total free usage at
- * 4 minutes per new user.
+ * Maximum SERVER-MEASURED duration, in seconds, that the ONE free trial may
+ * process: 2 minutes. With the frozen limit of 1 trial this caps total free
+ * usage at 2 minutes per new user.
  */
 export const FREE_TRIAL_MAX_DURATION_SECONDS = 120;
 
@@ -40,7 +41,7 @@ export const FREE_TRIAL_DURATION_LIMIT_CODE = 'FREE_TRIAL_DURATION_LIMIT';
 export const FREE_TRIAL_DURATION_LIMIT_MESSAGE =
   'Free trial is limited to 2 minutes. Please use credits for longer files.';
 
-/** Total free audio seconds a new user may ever consume (2 trials x 2 min). */
+/** Total free audio seconds a new user may ever consume (1 trial x 2 min). */
 export function freeTrialTotalMaxDurationSeconds(limit: number): number {
   return limit > 0 ? limit * FREE_TRIAL_MAX_DURATION_SECONDS : 0;
 }

@@ -13,6 +13,7 @@ import os from 'os';
 import path from 'path';
 import dotenv from 'dotenv';
 import { config } from '../config.ts';
+import { FREE_TRIAL_MAX_DURATION_SECONDS } from './freeTrialPolicy.ts';
 import { DataStore } from '../db/store.ts';
 import { ProviderSafetyRepo } from '../db/repos.ts';
 import { ProviderSafetyService, ProviderSpendingError } from './providerSafety.ts';
@@ -345,10 +346,15 @@ test('6. nothing that must not change was changed by this configuration', () => 
   // Credit packs are untouched.
   const packs = fs.readFileSync(path.resolve(process.cwd(), 'server.ts'), 'utf8');
   assert.doesNotMatch(packs, /PROVIDER_SPENDING_PROTECTION\s*[:=]\s*['"]true/);
-  // No credit-pack pricing was altered by the switch.
+  // No credit-pack pricing was altered by the switch. The .env value must
+  // determine the getter: derive the expectation from the file, then let the
+  // getter read that same value (the test runner does not call dotenv.config(),
+  // so process.env must be seeded explicitly, exactly as server.ts would).
   const raw = env.PROVIDER_SPENDING_PROTECTION?.trim().toLowerCase();
   const expected = !['0', 'false', 'no', 'off'].includes(raw ?? '');
-  assert.equal(expected, config.providerSpendingProtection);
+  withSwitch(env.PROVIDER_SPENDING_PROTECTION, () => {
+    assert.equal(config.providerSpendingProtection, expected);
+  });
 });
 
 test('7. render.yaml keeps spending protection ON and the kill-switch OFF', () => {
@@ -356,4 +362,16 @@ test('7. render.yaml keeps spending protection ON and the kill-switch OFF', () =
   // The production posture the split was requested for, pinned in config.
   assert.match(yaml, /- key: PROVIDER_SPENDING_PROTECTION\n\s+value: "true"/);
   assert.match(yaml, /- key: PROVIDER_KILL_SWITCH\n\s+value: "false"/);
+});
+
+test('8. FROZEN free-trial policy is deployed: exactly 1 trial, max 2 minutes', () => {
+  const yaml = fs.readFileSync(path.resolve(process.cwd(), 'render.yaml'), 'utf8');
+  // Every FREE_TRIAL_LIMIT occurrence must be "1" - never "2" - or the deployed
+  // free allowance would silently double. Both duplicate keys must agree.
+  const values = [...yaml.matchAll(/- key: FREE_TRIAL_LIMIT\n\s+value:\s*"([^"]*)"/g)].map((m) => m[1]);
+  assert.ok(values.length > 0, 'render.yaml must declare FREE_TRIAL_LIMIT');
+  assert.deepEqual(values, values.map(() => '1'), `every FREE_TRIAL_LIMIT must be "1", got ${values}`);
+  // The config default must match production, so a missing env var cannot widen it.
+  assert.equal(config.freeTrialLimit, 1);
+  assert.equal(FREE_TRIAL_MAX_DURATION_SECONDS, 120);
 });
