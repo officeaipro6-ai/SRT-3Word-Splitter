@@ -987,6 +987,23 @@ export class LoginActivityRepo {
     });
   }
 
+  /**
+   * Remove an UNDELIVERED (still-claimed) alert for a period so a later run can
+   * retry that day. Only a row whose statusMessage is the in-flight claim marker
+   * is removed; an alert that already carries a real delivery result is kept, so
+   * a successfully sent report can never be erased and re-sent.
+   */
+  deleteAlertFor(periodDate: string): boolean {
+    return this.store.mutate((db) => {
+      const list = db.loginAlerts ?? [];
+      const at = list.findIndex((a) => a.periodDate === periodDate);
+      if (at < 0) return false;
+      if (!String(list[at].statusMessage ?? '').startsWith('Claimed for delivery')) return false;
+      list.splice(at, 1);
+      return true;
+    });
+  }
+
   /** Newest-first alert log. */
   listAlerts(limit = 60): LoginAlertRecord[] {
     return (this.store.snapshot().loginAlerts ?? [])

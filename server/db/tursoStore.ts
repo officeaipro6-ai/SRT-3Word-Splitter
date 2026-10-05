@@ -15,7 +15,9 @@
  * All fields are stored as TEXT/INTEGER/REAL with JSON blobs for nested objects.
  */
 
-import { createClient } from '@libsql/client';
+import { createClient, type InArgs as LibsqlInArgs } from '@libsql/client';
+
+type SqlArgs = LibsqlInArgs;
 import {
   DB_VERSION,
   type CommunityMessageRecord,
@@ -603,16 +605,16 @@ export class TursoStore {
 
   /** The stored CREATE TABLE text for a table, or '' when it is not a table. */
   private async tableDdl(table: string): Promise<string> {
-    const rows = await this.client.execute(
-      "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
-      [table]
-    );
+    const rows = await this.client.execute({
+      sql: "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+      args: [table] as SqlArgs,
+    });
     return String(rows.rows[0]?.sql ?? '');
   }
 
   /** Execute a SELECT query and return rows. */
-  private async query<T>(sql: string, args: unknown[] = []): Promise<T[]> {
-    const result = await this.client.execute({ sql, args });
+  private async query<T>(sql: string, args: readonly unknown[] = []): Promise<T[]> {
+    const result = await this.client.execute({ sql, args: args as SqlArgs });
     return result.rows as T[];
   }
 
@@ -623,7 +625,7 @@ export class TursoStore {
    * `SELECT *` can never hand a caller a raw JSON string where the DataStore
    * interface promises an array/object.
    */
-  private async queryTable<T>(table: string, sql: string, args: unknown[] = []): Promise<T[]> {
+  private async queryTable<T>(table: string, sql: string, args: readonly unknown[] = []): Promise<T[]> {
     return (await this.query<T>(sql, args)).map((row) => decodeJsonRow(table, row));
   }
 
@@ -659,8 +661,23 @@ export class TursoStore {
   }
 
   /** Execute a non-SELECT statement. */
-  private async exec(sql: string, args: unknown[] = []): Promise<void> {
-    await this.client.execute({ sql, args });
+  private async exec(sql: string, args: readonly unknown[] = []): Promise<void> {
+    await this.client.execute({ sql, args: args as SqlArgs });
+  }
+
+  /**
+   * Execute a non-SELECT statement and report how many rows it actually
+   * changed.
+   *
+   * Needed for compare-and-set work (see `claimDailyLoginAlert`): `exec()`
+   * throws the write result away, but "did my INSERT win the race, or did
+   * another caller already own this row?" IS the answer we are after. SQLite
+   * returns 0 affected rows for a no-op `ON CONFLICT DO NOTHING`, which is
+   * precisely the losing case.
+   */
+  private async execCount(sql: string, args: readonly unknown[] = []): Promise<number> {
+    const result: any = await this.client.execute({ sql, args: args as SqlArgs });
+    return Number(result?.rowsAffected ?? 0);
   }
 
   /**
@@ -1281,6 +1298,102 @@ export class TursoStore {
 
   async findAlertFor(periodDate: string): Promise<any | null> {
     return this.queryTableRow('loginAlerts', 'SELECT * FROM loginAlerts WHERE periodDate = ?', [periodDate]);
+  }
+
+  /**
+   * ATOMIC, PERSISTED CLAIM on the daily login report for one IST date.
+   *
+   * WHY THIS EXISTS. The previous guard read `store.snapshot().loginAlerts`,
+   * which on libSQL is a Promise: the `.loginAlerts` property was `undefined`,
+   * `?? []` turned it into an empty array, and the guard therefore reported
+   * "no alert for this day" FOREVER. The report was sent, the follow-up
+   * `saveAlert()` threw (it used the unsupported whole-snapshot `mutate()`), and
+   * the send was never recorded - so every tick and every restart re-sent the
+   * same Telegram message. A check-then-act guard cannot fix that, because
+   * there was nothing persisted to check.
+   *
+   * HOW THIS FIXES IT. This is ONE statement against the table's
+   * UNIQUE(periodDate) constraint, so SQLite resolves it atomically for N
+   * concurrent callers (ticks, restarts, several Render instances):
+   *
+   *   - no row for the date      -> INSERT, 1 row affected, caller WINS
+   *   - row exists, DELIVERED / NOT_CONFIGURED -> the conditional DO UPDATE's
+   *     WHERE does not match, 0 rows affected, caller LOSES and must not send
+   *   - row exists, PENDING      -> another caller is mid-send, 0 rows, LOSES
+   *   - row exists, FAILED       -> the message never arrived, so the date is
+   *     re-claimed, 1 row, caller WINS and retries
+   *
+   * The state lives in the database, so it survives a restart, a redeploy and a
+   * scale-out. There is no in-memory flag anywhere in this path.
+   */
+  async claimDailyLoginAlert(claim: {
+    id: string;
+    alertDate: string;
+    periodDate: string;
+    month: string;
+    generatedAt: string;
+  }): Promise<boolean> {
+    const changed = await this.execCount(
+      `INSERT INTO loginAlerts (id, alertDate, periodDate, month, generatedAt, totalLogins, uniqueUsers, newUsers, activeUsers, failedLogins, topUsers, deliveryStatus, statusMessage)
+       VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, 0, NULL, 'PENDING', ?)
+       ON CONFLICT(periodDate) DO UPDATE SET
+         id = excluded.id,
+         alertDate = excluded.alertDate,
+         month = excluded.month,
+         generatedAt = excluded.generatedAt,
+         totalLogins = 0,
+         uniqueUsers = 0,
+         newUsers = 0,
+         activeUsers = 0,
+         failedLogins = 0,
+         topUsers = NULL,
+         deliveryStatus = 'PENDING',
+         statusMessage = excluded.statusMessage
+       WHERE loginAlerts.deliveryStatus = 'FAILED'`,
+      [
+        claim.id,
+        claim.alertDate,
+        claim.periodDate,
+        claim.month,
+        claim.generatedAt,
+        'Claimed for delivery; no message sent yet.',
+      ]
+    );
+    return changed > 0;
+  }
+
+  /**
+   * Fill in the claimed row with the real summary and the real delivery result.
+   * Only the caller that WON the claim may call this, and only for its own row.
+   */
+  async completeDailyLoginAlert(alert: any): Promise<void> {
+    await this.exec(
+      `UPDATE loginAlerts SET
+         totalLogins = ?, uniqueUsers = ?, newUsers = ?, activeUsers = ?, failedLogins = ?,
+         topUsers = ?, deliveryStatus = ?, statusMessage = ?
+       WHERE periodDate = ?`,
+      [
+        alert.totalLogins,
+        alert.uniqueUsers,
+        alert.newUsers,
+        alert.activeUsers,
+        alert.failedLogins,
+        JSON.stringify(alert.topUsers ?? []),
+        alert.deliveryStatus,
+        alert.statusMessage,
+        alert.periodDate,
+      ]
+    );
+  }
+
+  /**
+   * Give up an unfulfilled claim so a later tick can retry the same IST date.
+   *
+   * Only a PENDING row is removed. A row that already carries a real delivery
+   * result is never deleted here, so a successful report stays recorded.
+   */
+  async releaseDailyLoginAlert(periodDate: string): Promise<void> {
+    await this.exec(`DELETE FROM loginAlerts WHERE periodDate = ? AND deliveryStatus = 'PENDING'`, [periodDate]);
   }
 
   /**

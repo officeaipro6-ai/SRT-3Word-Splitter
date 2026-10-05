@@ -49,6 +49,30 @@ export interface AsyncAccountService {
 
   // --- activity + admin bootstrap ---
   touch(userId: string): Promise<void>;
+  /**
+   * Atomically consume ONE free trial and return the new count, or null when the
+   * user does not exist.
+   *
+   * The POLICY (how many trials, and the duration cap) is untouched and still
+   * lives in `freeTrialPolicy.ts` / `config.freeTrialLimit`. Only the
+   * persistence moved: this used to be `UserRepo.incrementFreeTrialsUsed`,
+   * which went through the unsupported whole-snapshot `mutate()` and therefore
+   * threw on the libSQL provider, so a successful free transcription 500'd and
+   * the trial was never consumed. It now uses each provider's real
+   * increment, which is a conditional SQL UPDATE.
+   */
+  incrementFreeTrialsUsed(userId: string): Promise<number | null>;
+  /**
+   * Append the ZERO-AMOUNT `FREE_TRIAL` ledger row that records "a trial was
+   * spent".
+   *
+   * This is an audit entry, not a credit movement: `amount` is 0 and the balance
+   * is unchanged. It exists so the admin transaction log explains why a user's
+   * trial count moved. Previously this was `creditsRepo.add(...)`, which uses
+   * the unsupported whole-snapshot `mutate()` on libSQL and therefore threw,
+   * taking the whole successful transcription down with it.
+   */
+  recordFreeTrialUsage(userId: string, balanceAfter: number): Promise<void>;
   setRole(userId: string, role: UserRole): Promise<boolean>;
   setCreditMode(userId: string, creditMode: CreditMode): Promise<boolean>;
   setOwnerEmail(userId: string, ownerEmail: string): Promise<boolean>;
@@ -98,6 +122,18 @@ export function createFileAccountFacade(users: UserRepo, credits?: CreditRepo): 
     },
 
     touch: async (userId) => users.touch(userId),
+    incrementFreeTrialsUsed: async (userId) => users.incrementFreeTrialsUsed(userId),
+    recordFreeTrialUsage: async (userId, balanceAfter) => {
+      if (!credits) return;
+      credits.add({
+        userId,
+        amount: 0,
+        type: 'FREE_TRIAL',
+        reason: 'free_trial_transcription',
+        jobId: undefined,
+        balanceAfter,
+      });
+    },
     setRole: async (userId, role) => users.setRole(userId, role),
     setCreditMode: async (userId, creditMode) => users.setCreditMode(userId, creditMode),
     setOwnerEmail: async (userId, ownerEmail) => users.setOwnerEmail(userId, ownerEmail),
@@ -121,6 +157,8 @@ export function createTursoAccountFacade(svc: TursoAccountService): AsyncAccount
       svc.createSessionUser(tokenHash, initialCredits, role, creditMode),
 
     touch: (userId) => svc.touch(userId),
+    incrementFreeTrialsUsed: (userId) => svc.incrementFreeTrialsUsed(userId),
+    recordFreeTrialUsage: (userId, balanceAfter) => svc.recordFreeTrialUsage(userId, balanceAfter),
     setRole: (userId, role) => svc.setRole(userId, role),
     setCreditMode: (userId, creditMode) => svc.setCreditMode(userId, creditMode),
     setOwnerEmail: (userId, ownerEmail) => svc.setOwnerEmail(userId, ownerEmail),

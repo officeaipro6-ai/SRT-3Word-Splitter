@@ -178,8 +178,7 @@ export const CreditPacksPanel: React.FC<Props> = ({ wallet, freeTrialsRemaining,
       {freeTrialsRemaining !== null && freeTrialLimit > 0 && (
         <div className="rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-2 text-[11px] text-slate-600 space-y-0.5">
           <p className="font-semibold text-slate-700">
-            {freeTrialLimit} Free Trial{freeTrialLimit === 1 ? '' : 's'} — Up to {FREE_TRIAL_MAX_MINUTES}{' '}
-            minute{FREE_TRIAL_MAX_MINUTES === 1 ? '' : 's'}
+            {freeTrialLimit} Free Trial{freeTrialLimit === 1 ? '' : 's'} — Up to {FREE_TRIAL_MAX_MINUTES} minutes
             {freeTrialLimit === 1 ? '' : ' each'}
           </p>
           <p>Total free usage: up to {freeTrialLimit * FREE_TRIAL_MAX_MINUTES} minutes</p>

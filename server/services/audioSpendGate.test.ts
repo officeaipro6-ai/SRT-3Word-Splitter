@@ -331,10 +331,11 @@ test('a FAILED run never consumes the trial: the counter is only incremented on 
   // call must sit INSIDE the post-success accounting block and AFTER the
   // provider transcription, so any thrown provider/API/server error jumps to
   // the catch block and skips the increment entirely.
+  // Now uses the async accounts facade instead of the synchronous users repo.
   const here = path.dirname(fileURLToPath(import.meta.url));
   const src = fs.readFileSync(path.join(here, '..', '..', 'server.ts'), 'utf8');
 
-  const increment = src.indexOf('users.incrementFreeTrialsUsed(');
+  const increment = src.indexOf('accounts.incrementFreeTrialsUsed(');
   const successMarker = src.indexOf('Success accounting');
   const transcription = src.indexOf('const rawTranscript =');
   const catchBlock = src.indexOf('} catch (error: any) {');

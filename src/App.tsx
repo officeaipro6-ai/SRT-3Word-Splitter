@@ -87,9 +87,16 @@ export default function App() {
   // server response after a run is the only thing that updates this).
   const [wallet, setWallet] = useState<{ credits: number; unlimited: boolean } | null>(null);
 
+  // Authentication gate: the transcription UI requires a signed-in customer account.
+  // Admin bootstrap tokens are not accepted here - they're for admin routes only.
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
+
   const syncSession = (s: SessionInfo) => {
     setFreeTrial({ used: s.freeTrialsUsed, limit: s.freeTrialLimit, remaining: s.freeTrialsRemaining });
     setWallet({ credits: s.credits, unlimited: s.unlimited });
+    // A customer session has an email and account role (not ADMIN).
+    const isCustomer = Boolean(s.account && s.email && s.role !== 'ADMIN');
+    setIsAuthenticated(isCustomer);
   };
 
   useEffect(() => {
@@ -525,43 +532,58 @@ export default function App() {
 
       {/* Main Content Area */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
-        {/* Upload & Preset Selector (Shown when no active transcription yet, or can be reconfigured) */}
-        {!transcriptionResult && (
-          <LandingPage>
-            <div className="space-y-6 animate-in fade-in duration-200">
-              {freeTrial && freeTrial.limit > 0 && (
-                <div className="flex justify-center">
-                  <span
-                    className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-[11px] font-semibold shadow-sm ${
-                      freeTrial.remaining > 0
-                        ? 'bg-white border-slate-200 text-slate-600'
-                        : 'bg-rose-50 border-rose-200 text-rose-600'
-                    }`}
-                  >
-                    {freeTrial.remaining > 0
-                      ? `Free trials remaining: ${freeTrial.remaining} of ${freeTrial.limit}`
-                      : 'Free trials exhausted — please choose a plan to continue.'}
-                  </span>
-                </div>
-              )}
-              <LanguageSelector
-                value={selectedLanguage}
-                onChange={setSelectedLanguage}
-                disabled={isProcessing}
-              />
-              <CreditPacksPanel
-                wallet={wallet}
-                freeTrialsRemaining={freeTrial ? freeTrial.remaining : null}
-                freeTrialLimit={freeTrial ? freeTrial.limit : 0}
-              />
-              <FileUpload
-                onFileSelected={(info) => setSelectedMedia(info)}
-                isProcessing={isProcessing}
-                selectedFile={selectedMedia}
-                onStartPipeline={handleStartPipeline}
-              />
+        {/* Authentication gate: transcription requires a signed-in customer account */}
+        {!isAuthenticated ? (
+          <div className="flex-1 flex items-center justify-center animate-in fade-in duration-200">
+            <div className="bg-white/90 backdrop-blur-sm border border-slate-200 rounded-2xl p-8 max-w-md w-full mx-4 shadow-lg">
+              <div className="text-center mb-6">
+                <h1 className="text-2xl font-bold text-slate-900">Sign in to transcribe</h1>
+                <p className="text-slate-500 mt-2">Create an account or sign in to access the transcription pipeline.</p>
+              </div>
+              <AccountPanel />
             </div>
-          </LandingPage>
+          </div>
+        ) : (
+          <>
+            {/* Upload & Preset Selector (Shown when no active transcription yet, or can be reconfigured) */}
+            {!transcriptionResult && (
+              <LandingPage>
+                <div className="space-y-6 animate-in fade-in duration-200">
+                  {freeTrial && freeTrial.limit > 0 && (
+                    <div className="flex justify-center">
+                      <span
+                        className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-[11px] font-semibold shadow-sm ${
+                          freeTrial.remaining > 0
+                            ? 'bg-white border-slate-200 text-slate-600'
+                            : 'bg-rose-50 border-rose-200 text-rose-600'
+                        }`}
+                      >
+                        {freeTrial.remaining > 0
+                          ? `Free trials remaining: ${freeTrial.remaining} of ${freeTrial.limit}`
+                          : 'Free trials exhausted — please choose a plan to continue.'}
+                      </span>
+                    </div>
+                  )}
+                  <LanguageSelector
+                    value={selectedLanguage}
+                    onChange={setSelectedLanguage}
+                    disabled={isProcessing}
+                  />
+                  <CreditPacksPanel
+                    wallet={wallet}
+                    freeTrialsRemaining={freeTrial ? freeTrial.remaining : null}
+                    freeTrialLimit={freeTrial ? freeTrial.limit : 0}
+                  />
+                  <FileUpload
+                    onFileSelected={(info) => setSelectedMedia(info)}
+                    isProcessing={isProcessing}
+                    selectedFile={selectedMedia}
+                    onStartPipeline={handleStartPipeline}
+                  />
+                </div>
+              </LandingPage>
+            )}
+          </>
         )}
 
         {/* Processing Progress Pipeline Component */}

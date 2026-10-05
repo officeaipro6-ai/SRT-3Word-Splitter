@@ -297,6 +297,43 @@ export class TursoAccountService {
     return user;
   }
 
+  /**
+   * Consume exactly one free trial and return the new count.
+   *
+   * POLICY IS UNCHANGED: this only persists the increment. Whether a trial is
+   * allowed at all is still decided by `freeTrialPolicy.ts` and
+   * `config.freeTrialLimit` before this is ever called. Implemented as one
+   * conditional SQL UPDATE (`COALESCE(freeTrialsUsed,0) + 1 ... RETURNING`), so
+   * concurrent requests cannot lose an increment the way a read-modify-write
+   * would.
+   *
+   * Returns null when the user does not exist, matching
+   * `UserRepo.incrementFreeTrialsUsed`.
+   */
+  async incrementFreeTrialsUsed(userId: string): Promise<number | null> {
+    return this.store.unitOfWork((scope) => scope.incrementFreeTrialsUsed(userId));
+  }
+
+  /**
+   * Append the zero-amount FREE_TRIAL ledger row.
+   *
+   * Audit only: `amount` is 0 and no balance changes. Recorded so the admin
+   * transaction log explains a trial-count change. Written through the same
+   * transaction helper as signup's opening grant so it cannot half-apply.
+   */
+  async recordFreeTrialUsage(userId: string, balanceAfter: number): Promise<void> {
+    await this.store.unitOfWork(async (scope) => {
+      await scope.addTransaction({
+        userId,
+        type: 'FREE_TRIAL',
+        amount: 0,
+        reason: 'free_trial_transcription',
+        balanceBefore: balanceAfter,
+        balanceAfter,
+      } as never);
+    });
+  }
+
   /** Admin listing: most recently active first. */
   async listUsers(): Promise<UserRecord[]> {
     const all = await this.store.getUsers();

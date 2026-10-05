@@ -115,9 +115,20 @@ import {
   freeTrialsUsedFor,
 } from './server/services/freeTrialPolicy';
 import { CREDIT_PACKS, PROVIDER_UNAVAILABLE_MESSAGE } from './server/services/creditPolicy';
-import { LoginActivityService, resolveMonth } from './server/services/loginActivityService';
+import { resolveMonth } from './server/services/loginActivityService';
+import type { LoginAlertTransport } from './server/services/loginAlertService';
+import {
+  AsyncLoginActivityService,
+  createFileLoginActivityStore,
+  createTursoLoginActivityStore,
+  runDailyLoginAlert,
+  startDailyLoginAlertSchedulerAsync,
+  type LoginActivityStore,
+} from './server/services/asyncLoginActivity';
+import type { TursoStore } from './server/db/tursoStore';
 import { runLoginAlert, startDailyLoginAlertScheduler } from './server/services/loginAlertService';
 import { createTelegramTransport, readTelegramConfig, toLoginAlertTransport } from './server/services/notifications';
+
 import {
   ProviderSafetyService,
   ProviderSpendingError,
@@ -664,6 +675,7 @@ async function startServer() {
 let store: DataStoreProvider;
 let accounts: AsyncAccountService;
 let credits: AsyncCreditService;
+let loginActivityRepo: LoginActivityRepo | undefined;
 if (config.databaseProvider === 'turso') {
   if (!config.tursoDatabaseUrl || !config.tursoAuthToken) {
     throw new Error('Turso configuration required: TURSO_DATABASE_URL and TURSO_AUTH_TOKEN must be set when DATABASE_PROVIDER=turso');
@@ -685,6 +697,7 @@ if (config.databaseProvider === 'turso') {
 } else {
   const { DataStore } = await import('./server/db/store');
   store = new DataStore(config.dbFile);
+  loginActivityRepo = new LoginActivityRepo(store);
   accounts = createFileAccountFacade(new UserRepo(store), new CreditRepo(store));
   credits = createFileCreditFacade(new FileCreditService(new UserRepo(store), new CreditRepo(store)));
 }
@@ -752,10 +765,23 @@ const moderation = new CommunityModerationService(moderationRepo);
 const communityAttachments = new LocalFileStorageProvider(
   path.join(config.dataDir, 'community-attachments')
 );
-// Monthly login analytics. Purely observational: its own tables, its own repo,
-// and it is never read by the credit/pipeline/provider-safety paths.
-const loginActivityRepo = new LoginActivityRepo(store);
-const loginActivity = new LoginActivityService(loginActivityRepo);
+// Monthly login analytics + the daily Telegram login report.
+//
+// Provider-aware on purpose. These tables used to be read/written through the
+// SYNCHRONOUS LoginActivityRepo, whose snapshot()/mutate() do not work on
+// libSQL: reads silently returned an empty list (so every metric reported ZERO)
+// and writes threw (so nothing was ever recorded). The daily report's "already
+// sent" guard therefore always reported "not sent", Telegram was messaged on
+// every tick, and the follow-up save threw - the same report, repeatedly.
+//
+// `loginActivityStore` is selected alongside `accounts`/`credits`, and the daily
+// report is gated by a PERSISTED ATOMIC claim (see runDailyLoginAlert), not by
+// an in-memory flag, so restarts and multiple instances cannot duplicate it.
+const loginActivityStore: LoginActivityStore =
+  config.databaseProvider === 'turso'
+    ? createTursoLoginActivityStore(store as unknown as TursoStore)
+    : createFileLoginActivityStore(loginActivityRepo);
+const loginActivity = new AsyncLoginActivityService(loginActivityStore);
 
   /**
    * Owner notifications. NO transport is configured: alerts are rendered,
@@ -865,6 +891,57 @@ const loginActivity = new LoginActivityService(loginActivityRepo);
     };
   }
 
+  /**
+   * MANDATORY customer authentication for every transcription entry point.
+   *
+   * This is `auth()` plus one extra rule that matters a great deal: an
+   * ADMIN/owner session is NOT accepted here. Owner bootstrap exists to
+   * administer the service; it must not be usable to run transcription under
+   * an owner's identity, because owner credit/spend accounting is deliberately
+   * different from customer accounting.
+   *
+   * It must be registered BEFORE `upload.single(...)` so an unauthenticated
+   * request is refused before multer reads, buffers or stores the body. That
+   * ordering is the difference between "401" and "the attacker's audio was
+   * uploaded and processed anyway".
+   */
+  function requireCustomer() {
+    return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+      const token = extractToken(req);
+      if (!isValidTokenShape(token)) {
+        return res.status(401).json({
+          error: 'Sign in to transcribe. Create an account or sign in to continue.',
+          code: 'AUTH_REQUIRED',
+        });
+      }
+      void (async () => {
+        const user = await accounts.getByToken(hashToken(token as string));
+        if (!user) {
+          res.status(401).json({
+            error: 'Your session is unknown or has expired. Please sign in again.',
+            code: 'SESSION_INVALID',
+          });
+          return;
+        }
+        if (user.role === 'ADMIN') {
+          res.status(403).json({
+            error: 'Administrator accounts cannot be used for customer transcription.',
+            code: 'ADMIN_NOT_ALLOWED',
+          });
+          return;
+        }
+        await accounts.touch(user.id).catch((e) => {
+          nestedLog.warn('session touch failed', { message: redact((e as Error).message) });
+        });
+        res.locals.user = user;
+        next();
+      })().catch((err) => {
+        nestedLog.error('requireCustomer failed', { message: redact((err as Error).message) });
+        if (!res.headersSent) res.status(500).json({ error: 'Failed to verify session.' });
+      });
+    };
+  }
+
   /** Never leak internal storage paths / keys to clients. */
   function publicJob(job: JobRecord) {
     const base = {
@@ -921,7 +998,19 @@ const loginActivity = new LoginActivityService(loginActivityRepo);
   });
 
   // Primary AI processing endpoint (accepts multipart file or JSON with base64 audio)
-  app.post('/api/process-audio', upload.single('mediaFile'), async (req, res) => {
+  // `requireCustomer()` is deliberately BEFORE `upload.single(...)`.
+  //
+  // It used to be neither: this route accepted a completely unauthenticated
+  // request and transcribed it. Because the free-trial counter and the credit
+  // gate are both keyed on a KNOWN user, an anonymous caller was charged
+  // nothing at all - while Sarvam was still called, on the operator's account.
+  // Any caller could spend real provider money without an account.
+  //
+  // Ordering matters: registering the gate first means an unauthenticated
+  // request is refused with 401 before multer reads the body, so no upload is
+  // buffered, no job is created, no provider is contacted, and no free trial or
+  // credit is touched.
+  app.post('/api/process-audio', requireCustomer(), upload.single('mediaFile'), async (req, res) => {
     // Set when a paid request reserves credits BEFORE the provider call. Always
     // settled on success and released on ANY error, so a failed/over-quota job
     // can never consume the user's credits (no double-spend, no charge for
@@ -991,31 +1080,25 @@ const loginActivity = new LoginActivityService(loginActivityRepo);
 
       // ------------------------------------------------------------------
       // IDENTITY + FREE-TRIAL USAGE LIMIT (server-side enforcement).
-      //   - A valid `x-user-token` resolves to a server-verified user identity.
-      //     The trial counter increments ONLY after a successful pipeline run
+      //   - `requireCustomer()` (registered before the upload middleware) has
+      //     ALREADY resolved a server-verified customer identity and put it in
+      //     `res.locals.user`. There is no anonymous branch any more: an
+      //     unauthenticated request never reaches this line.
+      //   - The trial counter increments ONLY after a successful pipeline run
       //     below, so failed uploads / API errors never consume a trial.
-      //   - Anonymous legacy callers keep the pre-existing unrestricted
-      //     behaviour (documented known limitation); the hard provider spending
-      //     protection still applies to them below.
       //   - The monetization credit gate runs AFTER the duration is measured and
       //     BEFORE any provider call (see below).
       // ------------------------------------------------------------------
-      const rawToken = extractToken(req);
-      let sessionUser: UserRecord | null = null;
-      if (rawToken) {
-        if (!isValidTokenShape(rawToken)) {
-          return res.status(401).json({ error: 'Missing or invalid bearer token. Create a session via POST /api/session.' });
-        }
-        // Same provider-aware resolution `auth()` uses, so a signed-in customer
-        // is recognised on the transcription route too. Free-trial and credit
-        // accounting below is unchanged; only HOW the identity is looked up.
-        const identity = await accounts.getByToken(hashToken(rawToken));
-        if (!identity) {
-          return res.status(401).json({ error: 'Unknown or expired session. Create a session via POST /api/session.' });
-        }
-        sessionUser = identity;
-        await accounts.touch(identity.id).catch((e) => {
-          nestedLog.warn('session touch failed', { message: redact((e as Error).message) });
+      // Re-read from `res.locals` rather than re-resolving the token: the gate
+      // already proved the session is live, and doing it once keeps a single
+      // source of truth for "who is this request".
+      const sessionUser: UserRecord | null = (res.locals.user as UserRecord | undefined) ?? null;
+      if (!sessionUser) {
+        // Defensive only. If this ever fires, the gate was bypassed and we must
+        // fail closed rather than transcribe anonymously.
+        return res.status(401).json({
+          error: 'Sign in to transcribe. Create an account or sign in to continue.',
+          code: 'AUTH_REQUIRED',
         });
       }
       const freeTrialsUsed = freeTrialsUsedFor(sessionUser);
@@ -1479,22 +1562,25 @@ const loginActivity = new LoginActivityService(loginActivityRepo);
           jobId: paidReservation.jobId,
         });
       } else if (sessionUser && spendDecision.kind === 'FREE_TRIAL') {
-        // UNCHANGED free-trial accounting. Left exactly as it was: this task is
-        // the auth/session/database fix, and the increment keeps going through
-        // the synchronous `users` repo on purpose so no free-trial policy
-        // behaviour can shift as a side effect.
-        const incremented = users.incrementFreeTrialsUsed(sessionUser.id);
+        // UNCHANGED free-trial accounting, now actually reachable.
+        //
+        // The POLICY is untouched: one trial per user, `config.freeTrialLimit`,
+        // and the 2-minute cap are all still decided by `freeTrialPolicy.ts`
+        // before we get here. Only the PERSISTENCE changed: the increment used to
+        // go through the synchronous `users.incrementFreeTrialsUsed`, whose
+        // `store.mutate()` throws on the libSQL provider, so a successful free
+        // transcription 500'd at the very last step and the trial was never
+        // consumed. It now uses the provider-aware facade (a conditional SQL
+        // UPDATE ... RETURNING), which is correct on both providers.
+        const incremented = await accounts.incrementFreeTrialsUsed(sessionUser.id);
         if (incremented !== null) {
           usage.freeTrialsUsed = incremented;
           usage.freeTrialsRemaining = freeTrialsRemaining(incremented, config.freeTrialLimit);
-          creditsRepo.add({
-            userId: sessionUser.id,
-            amount: 0,
-            type: 'FREE_TRIAL',
-            reason: 'free_trial_transcription',
-            jobId: undefined,
-            balanceAfter: users.getById(sessionUser.id)?.credits ?? 0,
-          });
+          // Zero-amount FREE_TRIAL ledger entry, exactly as before: it is the
+          // audit trail for "a trial was spent", not a credit movement.
+          await accounts
+            .recordFreeTrialUsage(sessionUser.id, sessionUser.credits ?? 0)
+            .catch((e) => nestedLog.warn('free trial ledger entry failed', { message: redact((e as Error).message) }));
           nestedLog.info('free trial used', { userId: sessionUser.id, used: incremented, limit: config.freeTrialLimit });
         }
       }
@@ -1642,7 +1728,12 @@ const loginActivity = new LoginActivityService(loginActivityRepo);
   });
 
   // Fast Language Detection endpoint (Step 1 standalone check)
-  app.post('/api/detect-language', async (req, res) => {
+  // `requireCustomer()` BEFORE the handler: this route calls `runOdiaPipeline`,
+  // i.e. it performs real ASR work against the configured provider. It used to
+  // be completely unauthenticated, so it was a second free provider-spend hole
+  // even after /api/process-audio was locked down. No auth -> 401, no pipeline
+  // call, no provider data leaves the process.
+  app.post('/api/detect-language', requireCustomer(), async (req, res) => {
     try {
       const { audioBase64, mimeType } = req.body;
       if (!audioBase64) {
@@ -1730,14 +1821,14 @@ const loginActivity = new LoginActivityService(loginActivityRepo);
       // service's refresh-dedup window, so it cannot inflate the counts.
       // Observational only: a failure here must never break session creation.
       try {
-        loginActivity.record({
-          userId,
-          email: user?.email ?? undefined,
-          method: isAdminBootstrap ? 'OWNER_BOOTSTRAP' : 'SESSION',
-          outcome: 'SUCCESS',
-          ip: req.ip,
-          userAgent: String(req.headers['user-agent'] ?? ''),
-        });
+    await loginActivity.record({
+      userId,
+      email: user?.email ?? undefined,
+      method: isAdminBootstrap ? 'OWNER_BOOTSTRAP' : 'SESSION',
+      outcome: 'SUCCESS',
+      ip: req.ip,
+      userAgent: String(req.headers['user-agent'] ?? ''),
+    });
       } catch (e) {
         nestedLog.warn('login activity record failed', { message: redact((e as Error).message) });
       }
@@ -1802,6 +1893,23 @@ const loginActivity = new LoginActivityService(loginActivityRepo);
       const token = issueToken();
       await accounts.addToken(result.user.id, hashToken(token));
       const user = await accounts.getById(result.user.id);
+      // A signup immediately establishes a real session, so it is the customer's
+      // FIRST successful login. Recording it here (not only on a later session
+      // refresh) is what makes the daily report's "new users" metric correct for
+      // a customer who signs up and never signs in again. Observational only:
+      // the response below is produced regardless of whether this lands.
+      try {
+        await loginActivity.record({
+          userId: result.user.id,
+          email: result.user.email ?? undefined,
+          method: 'SESSION',
+          outcome: 'SUCCESS',
+          ip: req.ip,
+          userAgent: String(req.headers['user-agent'] ?? ''),
+        });
+      } catch (e) {
+        nestedLog.warn('signup login-activity record failed', { message: redact((e as Error).message) });
+      }
       return res.status(201).json(sessionPayload(user, token));
     } catch (err: any) {
       nestedLog.error('account signup failed', { message: redact(err.message) });
@@ -1817,12 +1925,12 @@ const loginActivity = new LoginActivityService(loginActivityRepo);
         // metadata: the caller is unauthenticated, so the submitted address and
         // device are untrusted input and are not persisted.
         try {
-          loginActivity.record({
-            userId: '',
-            method: 'ACCOUNT_LOGIN',
-            outcome: 'FAILURE',
-            failureCode: result.code ?? 'INVALID_CREDENTIALS',
-          });
+      await loginActivity.record({
+        userId: '',
+        method: 'ACCOUNT_LOGIN',
+        outcome: 'FAILURE',
+        failureCode: result.code ?? 'INVALID_CREDENTIALS',
+      });
         } catch (e) {
           nestedLog.warn('failed-login record error', { message: redact((e as Error).message) });
         }
@@ -1831,14 +1939,14 @@ const loginActivity = new LoginActivityService(loginActivityRepo);
       const token = issueToken();
       await accounts.addToken(result.user.id, hashToken(token));
       try {
-        loginActivity.record({
-          userId: result.user.id,
-          email: result.user.email ?? undefined,
-          method: 'ACCOUNT_LOGIN',
-          outcome: 'SUCCESS',
-          ip: req.ip,
-          userAgent: String(req.headers['user-agent'] ?? ''),
-        });
+    await loginActivity.record({
+      userId: result.user.id,
+      email: result.user.email ?? undefined,
+      method: 'ACCOUNT_LOGIN',
+      outcome: 'SUCCESS',
+      ip: req.ip,
+      userAgent: String(req.headers['user-agent'] ?? ''),
+    });
       } catch (e) {
         nestedLog.warn('login activity record failed', { message: redact((e as Error).message) });
       }
@@ -2199,7 +2307,7 @@ const job = (await jobs.getForUser(jobId, user.id)) as JobRecord;
     }
 
     // Verify the user exists
-    const user = users.getById(payment.userId);
+    const user = await accounts.getById(payment.userId);
     if (!user) {
       nestedLog.warn('razorpay webhook: unknown user', { userId: payment.userId });
       return res.json({ received: true, error: 'Unknown user' });
@@ -2428,7 +2536,7 @@ const job = (await jobs.getForUser(jobId, user.id)) as JobRecord;
    * that is correct for both providers.
    */
   async function adminUserView(userId: string) {
-    const u = users.getById(userId);
+    const u = await accounts.getById(userId);
     if (!u) return null;
     return {
       id: u.id,
@@ -2479,7 +2587,9 @@ const job = (await jobs.getForUser(jobId, user.id)) as JobRecord;
   app.get('/api/admin/users', auth(), requireAdmin, asyncRoute(async (req, res) => {
     const limit = Math.min(Number(req.query.limit) || 100, 500);
     const query = typeof req.query.q === 'string' ? req.query.q.trim() : '';
-    const list = query ? users.searchUsers(query, limit) : users.listUsers().slice(0, limit);
+    const list = query
+      ? await accounts.searchUsers(query, limit)
+      : (await accounts.listUsers()).slice(0, limit);
     const views = await Promise.all(list.map((u) => adminUserView(u.id)));
     res.json({ users: views, query });
   }));
@@ -2507,37 +2617,38 @@ const job = (await jobs.getForUser(jobId, user.id)) as JobRecord;
   // Month-wise login analytics for the admin dashboard. `?month=YYYY-MM`
   // defaults to the current IST month; `?q=` searches id/email/date; the table
   // is paginated, but the numbers always describe the WHOLE month.
-  app.get('/api/admin/login-activity', auth(), requireAdmin, (req, res) => {
+  app.get('/api/admin/login-activity', auth(), requireAdmin, asyncRoute(async (req, res) => {
     try {
       const month = resolveMonth(req.query.month);
-      const result = loginActivity.queryMonth({
+      const result = await loginActivity.queryMonth({
         month,
         q: typeof req.query.q === 'string' ? req.query.q : undefined,
         page: Number(req.query.page) || 1,
         pageSize: Number(req.query.pageSize) || 50,
       });
-      res.json({ ...result, availableMonths: loginActivity.availableMonths() });
+      res.json({ ...result, availableMonths: await loginActivity.availableMonths() });
     } catch (err) {
       nestedLog.error('admin login activity failed', { err: String(err) });
       res.status(500).json({ error: 'LOGIN_ACTIVITY_FAILED' });
     }
-  });
+  }));
 
   // The daily "yesterday's logins" alert log, newest first.
-  app.get('/api/admin/login-alerts', auth(), requireAdmin, (req, res) => {
+  app.get('/api/admin/login-alerts', auth(), requireAdmin, asyncRoute(async (_req, res) => {
     try {
-      res.json({ alerts: loginActivityRepo.listAlerts(60) });
+      res.json({ alerts: await loginActivityStore.listAlerts(60) });
     } catch (err) {
       nestedLog.error('admin login alerts failed', { err: String(err) });
       res.status(500).json({ error: 'LOGIN_ALERTS_FAILED' });
     }
-  });
+  }));
 
   // Manual trigger for the same idempotent job the scheduler runs. Used by the
-  // admin button and by ops; re-running for an already-reported day is a no-op.
+  // admin button and by ops; re-running for an already-reported day is a no-op
+  // because the report is gated by the persisted atomic claim.
   app.post('/api/admin/login-alerts/run', auth(), requireAdmin, asyncRoute(async (_req, res) => {
     try {
-      const { alert, duplicate } = await runLoginAlert(loginActivity, loginActivityRepo, {});
+      const { alert, duplicate } = await runDailyLoginAlert(loginActivity, loginActivityStore, {});
       res.json({ alert, duplicate });
     } catch (err) {
       nestedLog.error('manual login alert failed', { err: String(err) });
@@ -2670,23 +2781,35 @@ const job = (await jobs.getForUser(jobId, user.id)) as JobRecord;
    * Admin-only moderation view. Requires a verified owner account exactly like
    * every other admin route (auth() + requireAdmin).
    */
-  app.get('/api/admin/moderation', auth(), requireAdmin, (req, res) => {
+  app.get('/api/admin/moderation', auth(), requireAdmin, asyncRoute(async (_req, res) => {
     const now = Date.now();
+    // User lookups go through the async account facade: `users.getById` is a
+    // synchronous repository read that cannot work on the libSQL provider, so
+    // every email/ownerEmail in this view used to be a hard 500 in production.
+    const decorate = async <T extends { userId: string }>(rows: T[]) =>
+      Promise.all(
+        rows.map(async (row) => {
+          const u = await accounts.getById(row.userId);
+          return { row, email: u?.email ?? null, ownerEmail: u?.ownerEmail ?? null };
+        })
+      );
+    const restrictions = await decorate(moderationRepo.activeRestrictions(now));
+    const cases = await decorate(moderationRepo.listCases(200));
     res.json({
-      activeRestrictions: moderationRepo.activeRestrictions(now).map((r) => ({
+      activeRestrictions: restrictions.map(({ row: r, email, ownerEmail }) => ({
         userId: r.userId,
-        email: users.getById(r.userId)?.email ?? null,
-        ownerEmail: users.getById(r.userId)?.ownerEmail ?? null,
+        email,
+        ownerEmail,
         startedAt: r.startedAt,
         expiresAt: r.expiresAt,
         extendedCount: r.extendedCount,
         automatic: r.automatic,
       })),
-      cases: moderationRepo.listCases(200).map((c) => ({
+      cases: cases.map(({ row: c, email, ownerEmail }) => ({
         id: c.id,
         userId: c.userId,
-        email: users.getById(c.userId)?.email ?? null,
-        ownerEmail: users.getById(c.userId)?.ownerEmail ?? null,
+        email,
+        ownerEmail,
         category: c.category,
         action: c.action,
         confidence: c.confidence,
@@ -2714,7 +2837,7 @@ const job = (await jobs.getForUser(jobId, user.id)) as JobRecord;
       })),
       telegram: TELEGRAM_MODERATION_NOTE,
     });
-  });
+  }));
 
   /** Mark a moderation case reviewed. */
   app.post('/api/admin/moderation/cases/:id/review', auth(), requireAdmin, (req, res) => {
@@ -2973,17 +3096,21 @@ const job = (await jobs.getForUser(jobId, user.id)) as JobRecord;
 
 // Build Telegram transport if configured (reads from .env at startup).
     const telegramConfig = readTelegramConfig();
-    const transports: Record<string, import('./server/services/loginAlertService').LoginAlertTransport> = {};
+    const transports: Record<string, LoginAlertTransport> = {};
     if (telegramConfig) {
       const tg = createTelegramTransport(telegramConfig);
       if (tg) transports.telegram = toLoginAlertTransport(tg);
     }
 
     // Daily "yesterday's login activity" alert, shortly after IST midnight.
-    // Idempotency is persisted (keyed on the reported day), so restarts and
-    // repeated ticks cannot emit twice. If Telegram is configured, the alert
-    // is also sent there; otherwise it records NOT_CONFIGURED to the admin log.
-    startDailyLoginAlertScheduler(loginActivity, loginActivityRepo, {
+    //
+    // This is the SAME single in-process 60s tick as before - not a second
+    // scheduler. What changed is the idempotency: instead of reading a guard
+    // that could never see a stored row (and therefore re-sent on every tick),
+    // the send is gated by a PERSISTED ATOMIC claim in Turso. Restarts,
+    // redeploys and multiple instances can no longer produce a second message
+    // for an IST date that has already been reported.
+    startDailyLoginAlertSchedulerAsync(loginActivity, loginActivityStore, {
       transports,
       onError: (e) => nestedLog.warn('daily login alert tick failed', { message: redact(String(e)) }),
     });
