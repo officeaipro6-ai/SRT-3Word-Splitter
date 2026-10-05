@@ -2300,12 +2300,6 @@ const job = (await jobs.getForUser(jobId, user.id)) as JobRecord;
       return res.json({ received: true });
     }
 
-    // Idempotency: check if already processed
-    const existing = creditsRepo.findByPaymentId?.(payment.paymentId);
-    if (existing) {
-      return res.json({ received: true, alreadyProcessed: true });
-    }
-
     // Verify the user exists
     const user = await accounts.getById(payment.userId);
     if (!user) {
@@ -2326,6 +2320,7 @@ const job = (await jobs.getForUser(jobId, user.id)) as JobRecord;
     }
 
     // Use the credit service's recordPurchase method (handles idempotency, ledger, etc.)
+    // Idempotency is enforced inside the transaction via paymentId for both providers.
     const result = await credits.recordPurchase({
       userId: payment.userId,
       planId: payment.planId,
@@ -2341,6 +2336,7 @@ const job = (await jobs.getForUser(jobId, user.id)) as JobRecord;
       userId: payment.userId,
       paymentId: payment.paymentId,
       credits: plan.credits,
+      alreadyProcessed: result.alreadyProcessed,
     });
 
     res.json({ received: true, creditsAdded: plan.credits, alreadyProcessed: result.alreadyProcessed });

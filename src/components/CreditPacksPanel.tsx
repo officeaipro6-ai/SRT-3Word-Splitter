@@ -107,9 +107,11 @@ export const CreditPacksPanel: React.FC<Props> = ({ wallet, freeTrialsRemaining,
               window.dispatchEvent(new CustomEvent('credits-updated', { detail: result.credits }));
             } else {
               setPurchaseError('Payment verification failed. Please contact support.');
+              setPurchasingPlanId(null);
             }
           } catch (err: any) {
             setPurchaseError(err.message || 'Payment verification failed. Please contact support.');
+            setPurchasingPlanId(null);
           }
         },
         modal: {
@@ -131,6 +133,16 @@ export const CreditPacksPanel: React.FC<Props> = ({ wallet, freeTrialsRemaining,
     } catch (err: any) {
       setPurchaseError(err.message || 'Failed to initiate payment. Please try again.');
       setPurchasingPlanId(null);
+    } finally {
+      // Ensure processing state is always reset, even if an unexpected error occurs
+      // after the Razorpay modal opens but before handler/ondismiss fires
+      // (the handler/ondismiss will also reset, but this is a safety net)
+      if (purchasingPlanId === planId) {
+        // Small delay to allow handler/ondismiss to run first if they will
+        setTimeout(() => {
+          setPurchasingPlanId(current => current === planId ? null : current);
+        }, 0);
+      }
     }
   };
 
