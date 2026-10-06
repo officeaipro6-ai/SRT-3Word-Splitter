@@ -18,6 +18,7 @@ import { CreditsWidget } from './components/CreditsWidget';
 import { CommunitySupport } from './components/CommunitySupport';
 import { AccountPanel } from './components/AccountPanel';
 import { ensureSession, AUTH_CHANGED_EVENT, type SessionInfo } from './lib/sessionClient';
+import { getApiUrl } from './lib/apiUrl';
 import { CreditPacksPanel } from './components/CreditPacksPanel';
 import { LanguageSelector } from './components/LanguageSelector';
 import { LandingPage } from './components/LandingPage';
@@ -224,7 +225,7 @@ export default function App() {
       } catch {
         // session unavailable — the pipeline call below surfaces the real error
       }
-      const response = await fetch('/api/process-audio', {
+      const response = await fetch(getApiUrl('/api/process-audio'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

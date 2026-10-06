@@ -1,10 +1,4 @@
-/**
- * Server-side session + credits client for the additive admin/credits UI.
- *
- * The opaque session token may be kept in localStorage (it is not an
- * authorization claim); role / creditMode / balances are ALWAYS fetched fresh
- * from the server and never trusted from the browser.
- */
+import { getApiUrl } from './apiUrl';
 
 export interface SessionInfo {
   userId: string;
@@ -56,7 +50,7 @@ export function storeToken(token: string): void {
 
 export async function ensureSession(): Promise<SessionInfo> {
   const existing = getStoredToken();
-  const res = await fetch('/api/session', {
+  const res = await fetch(getApiUrl('/api/session'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(existing ? {} : {}),
@@ -97,7 +91,7 @@ function parseSession(data: any, token: string): SessionInfo {
  * OWNER_EMAILS allowlist and re-checks that email on every admin request.
  */
 export async function signInAsOwner(opts: { adminBootstrapToken: string; ownerEmail: string }): Promise<SessionInfo> {
-  const res = await fetch('/api/session', {
+  const res = await fetch(getApiUrl('/api/session'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -133,7 +127,7 @@ export async function signupAccount(opts: {
   password: string;
   language?: string;
 }): Promise<SessionInfo> {
-  const res = await fetch('/api/account/signup', {
+  const res = await fetch(getApiUrl('/api/account/signup'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -153,7 +147,7 @@ export async function loginAccount(opts: {
   password: string;
   language?: string;
 }): Promise<SessionInfo> {
-  const res = await fetch('/api/account/login', {
+  const res = await fetch(getApiUrl('/api/account/login'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -169,7 +163,7 @@ export async function loginAccount(opts: {
 
 /** Sign out: revoke the current token server-side and clear it locally. */
 export async function logoutAccount(): Promise<void> {
-  const res = await authFetch('/api/account/logout', { method: 'POST' });
+  const res = await authFetch(getApiUrl('/api/account/logout'), { method: 'POST' });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
     throw new Error(data.error || 'Sign-out failed.');
@@ -192,7 +186,7 @@ export async function authFetch(
   if (init.body && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json');
   }
-  return fetch(path, { ...init, headers });
+  return fetch(getApiUrl(path), { ...init, headers });
 }
 
 export interface AdminUserView {
@@ -442,7 +436,7 @@ export interface CreditPack {
 
 /** Public credit pack catalog. Display-only: no purchase endpoint exists yet. */
 export async function fetchCreditPacks(): Promise<CreditPack[]> {
-  const res = await fetch('/api/credits/packs');
+  const res = await fetch(getApiUrl('/api/credits/packs'));
   if (!res.ok) throw new Error(`Failed to load credit packs (${res.status}).`);
   const data = await res.json();
   return data.packs ?? [];
@@ -591,7 +585,7 @@ export interface CommunitySubmissionResult {
 
 export async function fetchCommunityGuidelines(): Promise<CommunityGuidelines> {
   // Public: contains no user data, so a plain fetch is correct here.
-  const res = await fetch('/api/community/guidelines');
+  const res = await fetch(getApiUrl('/api/community/guidelines'));
   if (!res.ok) throw new Error('Failed to load community guidelines.');
   return res.json();
 }
@@ -750,10 +744,10 @@ export async function releaseRestriction(
 
 /** Admin-only, authenticated attachment URL. Never linkable by a normal user. */
 export function adminAttachmentUrl(userId: string, key: string): string {
-  return `/api/admin/moderation/attachments/${encodeURIComponent(userId)}/${key
+  return getApiUrl(`/api/admin/moderation/attachments/${encodeURIComponent(userId)}/${key
     .split('/')
     .map(encodeURIComponent)
-    .join('/')}`;
+    .join('/')}`);
 }
 
 // ============================================================================
