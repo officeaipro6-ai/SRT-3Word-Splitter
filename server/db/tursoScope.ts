@@ -73,6 +73,11 @@ export type CreditDeltaResult =
  * that interface (the Excel export reads several of them). Preserving `extra`
  * across a read/write round trip is what keeps this provider lossless, so the
  * stored shape is expressed here rather than loosened with a cast.
+ *
+ * Two typed fields that the table has no column for — `packageId` and
+ * `paymentStatus` — are transported in this bag and lifted back out on read
+ * (see `transactionExtraColumn` / `liftTransactionMetadata`), so they are part
+ * of the stored shape through the record fields, not through `extra`.
  */
 type StoredTransaction = CreditTransactionRecord & {
   extra?: Record<string, unknown> | null;
@@ -88,19 +93,94 @@ function toNum(value: unknown, fallback: number): number {
 }
 
 /**
+ * Ledger fields persisted inside the `transactions.extra` overflow bag because
+ * the table has no dedicated columns for them.
+ *
+ * `packageId`/`paymentStatus` are part of the typed `CreditTransactionRecord`
+ * contract (the file provider stores them as ordinary record fields) and the
+ * Excel purchase history reads both, so the Turso provider must round-trip them
+ * too. Folding them into `extra` on write and lifting them back out on read
+ * keeps rows lossless WITHOUT a schema change: `extra` stays, as documented
+ * above, the place where fields with no column live, and a record returned to
+ * business code never exposes the transport detail.
+ */
+const TRANSACTION_METADATA_FIELDS = ['packageId', 'paymentStatus'] as const;
+
+type TransactionMetadata = Partial<Pick<CreditTransactionRecord, 'packageId' | 'paymentStatus'>>;
+
+/**
+ * Write side of the transport: the JSON text for the `extra` column of one
+ * transaction row, or `null` when there is nothing to store.
+ *
+ * The caller's own `extra` bag is preserved byte-for-byte; the metadata fields
+ * are only merged in when the record actually carries them (Razorpay PURCHASE
+ * rows), so every non-purchase row writes exactly what it wrote before.
+ */
+export function transactionExtraColumn(
+  record: { extra?: Record<string, unknown> | null } & TransactionMetadata
+): string | null {
+  const bag: Record<string, unknown> = { ...(record.extra ?? {}) };
+  let stored = Object.keys(bag).length > 0;
+  for (const field of TRANSACTION_METADATA_FIELDS) {
+    const value = record[field];
+    if (typeof value === 'string' && bag[field] !== value) {
+      bag[field] = value;
+      stored = true;
+    }
+  }
+  return stored ? JSON.stringify(bag) : null;
+}
+
+/**
+ * Read side of the transport: lift the transported metadata out of a decoded
+ * `extra` value so the row reads back as a plain `CreditTransactionRecord`.
+ *
+ * - Metadata keys are MOVED (removed from `extra`), so `extra` keeps its
+ *   documented meaning of "fields with no column of their own" and a
+ *   write-read-write cycle is stable instead of accumulating duplicates.
+ * - A non-string value under a metadata key is left in `extra` untouched:
+ *   it cannot populate the typed field, and silently discarding unknown data
+ *   would be worse than keeping it in the bag.
+ * - Non-object `extra` (null, an array) is returned as-is with no metadata.
+ */
+export function liftTransactionMetadata(decodedExtra: unknown): {
+  extra: Record<string, unknown> | null;
+  metadata: TransactionMetadata;
+} {
+  if (decodedExtra === null || decodedExtra === undefined) {
+    return { extra: null, metadata: {} };
+  }
+  if (typeof decodedExtra !== 'object' || Array.isArray(decodedExtra)) {
+    return { extra: decodedExtra as Record<string, unknown>, metadata: {} };
+  }
+  const bag = { ...(decodedExtra as Record<string, unknown>) };
+  const metadata: TransactionMetadata = {};
+  for (const field of TRANSACTION_METADATA_FIELDS) {
+    const value = bag[field];
+    if (typeof value === 'string') {
+      metadata[field] = value;
+      delete bag[field];
+    }
+  }
+  return { extra: Object.keys(bag).length > 0 ? bag : null, metadata };
+}
+
+/**
  * Decode one ledger row. Mirrors the JSON `CreditRepo` return shape: the row is
- * returned as stored, with `extra` already decoded from its JSON text.
+ * returned as stored, with `extra` already decoded from its JSON text and the
+ * transported metadata lifted back onto the typed fields.
  */
 function toTransaction(row: unknown): StoredTransaction | null {
   if (row === null || row === undefined) return null;
   const r = row as Record<string, unknown>;
   const extraRaw = r.extra;
-  const extra =
+  const decodedExtra =
     extraRaw === null || extraRaw === undefined
       ? null
       : typeof extraRaw === 'string'
         ? (JSON.parse(extraRaw) as Record<string, unknown>)
         : (extraRaw as Record<string, unknown>);
+  const { extra, metadata } = liftTransactionMetadata(decodedExtra);
   return {
     id: String(r.id),
     userId: String(r.userId),
@@ -118,6 +198,7 @@ function toTransaction(row: unknown): StoredTransaction | null {
     jobId: r.jobId === null || r.jobId === undefined ? null : String(r.jobId),
     paymentId: r.paymentId === null || r.paymentId === undefined ? null : String(r.paymentId),
     extra,
+    ...metadata,
   } as StoredTransaction;
 }
 
@@ -262,7 +343,7 @@ export class TursoScope implements UnitOfWork<TursoScope> {
         record.adminEmail ?? null,
         record.jobId ?? null,
         record.paymentId ?? null,
-        record.extra ? JSON.stringify(record.extra) : null,
+        transactionExtraColumn(record),
       ],
     });
     return record;

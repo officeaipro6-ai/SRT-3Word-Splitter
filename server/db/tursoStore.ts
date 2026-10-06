@@ -41,7 +41,7 @@ import {
 } from './store';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Client } from '@libsql/client';
-import { TursoScope } from './tursoScope';
+import { TursoScope, liftTransactionMetadata, transactionExtraColumn } from './tursoScope';
 import { WriteMutex } from './writeMutex';
 import {
   applyCreditIdentityMigration,
@@ -240,8 +240,9 @@ const TABLE_COLUMNS: Record<string, string> = {
  * Columns that hold a JSON blob encoded as TEXT, per table.
  *
  * This is the read-side mirror of the `JSON.stringify(...)` call sites below
- * (createUser/updateUser, createJob/updateJob, addTransaction, saveAlert) and of
- * the `json: true` flags in scripts/migrate-to-production.ts ENTITY_SPECS. Every
+ * (createUser/updateUser, createJob/updateJob, the transaction `extra` writer,
+ * saveAlert) and of the `json: true` flags in scripts/migrate-to-production.ts
+ * ENTITY_SPECS. Every
  * other TEXT column (communityMessages.body, moderationCases.excerpt,
  * jobs.lastError, loginActivity.userAgent, ...) is plain text and must stay a
  * string, so it is deliberately absent from this list.
@@ -285,6 +286,19 @@ function decodeJsonRow<T>(table: string, row: T): T {
   for (const column of columns) {
     if (!(column in decoded)) continue;
     decoded[column] = decodeJsonColumn(table, column, decoded[column]);
+  }
+  if (table === 'transactions') {
+    // The ledger table persists packageId/paymentStatus inside `extra` (they
+    // have no column), so every read of a transaction row lifts them back onto
+    // the typed fields. This is the single choke point for the store-level
+    // read paths (queryTable feeds getTransactions*, getTransactionBy* and
+    // snapshot()), mirroring TursoScope.toTransaction for the scope paths.
+    // A real column value, if the schema ever gains one, wins over the bag.
+    const { extra, metadata } = liftTransactionMetadata(decoded.extra);
+    decoded.extra = extra;
+    for (const [field, value] of Object.entries(metadata)) {
+      if (decoded[field] === undefined) decoded[field] = value;
+    }
   }
   return decoded as T;
 }
@@ -928,7 +942,7 @@ export class TursoStore {
       txn.adminEmail ?? null,
       txn.jobId ?? null,
       txn.paymentId ?? null,
-      txn.extra ? JSON.stringify(txn.extra) : null,
+      transactionExtraColumn(txn),
     ]);
   }
 

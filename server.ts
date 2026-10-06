@@ -966,8 +966,23 @@ const loginActivity = new AsyncLoginActivityService(loginActivityStore);
     return job.output ? { ...base, output: { segmentCount: job.output.segmentCount, wordCount: job.output.wordCount } } : base;
   }
 
-  // JSON payload parser for base64 uploads
-  app.use(express.json({ limit: '100mb' }));
+  // JSON payload parser for base64 uploads.
+  //
+  // Razorpay webhook signatures are HMACs over the EXACT raw request bytes, but
+  // once express.json has parsed the body the route only sees a plain object.
+  // Capture the raw buffer here — before JSON.parse — and only for the webhook
+  // path, so signature verification can use the bytes Razorpay actually signed.
+  // No other route's behaviour or memory profile changes.
+  app.use(
+    express.json({
+      limit: '100mb',
+      verify: (req, _res, buf) => {
+        if ((req as express.Request).path === '/api/credits/purchase/webhook') {
+          (req as express.Request & { rawBody?: Buffer }).rawBody = buf;
+        }
+      },
+    }),
+  );
   app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 
   // API Routes
@@ -2242,6 +2257,30 @@ const job = (await jobs.getForUser(jobId, user.id)) as JobRecord;
       return res.status(400).json({ error: 'Currency mismatch.', code: 'CURRENCY_MISMATCH' });
     }
 
+    // PAYER BINDING: the payment must belong to the CALLING session. The payer
+    // is recorded in the order notes when the server creates the order
+    // (razorpayService.createRazorpayOrder), so the order — not the client —
+    // decides who may claim it. Payment notes are accepted as a fallback.
+    // Fail-closed: an unidentifiable payer is rejected, and the response never
+    // echoes whose account the payment actually belongs to.
+    let payerUserId: string;
+    try {
+      const orderDetails = await razorpay!.orders.fetch(orderId);
+      const orderNotes = orderDetails.notes ?? {};
+      const paymentNotes = (paymentDetails as { notes?: Record<string, unknown> }).notes ?? {};
+      payerUserId = String(orderNotes.userId ?? paymentNotes.userId ?? '');
+    } catch (err) {
+      nestedLog.error('razorpay fetch order failed', { userId: user.id, orderId, message: String(err) });
+      return res.status(500).json({ error: 'Failed to verify payment.', code: 'VERIFY_FAILED' });
+    }
+    if (payerUserId !== user.id) {
+      nestedLog.warn('razorpay verify: payer mismatch', { userId: user.id, orderId });
+      return res.status(403).json({
+        error: 'This payment belongs to a different account.',
+        code: 'PAYER_MISMATCH',
+      });
+    }
+
     // Use the credit service's recordPurchase method (handles idempotency, ledger, etc.)
     const result = await credits.recordPurchase({
       userId: user.id,
@@ -2263,8 +2302,10 @@ const job = (await jobs.getForUser(jobId, user.id)) as JobRecord;
   }));
 
   // Razorpay webhook endpoint — receives payment.captured, payment.failed, etc.
-  // Verifies webhook signature before processing.
-  app.post('/api/credits/purchase/webhook', express.raw({ type: 'application/json' }), asyncRoute(async (req, res) => {
+  // Verifies webhook signature against the EXACT raw request bytes (captured by
+  // the express.json verify hook above; a route-level express.raw parser would
+  // be skipped because the global parser has already consumed the body).
+  app.post('/api/credits/purchase/webhook', asyncRoute(async (req, res) => {
     if (!razorpayEnabled || !razorpay) {
       return res.status(503).json({ error: 'Payment system not configured.' });
     }
@@ -2275,7 +2316,11 @@ const job = (await jobs.getForUser(jobId, user.id)) as JobRecord;
       return res.status(400).json({ error: 'Missing signature.' });
     }
 
-    const rawBody = req.body as Buffer;
+    const rawBody = (req as express.Request & { rawBody?: Buffer }).rawBody;
+    if (!Buffer.isBuffer(rawBody)) {
+      nestedLog.warn('razorpay webhook missing raw request body');
+      return res.status(400).json({ error: 'Missing request body.' });
+    }
     if (!verifyWebhookSignature(razorpayConfig!.webhookSecret, rawBody, signature)) {
       nestedLog.warn('razorpay webhook signature verification failed');
       return res.status(400).json({ error: 'Invalid webhook signature.' });
