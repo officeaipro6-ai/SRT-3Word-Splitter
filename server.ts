@@ -658,6 +658,51 @@ async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
 
+  // Bind the port FIRST, before any fallible initialization below. Render
+  // scans for an open port the moment the process starts, but listen() used to
+  // be the last statement of startServer (~2500 lines below): any startup
+  // failure (missing provider env, unreachable Turso, stale dist/) killed the
+  // process before a port ever opened, and Render reported the misleading
+  // "Port scan timeout reached, no open ports detected" instead of the real
+  // error. Until initialization finishes, /api/health answers 503 so Render's
+  // health check keeps retrying and only turns healthy once the real handler
+  // registered below is live.
+  let bootReady = false;
+  app.get('/api/health', (_req, res, next) => {
+    if (bootReady) {
+      next();
+    } else {
+      res.status(503).json({ status: 'starting' });
+    }
+  });
+
+  const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(
+      `[Server] Odia SRT — Audio/Video → Tagged SRT  |  http://localhost:${PORT}/\n` +
+        `[Server] Admin Dashboard (owner only)         |  http://localhost:${PORT}/admin\n` +
+        `[Server] serving: ${process.cwd()}`,
+    );
+  });
+
+  // A port collision is the exact failure that hid the real app behind a stale
+  // one. Report WHO owns the port and refuse to continue.
+  server.on('error', (err: NodeJS.ErrnoException) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(
+        `\n[Server] FATAL: port ${PORT} is already in use.\n` +
+          `        This process will NOT start, and the server already on the port is NOT\n` +
+          `        necessarily this application — it may be a stale copy or an unrelated dev\n` +
+          `        server, which is how an old UI can be served at http://localhost:${PORT}/.\n` +
+          `        Find it with:  Get-NetTCPConnection -State Listen -LocalPort ${PORT}\n` +
+          `        Stop it with:  Stop-Process -Id <pid>\n` +
+          `        Or run this app on another port:  $env:PORT=3001; npm start\n`,
+      );
+      process.exit(1);
+    }
+    console.error('[Server] fatal listen error', err);
+    process.exit(1);
+  });
+
   // Stage 6B: fail fast, BEFORE any provider is constructed, if a production
   // process has not named its production providers explicitly. A no-op unless
   // NODE_ENV=production, so local development and the test suite are unchanged.
@@ -3121,65 +3166,46 @@ const job = (await jobs.getForUser(jobId, user.id)) as JobRecord;
     );
   }
 
-  const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(
-      `[Server] Odia SRT — Audio/Video → Tagged SRT  |  http://localhost:${PORT}/\n` +
-        `[Server] Admin Dashboard (owner only)         |  http://localhost:${PORT}/admin\n` +
-        `[Server] serving: ${process.cwd()}`,
-    );
-      if (config.enableJobQueue) {
-        queue.rehydrate();
-        queue.start();
-        nestedLog.info('job queue worker started', { provider: getAsrProviderName() });
-      } else {
-        nestedLog.warn('job queue disabled (ENABLE_JOB_QUEUE=false) job endpoints will not process work');
-      }
+  // Initialization is complete: /api/health now falls through to its real
+  // handler, and the background work that used to run inside the listen
+  // callback runs here because the port is now bound at the top of startServer.
+  bootReady = true;
 
-// Build Telegram transport if configured (reads from .env at startup).
-    const telegramConfig = readTelegramConfig();
-    const transports: Record<string, LoginAlertTransport> = {};
-    if (telegramConfig) {
-      const tg = createTelegramTransport(telegramConfig);
-      if (tg) transports.telegram = toLoginAlertTransport(tg);
-    }
+  if (config.enableJobQueue) {
+    queue.rehydrate();
+    queue.start();
+    nestedLog.info('job queue worker started', { provider: getAsrProviderName() });
+  } else {
+    nestedLog.warn('job queue disabled (ENABLE_JOB_QUEUE=false) job endpoints will not process work');
+  }
 
-    // Daily "yesterday's login activity" alert, shortly after IST midnight.
-    //
-    // This is the SAME single in-process 60s tick as before - not a second
-    // scheduler. What changed is the idempotency: instead of reading a guard
-    // that could never see a stored row (and therefore re-sent on every tick),
-    // the send is gated by a PERSISTED ATOMIC claim in Turso. Restarts,
-    // redeploys and multiple instances can no longer produce a second message
-    // for an IST date that has already been reported.
-    startDailyLoginAlertSchedulerAsync(loginActivity, loginActivityStore, {
-      transports,
-      onError: (e) => nestedLog.warn('daily login alert tick failed', { message: redact(String(e)) }),
-    });
+  // Build Telegram transport if configured (reads from .env at startup).
+  const telegramConfig = readTelegramConfig();
+  const transports: Record<string, LoginAlertTransport> = {};
+  if (telegramConfig) {
+    const tg = createTelegramTransport(telegramConfig);
+    if (tg) transports.telegram = toLoginAlertTransport(tg);
+  }
 
-  });
-
-  // A port collision is the exact failure that hid the real app behind a stale
-  // one. Report WHO owns the port and refuse to continue.
-  server.on('error', (err: NodeJS.ErrnoException) => {
-    if (err.code === 'EADDRINUSE') {
-      console.error(
-        `\n[Server] FATAL: port ${PORT} is already in use.\n` +
-          `        This process will NOT start, and the server already on the port is NOT\n` +
-          `        necessarily this application — it may be a stale copy or an unrelated dev\n` +
-          `        server, which is how an old UI can be served at http://localhost:${PORT}/.\n` +
-          `        Find it with:  Get-NetTCPConnection -State Listen -LocalPort ${PORT}\n` +
-          `        Stop it with:  Stop-Process -Id <pid>\n` +
-          `        Or run this app on another port:  $env:PORT=3001; npm start\n`,
-      );
-      process.exit(1);
-    }
-    console.error('[Server] fatal listen error', err);
-    process.exit(1);
+  // Daily "yesterday's login activity" alert, shortly after IST midnight.
+  //
+  // This is the SAME single in-process 60s tick as before - not a second
+  // scheduler. What changed is the idempotency: instead of reading a guard
+  // that could never see a stored row (and therefore re-sent on every tick),
+  // the send is gated by a PERSISTED ATOMIC claim in Turso. Restarts,
+  // redeploys and multiple instances can no longer produce a second message
+  // for an IST date that has already been reported.
+  startDailyLoginAlertSchedulerAsync(loginActivity, loginActivityStore, {
+    transports,
+    onError: (e) => nestedLog.warn('daily login alert tick failed', { message: redact(String(e)) }),
   });
 }
 
 // ODIA_SKIP_SERVER=1 lets tests/scripts import the pipeline functions
 // (buildMax3WordSegments, applyAudioAnalysisTags) without binding the port.
 if (process.env.ODIA_SKIP_SERVER !== '1') {
-  startServer();
+  startServer().catch((err) => {
+    console.error('[Server] FATAL: startup failed before the app was ready.', err);
+    process.exit(1);
+  });
 }
