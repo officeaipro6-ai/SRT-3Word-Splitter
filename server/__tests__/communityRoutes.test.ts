@@ -75,6 +75,18 @@ test('O1. all pre-existing production routes are still registered and unchanged'
   }
 
   // The critical production pipelines keep their exact middleware chain.
+  for (const endpoint of ['/api/process-audio', '/api/detect-language']) {
+    assert.match(
+      chainFor('POST', endpoint),
+      /requireTranscriber\(\)/,
+      `${endpoint} must keep mandatory transcription auth (customer OR verified owner)`,
+    );
+  }
+  assert.match(
+    chainFor('POST', '/api/process-audio'),
+    /requireTranscriber\(\),\s*upload\.single\('mediaFile'\)/,
+    'the transcription auth gate must stay before multer'
+  );
   assert.match(
     chainFor('POST', '/api/process-audio'),
     /upload\.single\('mediaFile'\)/,

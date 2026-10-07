@@ -33,11 +33,27 @@ const BASE = `http://127.0.0.1:${PORT}`;
 const PASSWORD = 'CorrectHorse1!';
 const EMAIL = 'http-flow@example.com';
 
+// A second, separate server instance that HAS the ADMIN bootstrap configured.
+// The main instance above deliberately runs with `ADMIN_BOOTSTRAP_TOKEN=''` so
+// its tests can never touch a real owner account; the admin-flow tests below
+// need a real bootstrap secret + allowlist, so they get their own isolated
+// process, temp DB and port.
+const ADMIN_PORT = Number(process.env.AUTH_E2E_ADMIN_PORT ?? 4320);
+const ADMIN_BASE = `http://127.0.0.1:${ADMIN_PORT}`;
+const ADMIN_SECRET = 'e2e-admin-bootstrap-secret-7788';
+const ADMIN_EMAIL = 'owner-admin@example.com';
+
 let dir: string;
 let dbUrl: string;
 let child: ChildProcess | undefined;
 let stdout = '';
 let stderr = '';
+
+let adminDir: string;
+let adminDbUrl: string;
+let adminChild: ChildProcess | undefined;
+let adminStdout = '';
+let adminStderr = '';
 
 async function post(path: string, body: unknown, token?: string) {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -57,6 +73,34 @@ async function get(path: string, token?: string) {
   const headers: Record<string, string> = {};
   if (token) headers.Authorization = `Bearer ${token}`;
   const res = await fetch(`${BASE}${path}`, { headers });
+  const text = await res.text();
+  let json: any;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    /* see above */
+  }
+  return { status: res.status, json, text };
+}
+
+async function adminPost(path: string, body: unknown, token?: string) {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const res = await fetch(`${ADMIN_BASE}${path}`, { method: 'POST', headers, body: JSON.stringify(body) });
+  const text = await res.text();
+  let json: any;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    /* keep `json` undefined: a non-JSON body is itself a finding */
+  }
+  return { status: res.status, json, text };
+}
+
+async function adminGet(path: string, token?: string) {
+  const headers: Record<string, string> = {};
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const res = await fetch(`${ADMIN_BASE}${path}`, { headers });
   const text = await res.text();
   let json: any;
   try {
@@ -91,8 +135,8 @@ async function verifyViaLink(link: string) {
 }
 
 /** Raw read of the on-disk database, bypassing the app entirely. */
-async function db() {
-  const client = createClient({ url: dbUrl });
+async function db(url = dbUrl) {
+  const client = createClient({ url });
   return {
     async all(sql: string, args: InValue[] = []) {
       return (await client.execute({ sql, args })).rows;
@@ -176,6 +220,97 @@ after(async () => {
     /* best effort */
   }
 });
+
+/**
+ * Boots the SECOND server instance — the one with ADMIN bootstrap configured.
+ * Real process, real turso file DB, real bootstrap secret + allowlist: the
+ * admin-flow tests below are exercised exactly as production boots them.
+ */
+async function spawnAdminServer(): Promise<void> {
+  adminDir = mkdtempSync(join(tmpdir(), 'authadmin-'));
+  adminDbUrl = `file:${join(adminDir, 'app.db')}`;
+  adminChild = spawn(process.execPath, ['node_modules/tsx/dist/cli.mjs', 'server.ts'], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      NODE_ENV: 'test',
+      PORT: String(ADMIN_PORT),
+      DATABASE_PROVIDER: 'turso',
+      TURSO_DATABASE_URL: adminDbUrl,
+      TURSO_AUTH_TOKEN: 'local-e2e-file-token',
+      INITIAL_CREDITS: '25',
+      FREE_TRIAL_LIMIT: '1',
+      STORAGE_PROVIDER: 'local',
+      ENABLE_JOB_QUEUE: 'false',
+      // THIS server has the bootstrap secret + allowlist (the ordinary server
+      // above deliberately does not).
+      ADMIN_BOOTSTRAP_TOKEN: ADMIN_SECRET,
+      OWNER_EMAILS: ADMIN_EMAIL,
+      RAZORPAY_KEY_ID: '',
+      RAZORPAY_KEY_SECRET: '',
+      RAZORPAY_WEBHOOK_SECRET: '',
+      SARVAM_API_KEY: '',
+      LOCAL_SUBMISSION_MODE: 'false',
+      RESEND_API_KEY: '',
+      EMAIL_FROM: '',
+      EMAIL_VERIFY_EXPIRES_MS: '',
+      EMAIL_VERIFY_RESEND_COOLDOWN_MS: '250',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  adminChild.stdout?.on('data', (d) => {
+    adminStdout += String(d);
+  });
+  adminChild.stderr?.on('data', (d) => {
+    adminStderr += String(d);
+  });
+  const deadline = Date.now() + 90_000;
+  while (Date.now() < deadline) {
+    if (adminChild.exitCode !== null) {
+      throw new Error(
+        `admin server exited early (code ${adminChild.exitCode})\nstdout:\n${adminStdout}\nstderr:\n${adminStderr}`,
+      );
+    }
+    try {
+      const res = await fetch(`${ADMIN_BASE}/api/health`);
+      if (res.ok) return;
+    } catch {
+      /* not listening yet */
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  throw new Error(`admin server never became healthy\nstdout:\n${adminStdout}\nstderr:\n${adminStderr}`);
+}
+
+before(async () => {
+  await spawnAdminServer();
+});
+
+after(async () => {
+  if (adminChild && adminChild.exitCode === null) {
+    adminChild.kill();
+    await new Promise((r) => setTimeout(r, 500));
+    if (adminChild.exitCode === null) adminChild.kill('SIGKILL');
+  }
+  try {
+    if (adminDir && existsSync(adminDir))
+      rmSync(adminDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  } catch {
+    /* best effort */
+  }
+});
+
+/** Bootstrap a fresh ADMIN session on the admin-enabled instance. */
+async function createAdminSession(): Promise<string> {
+  const res = await adminPost('/api/session', {
+    adminBootstrapToken: ADMIN_SECRET,
+    ownerEmail: ADMIN_EMAIL,
+  });
+  assert.equal(res.status, 200, `owner bootstrap must succeed: ${res.text}`);
+  assert.equal(res.json.role, 'ADMIN');
+  assert.ok(res.json.token, 'an ADMIN session token must be issued');
+  return res.json.token as string;
+}
 
 test('the server booted on the turso provider', async () => {
   const health = await get('/api/health');
@@ -334,6 +469,27 @@ test('HTTP signup -> login -> refresh -> credits -> logout', async (t) => {
   assert.equal(bogus.status, 401, `unknown token must be 401, got ${bogus.status}: ${bogus.text.slice(0, 200)}`);
   // no token -> 401
   assert.equal((await get('/api/credits/me')).status, 401);
+
+  // The VERIFIED customer passes the transcription gate: an empty-body request
+  // is refused for missing audio (400), never for auth (403/401). This locks
+  // the "verified customer may transcribe" half of the authorization boundary.
+  const transcribeAsCustomer = await post('/api/process-audio', {}, loginToken);
+  assert.equal(
+    transcribeAsCustomer.status,
+    400,
+    `a verified customer must clear the transcription gate and reach the handler: ${transcribeAsCustomer.text}`,
+  );
+  assert.match(String(transcribeAsCustomer.json.error ?? ''), /no audio or video data/i);
+  const languageAsCustomer = await post('/api/detect-language', {}, loginToken);
+  assert.equal(languageAsCustomer.status, 400, `detect-language must admit the verified customer: ${languageAsCustomer.text}`);
+  assert.equal(languageAsCustomer.json.error, 'Missing audio data');
+
+  // Unauthenticated callers are refused BEFORE any upload is read/multer runs,
+  // on both transcription entry points.
+  const anonAudio = await post('/api/process-audio', {});
+  assert.equal(anonAudio.status, 401, `unauthenticated process-audio must be 401: ${anonAudio.text}`);
+  assert.equal(anonAudio.json.code, 'AUTH_REQUIRED');
+  assert.equal((await post('/api/detect-language', {})).status, 401);
 
   // ------------------------------------------------------------- logout ---
   const logout = await post('/api/account/logout', {}, loginToken);
@@ -540,4 +696,99 @@ test('no secret material is echoed by any auth response', async () => {
     ['token'],
     'the session token is the only credential-shaped field, and it is intentional',
   );
+});
+
+test('ADMIN bootstrap: one session drives /admin AND transcription — no second customer login', async (t) => {
+  const conn = await db(adminDbUrl);
+  t.after(() => conn.close());
+
+  const bootstrap = await adminPost('/api/session', {
+    adminBootstrapToken: ADMIN_SECRET,
+    ownerEmail: ADMIN_EMAIL,
+  });
+  assert.equal(bootstrap.status, 200, bootstrap.text);
+  assert.equal(bootstrap.json.role, 'ADMIN', 'owner bootstrap must produce an ADMIN session');
+  assert.equal(bootstrap.json.account, false, 'an owner has no customer email/password account');
+  assert.equal(bootstrap.json.emailVerified, true, 'an owner is never asked to verify a customer inbox');
+  const ownerToken: string = bootstrap.json.token;
+  const ownerUserId: string = bootstrap.json.userId;
+
+  // The row is really ADMIN with the canonical allowlisted ownerEmail.
+  const rows = await conn.all('SELECT id, role, ownerEmail, creditMode FROM users WHERE id = ?', [ownerUserId]);
+  assert.equal(rows.length, 1, 'exactly one admin row must exist');
+  const row = rows[0] as Record<string, unknown>;
+  assert.equal(row.role, 'ADMIN');
+  assert.equal(row.ownerEmail, ADMIN_EMAIL, 'the stored owner email must be the canonical allowlisted one');
+  assert.equal(String(row.creditMode).toUpperCase(), 'UNLIMITED');
+
+  // (2) The SAME admin session reaches the Admin surface (server side).
+  const adminUsers = await adminGet('/api/admin/users', ownerToken);
+  assert.equal(
+    adminUsers.status,
+    200,
+    `the admin dashboard API must open with the admin token: ${adminUsers.text.slice(0, 200)}`,
+  );
+  assert.ok(Array.isArray(adminUsers.json.users), 'the admin users list must be an array');
+  assert.ok(
+    adminUsers.json.users.some((u: any) => u.id === ownerUserId),
+    'the admin list must contain the owner who requested it',
+  );
+
+  // (1) The SAME admin token clears the transcription gate on BOTH entry
+  //     points: an empty-body request is refused for missing audio (400),
+  //     never for auth/role (403/401). No second, separate customer session is
+  //     ever needed.
+  const transcribeAsOwner = await adminPost('/api/process-audio', {}, ownerToken);
+  assert.equal(
+    transcribeAsOwner.status,
+    400,
+    `a verified owner must clear the transcription gate and reach the handler: ${transcribeAsOwner.text}`,
+  );
+  assert.match(String(transcribeAsOwner.json.error ?? ''), /no audio or video data/i);
+  const languageAsOwner = await adminPost('/api/detect-language', {}, ownerToken);
+  assert.equal(languageAsOwner.status, 400, `detect-language must admit the owner: ${languageAsOwner.text}`);
+  assert.equal(languageAsOwner.json.error, 'Missing audio data');
+  // Legacy pipeline alias: the same owner session also passes /api/jobs.
+  const jobsAsOwner = await adminPost('/api/jobs', {}, ownerToken);
+  assert.equal(jobsAsOwner.status, 400, `an owner must pass the jobs auth chain: ${jobsAsOwner.text}`);
+
+  // (6) Invalid/expired ADMIN sessions are rejected from transcription: after
+  //     signing out, the same token is refused with 401 before any upload.
+  const logout = await adminPost('/api/account/logout', {}, ownerToken);
+  assert.equal(logout.status, 200, logout.text);
+  const afterLogout = await adminPost('/api/process-audio', {}, ownerToken);
+  assert.equal(afterLogout.status, 401, `a revoked admin token must be rejected: ${afterLogout.text}`);
+  assert.equal(afterLogout.json.code, 'SESSION_INVALID');
+  // A bogus well-formed token is never an owner anyone can transcribe as.
+  assert.equal((await adminPost('/api/process-audio', {}, 'B'.repeat(40))).status, 401);
+
+  // An arbitrary address with the correct secret is REFUSED: only the
+  // server-side allowlist can back an ADMIN session.
+  const forged = await adminPost('/api/session', {
+    adminBootstrapToken: ADMIN_SECRET,
+    ownerEmail: 'attacker@example.com',
+  });
+  assert.equal(forged.status, 403, forged.text);
+  assert.ok(!forged.text.includes(ADMIN_SECRET), 'a refused owner claim must never echo the secret');
+});
+
+test('the admin bootstrap secret is never returned or logged', async () => {
+  const res = await adminPost('/api/session', {
+    adminBootstrapToken: ADMIN_SECRET,
+    ownerEmail: ADMIN_EMAIL,
+  });
+  assert.equal(res.status, 200, res.text);
+  // Nowhere in the body — not under any key, not as a bare substring.
+  assert.ok(!res.text.includes(ADMIN_SECRET), 'the bootstrap secret must never appear in a response');
+  const keys = Object.keys(res.json);
+  assert.deepEqual(
+    keys.filter((k: string) => /password|hash|secret|bootstrap|token$/i.test(k)),
+    ['token'],
+    'the only credential-shaped field is the (intentional) session token',
+  );
+  assert.notEqual(res.json.token, ADMIN_SECRET, 'the session token and the bootstrap secret must differ');
+  // Let the log pipe land a tick, then search the entire server output.
+  await new Promise((r) => setTimeout(r, 150));
+  assert.ok(!adminStdout.includes(ADMIN_SECRET), 'stdout must never contain the bootstrap secret');
+  assert.ok(!adminStderr.includes(ADMIN_SECRET), 'stderr must never contain the bootstrap secret');
 });

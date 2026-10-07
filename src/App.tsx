@@ -17,7 +17,7 @@ import { RulesGuideModal } from './components/RulesGuideModal';
 import { CreditsWidget } from './components/CreditsWidget';
 import { CommunitySupport } from './components/CommunitySupport';
 import { AccountPanel } from './components/AccountPanel';
-import { ensureSession, AUTH_CHANGED_EVENT, type SessionInfo } from './lib/sessionClient';
+import { ensureSession, AUTH_CHANGED_EVENT, transcriptionGate, type SessionInfo } from './lib/sessionClient';
 import { getApiUrl } from './lib/apiUrl';
 import { CreditPacksPanel } from './components/CreditPacksPanel';
 import { LanguageSelector } from './components/LanguageSelector';
@@ -88,21 +88,24 @@ export default function App() {
   // server response after a run is the only thing that updates this).
   const [wallet, setWallet] = useState<{ credits: number; unlimited: boolean } | null>(null);
 
-  // Authentication gate: the transcription UI requires a signed-in customer account.
-  // Admin bootstrap tokens are not accepted here - they're for admin routes only.
+  // Authentication gate: the transcription UI requires a valid session — a
+  // verified customer account OR an authenticated admin/owner session. A valid
+  // admin session goes straight to the transcription UI; it is never asked for
+  // a second, separate customer login (server side: authorizeTranscriber).
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
   // Email ownership gate: a customer account whose inbox is not yet verified
   // may NOT spend credits / run transcription (the server enforces it too);
-  // this screen is the friendly half of that gate.
+  // this screen is the friendly half of that gate. Owners are never shown it.
   const [emailUnverified, setEmailUnverified] = useState<boolean>(false);
 
   const syncSession = (s: SessionInfo) => {
     setFreeTrial({ used: s.freeTrialsUsed, limit: s.freeTrialLimit, remaining: s.freeTrialsRemaining });
     setWallet({ credits: s.credits, unlimited: s.unlimited });
-    // A customer session has an email and account role (not ADMIN).
-    const isCustomer = Boolean(s.account && s.email && s.role !== 'ADMIN');
-    setIsAuthenticated(isCustomer);
-    setEmailUnverified(isCustomer && s.emailVerified === false);
+    // Client half of the transcription gate (see transcriptionGate): a valid
+    // admin session is `authenticated` directly, so no second login form appears.
+    const gate = transcriptionGate(s);
+    setIsAuthenticated(gate.authenticated);
+    setEmailUnverified(gate.emailUnverified);
   };
 
   useEffect(() => {
@@ -538,7 +541,9 @@ export default function App() {
 
       {/* Main Content Area */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
-        {/* Authentication gate: transcription requires a signed-in customer account */}
+        {/* Authentication gate: transcription requires a valid session (a
+            verified customer account OR an authenticated admin/owner). An admin
+            session lands directly on the pipeline — no second customer login. */}
         {!isAuthenticated ? (
           <div className="flex-1 flex items-center justify-center animate-in fade-in duration-200">
             <div className="bg-white/90 backdrop-blur-sm border border-slate-200 rounded-2xl p-8 max-w-md w-full mx-4 shadow-lg">

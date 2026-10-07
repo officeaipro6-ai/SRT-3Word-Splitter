@@ -87,6 +87,39 @@ function parseSession(data: any, token: string): SessionInfo {
   };
 }
 
+export interface TranscriptionGate {
+  /**
+   * True when this session may drive the transcription UI. A valid ADMIN/owner
+   * session is authenticated directly — the owner is never asked for a second,
+   * separate customer login. A customer session is authenticated too.
+   */
+  authenticated: boolean;
+  /**
+   * True only for a customer account whose inbox is not yet proven (email
+   * ownership verification) — the UI then shows the verification screen instead
+   * of the pipeline. Owners are never shown this screen.
+   */
+  emailUnverified: boolean;
+}
+
+/**
+ * Client-side half of the transcription gate. The server enforces the same
+ * boundary (server/authz.ts `authorizeTranscriber`): this only decides which
+ * screen to show, never what the server will accept. A valid ADMIN session and
+ * a verified customer session both reach the transcription UI; an unverified
+ * customer reaches the email-ownership screen; a guest sees the sign-in screen.
+ */
+export function transcriptionGate(
+  s: Pick<SessionInfo, 'role' | 'account' | 'email' | 'emailVerified'>,
+): TranscriptionGate {
+  const isAdmin = s.role === 'ADMIN';
+  const isCustomer = Boolean(s.account && s.email && !isAdmin);
+  return {
+    authenticated: isAdmin || isCustomer,
+    emailUnverified: isCustomer && s.emailVerified === false,
+  };
+}
+
 /**
  * Owner sign-in: exchanges the server-side admin bootstrap token + an owner
  * email for a session whose role is ADMIN.

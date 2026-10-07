@@ -4,6 +4,7 @@ import fs from 'fs';
 import {
   DEFAULT_OWNER_EMAILS,
   authorizeOwnerSession,
+  authorizeTranscriber,
   isAllowlistedOwnerEmail,
   isValidAdminBootstrapToken,
   isVerifiedOwner,
@@ -167,6 +168,74 @@ test('rejection messages never echo the submitted secret', () => {
     const message = ownerRejectionMessage(code);
     assert.ok(!message.includes(secretish));
     assert.ok(message.length > 0);
+  }
+});
+
+test('authorizeTranscriber: verified customers pass, unverified customers are blocked', () => {
+  // Verified inbox -> transcription allowed.
+  assert.deepEqual(authorizeTranscriber({ role: 'USER', email: 'c@example.com', emailVerified: true }), {
+    ok: true,
+  });
+  // Legacy / no-email session user keeps the long-standing grandfathered pass.
+  assert.deepEqual(authorizeTranscriber({ role: 'USER', email: null, emailVerified: false }), {
+    ok: true,
+  });
+  // Unverified customer -> blocked with the dedicated, friendly code.
+  const unverified = authorizeTranscriber({ role: 'USER', email: 'c@example.com', emailVerified: false });
+  assert.equal(unverified.ok, false);
+  if (!unverified.ok) {
+    assert.equal(unverified.code, 'EMAIL_NOT_VERIFIED');
+    assert.equal(unverified.status, 403);
+    assert.ok(!unverified.error.includes('c@example.com'));
+  }
+  // A USER row is never an owner, even when it names an allowlisted email.
+  assert.deepEqual(
+    authorizeTranscriber({
+      role: 'USER',
+      email: 'officeaipro6@gmail.com',
+      ownerEmail: 'officeaipro6@gmail.com',
+      emailVerified: true,
+    }),
+    { ok: true },
+  );
+});
+
+test('authorizeTranscriber: a valid owner passes WITHOUT any customer email-ownership step', () => {
+  delete process.env.OWNER_EMAILS;
+  const owner = authorizeTranscriber({
+    role: 'ADMIN',
+    ownerEmail: 'officeaipro6@gmail.com',
+    // The owner has never verified a customer inbox — and must not be asked to.
+    emailVerified: false,
+  });
+  assert.deepEqual(owner, { ok: true });
+});
+
+test('authorizeTranscriber: an ADMIN row is only trusted while its ownerEmail is allowlisted', () => {
+  delete process.env.OWNER_EMAILS;
+  const second = authorizeTranscriber({ role: 'ADMIN', ownerEmail: 'sumitchinara@gmail.com', emailVerified: false });
+  assert.deepEqual(second, { ok: true });
+
+  // An ADMIN row with NO stored owner email can never transcribe.
+  const legacy = authorizeTranscriber({ role: 'ADMIN', ownerEmail: undefined, emailVerified: false });
+  assert.equal(legacy.ok, false);
+  if (!legacy.ok) assert.equal(legacy.code, 'ADMIN_FORBIDDEN');
+
+  // A null user (no session) is refused by the caller's auth layer; here it is
+  // never granted transcription.
+  assert.equal(authorizeTranscriber(null).ok, false);
+
+  // Revoking the address from OWNER_EMAILS cuts transcription access at once,
+  // matching the /api/admin revocation semantics (no re-bootstrap needed).
+  const previous = process.env.OWNER_EMAILS;
+  process.env.OWNER_EMAILS = 'someone-else@example.com';
+  try {
+    const revoked = authorizeTranscriber({ role: 'ADMIN', ownerEmail: 'officeaipro6@gmail.com', emailVerified: false });
+    assert.equal(revoked.ok, false);
+    if (!revoked.ok) assert.equal(revoked.code, 'ADMIN_FORBIDDEN');
+  } finally {
+    if (previous === undefined) delete process.env.OWNER_EMAILS;
+    else process.env.OWNER_EMAILS = previous;
   }
 });
 

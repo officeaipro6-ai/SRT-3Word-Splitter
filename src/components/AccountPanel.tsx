@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { AtSign, LogIn, LogOut, KeyRound, MailCheck, UserRound } from 'lucide-react';
+import { AtSign, LogIn, LogOut, KeyRound, MailCheck, ShieldCheck, UserRound } from 'lucide-react';
 import {
   ensureSession,
   loginAccount,
@@ -15,6 +15,10 @@ import {
  * This is completely separate from the ADMIN bootstrap flow: no bootstrap token
  * is ever entered here, and sign-up can never produce an ADMIN role (the
  * server enforces that).
+ *
+ * A valid ADMIN/owner session is never shown the customer email/password form:
+ * the owner already authenticated via /admin bootstrap, and the same session
+ * drives transcription — no second login is ever requested.
  */
 export const AccountPanel: React.FC = () => {
   const [session, setSession] = useState<SessionInfo | null>(null);
@@ -103,6 +107,9 @@ export const AccountPanel: React.FC = () => {
   };
 
   const isAccount = Boolean(session?.account && session?.email);
+  // A valid admin/owner session must never be asked for a second login: the
+  // customer email/password form is for normal accounts only.
+  const isOwner = session?.role === 'ADMIN';
 
   return (
     <div className="border-b border-slate-200 bg-slate-900/95 backdrop-blur-sm text-slate-100">
@@ -128,6 +135,25 @@ export const AccountPanel: React.FC = () => {
                 </button>
               </span>
             )}
+            <button
+              onClick={() => void signOut()}
+              disabled={busy}
+              className="px-2 py-1 rounded-lg text-xs font-semibold text-slate-200 hover:text-white hover:bg-slate-700 transition-colors cursor-pointer inline-flex items-center gap-1 disabled:opacity-50"
+            >
+              <LogOut className="w-3 h-3" />
+              Sign out
+            </button>
+          </>
+        ) : isOwner ? (
+          <>
+            <a
+              href="/admin"
+              className="inline-flex items-center gap-1 text-slate-300 hover:text-white"
+              title="Admin Dashboard"
+            >
+              <ShieldCheck className="w-3 h-3 text-indigo-300" />
+              Admin session
+            </a>
             <button
               onClick={() => void signOut()}
               disabled={busy}
@@ -172,7 +198,7 @@ export const AccountPanel: React.FC = () => {
           </div>
         </div>
       )}
-      {showForm && !isAccount && (
+      {showForm && !isAccount && !isOwner && (
         <div className="bg-slate-900 border-t border-slate-800">
           <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-2 flex flex-wrap items-center gap-2 text-xs">
             <input

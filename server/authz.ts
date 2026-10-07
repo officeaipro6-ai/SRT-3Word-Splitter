@@ -20,6 +20,8 @@
  */
 import { timingSafeEqual } from 'crypto';
 import { config } from './config';
+import { isEmailVerified } from './services/emailVerification';
+import type { UserRecord } from './db/types';
 
 /** Addresses that may back an ADMIN account when OWNER_EMAILS is not set. */
 export const DEFAULT_OWNER_EMAILS: readonly string[] = [
@@ -79,6 +81,69 @@ export type OwnerRejection = 'NO_ADMIN_SECRET' | 'BAD_TOKEN' | 'EMAIL_NOT_ALLOWE
 export function isVerifiedOwner(user: { role?: string; ownerEmail?: string } | null | undefined): boolean {
   if (!user || user.role !== 'ADMIN') return false;
   return isAllowlistedOwnerEmail(user.ownerEmail);
+}
+
+export type TranscriberRejection = 'NO_SESSION' | 'ADMIN_FORBIDDEN' | 'EMAIL_NOT_VERIFIED';
+
+export type TranscriberGrant =
+  | { ok: true }
+  | { ok: false; status: 403; code: TranscriberRejection; error: string }
+  | { ok: false; status: 401; code: 'NO_SESSION'; error: string };
+
+/**
+ * The server-side authorization decision for EVERY transcription entry point
+ * (POST /api/process-audio, POST /api/detect-language).
+ *
+ * Matrix (this is the ONLY boundary that deliberately admits BOTH identities):
+ *
+ *   - valid ADMIN/owner session (token resolved + role ADMIN + the STORED
+ *     ownerEmail is still on the live OWNER_EMAILS allowlist)  -> allowed,
+ *     and NO customer email-ownership step is required of an owner.
+ *   - USER (customer) session whose inbox was proven with the emailed
+ *     single-use link (isEmailVerified)                        -> allowed.
+ *   - USER session with an unverified inbox                    -> blocked.
+ *   - ADMIN row whose ownerEmail is no longer allowlisted, or an ADMIN row
+ *     without a stored owner email (revoked/denied)            -> blocked, so an
+ *     arbitrary or demoted user can never transcribe under admin identity.
+ *   - unknown/expired/bogus token never reaches here: the caller's auth
+ *     middleware rejects the session (401) before this runs.
+ */
+export function authorizeTranscriber(
+  user: Pick<UserRecord, 'role' | 'ownerEmail' | 'email' | 'emailVerified'> | null | undefined,
+): TranscriberGrant {
+  // Never reached through the HTTP middleware (an unknown/expired token is
+  // rejected with 401 before the handler resolves a user) — a defensive guard
+  // so a missing user can never be interpreted as a verified customer.
+  if (!user) {
+    return {
+      ok: false,
+      status: 401,
+      code: 'NO_SESSION',
+      error: 'Authentication required.',
+    };
+  }
+  if (user.role === 'ADMIN') {
+    // Same live-allowlist re-check as every /api/admin request: editing
+    // OWNER_EMAILS revokes transcription access at the same moment.
+    if (!isVerifiedOwner(user)) {
+      return {
+        ok: false,
+        status: 403,
+        code: 'ADMIN_FORBIDDEN',
+        error: 'Forbidden: this administrator session is not a verified owner account.',
+      };
+    }
+    return { ok: true };
+  }
+  if (!isEmailVerified(user)) {
+    return {
+      ok: false,
+      status: 403,
+      code: 'EMAIL_NOT_VERIFIED',
+      error: 'Please verify your email before continuing.',
+    };
+  }
+  return { ok: true };
 }
 
 /**

@@ -156,6 +156,7 @@ import { createOwnerNotifier, type OwnerNotifier } from './server/services/notif
 import { verifyBootstrapTokenIntegrity } from './server/services/bootstrapTokenGuard';
 import {
   authorizeOwnerSession,
+  authorizeTranscriber,
   isVerifiedOwner,
   ownerRejectionMessage,
   normalizeEmail,
@@ -960,20 +961,23 @@ const loginActivity = new AsyncLoginActivityService(loginActivityStore);
   }
 
   /**
-   * MANDATORY customer authentication for every transcription entry point.
+   * MANDATORY authentication for every transcription entry point (the audio ->
+   * SRT pipeline). This is `auth()` plus the transcription authorization
+   * decision from `authorizeTranscriber`, covering both identities:
    *
-   * This is `auth()` plus one extra rule that matters a great deal: an
-   * ADMIN/owner session is NOT accepted here. Owner bootstrap exists to
-   * administer the service; it must not be usable to run transcription under
-   * an owner's identity, because owner credit/spend accounting is deliberately
-   * different from customer accounting.
+   *   - verified customer (email ownership proven)        -> allowed
+   *   - valid ADMIN/owner session (bootstrap + allowlist) -> allowed, and NO
+   *     customer email-ownership step is required of an owner
+   *   - unverified customer                              -> blocked (403)
+   *   - ADMIN session whose owner address left the allowlist (revoked) -> 403
+   *   - unknown/expired/bogus token                      -> blocked (401)
    *
    * It must be registered BEFORE `upload.single(...)` so an unauthenticated
    * request is refused before multer reads, buffers or stores the body. That
    * ordering is the difference between "401" and "the attacker's audio was
    * uploaded and processed anyway".
    */
-  function requireCustomer() {
+  function requireTranscriber() {
     return (req: express.Request, res: express.Response, next: express.NextFunction) => {
       const token = extractToken(req);
       if (!isValidTokenShape(token)) {
@@ -991,21 +995,12 @@ const loginActivity = new AsyncLoginActivityService(loginActivityStore);
           });
           return;
         }
-        if (user.role === 'ADMIN') {
-          res.status(403).json({
-            error: 'Administrator accounts cannot be used for customer transcription.',
-            code: 'ADMIN_NOT_ALLOWED',
-          });
-          return;
-        }
-        // EMAIL OWNERSHIP VERIFICATION: an email account that has not proven its
-        // inbox cannot spend service credits on transcription. No-email session
-        // users and legacy accounts (grandfathered verified) pass untouched.
-        if (!isEmailVerified(user)) {
-          res.status(403).json({
-            error: 'Please verify your email before continuing.',
-            code: 'EMAIL_NOT_VERIFIED',
-          });
+        // The single authorization boundary for the pipeline: verified customer
+        // OR verified owner. An ADMIN session is never routed through the
+        // customer email-ownership step.
+        const grant = authorizeTranscriber(user);
+        if (grant.ok !== true) {
+          res.status(grant.status).json({ error: grant.error, code: grant.code });
           return;
         }
         await accounts.touch(user.id).catch((e) => {
@@ -1014,7 +1009,7 @@ const loginActivity = new AsyncLoginActivityService(loginActivityStore);
         res.locals.user = user;
         next();
       })().catch((err) => {
-        nestedLog.error('requireCustomer failed', { message: redact((err as Error).message) });
+        nestedLog.error('requireTranscriber failed', { message: redact((err as Error).message) });
         if (!res.headersSent) res.status(500).json({ error: 'Failed to verify session.' });
       });
     };
@@ -1024,9 +1019,9 @@ const loginActivity = new AsyncLoginActivityService(loginActivityStore);
    * EMAIL OWNERSHIP VERIFICATION — gate for authenticated-but-unverified callers.
    *
    * Used on subscription/charge paths that also admit ADMIN sessions (which
-   * requireCustomer() would reject wholesale). It only refuses accounts that
-   * possess an email AND still have it unverified; ADMIN/no-email users are
-   * always allowed, exactly like requireCustomer()'s rule.
+   * requireTranscriber() would accept as owners, not as customers). It only
+   * refuses accounts that possess an email AND still have it unverified;
+   * ADMIN/no-email users are always allowed, exactly like authorizeTranscriber.
    */
   function requireEmailVerified() {
     return (req: express.Request, res: express.Response, next: express.NextFunction) => {
@@ -1115,7 +1110,7 @@ const loginActivity = new AsyncLoginActivityService(loginActivityStore);
   });
 
   // Primary AI processing endpoint (accepts multipart file or JSON with base64 audio)
-  // `requireCustomer()` is deliberately BEFORE `upload.single(...)`.
+  // `requireTranscriber()` is deliberately BEFORE `upload.single(...)`.
   //
   // It used to be neither: this route accepted a completely unauthenticated
   // request and transcribed it. Because the free-trial counter and the credit
@@ -1127,7 +1122,7 @@ const loginActivity = new AsyncLoginActivityService(loginActivityStore);
   // request is refused with 401 before multer reads the body, so no upload is
   // buffered, no job is created, no provider is contacted, and no free trial or
   // credit is touched.
-  app.post('/api/process-audio', requireCustomer(), upload.single('mediaFile'), async (req, res) => {
+  app.post('/api/process-audio', requireTranscriber(), upload.single('mediaFile'), async (req, res) => {
     // Set when a paid request reserves credits BEFORE the provider call. Always
     // settled on success and released on ANY error, so a failed/over-quota job
     // can never consume the user's credits (no double-spend, no charge for
@@ -1197,10 +1192,10 @@ const loginActivity = new AsyncLoginActivityService(loginActivityStore);
 
       // ------------------------------------------------------------------
       // IDENTITY + FREE-TRIAL USAGE LIMIT (server-side enforcement).
-      //   - `requireCustomer()` (registered before the upload middleware) has
-      //     ALREADY resolved a server-verified customer identity and put it in
-      //     `res.locals.user`. There is no anonymous branch any more: an
-      //     unauthenticated request never reaches this line.
+      //   - `requireTranscriber()` (registered before the upload middleware) has
+      //     ALREADY resolved a server-verified identity (customer OR verified
+      //     owner) and put it in `res.locals.user`. There is no anonymous branch
+      //     any more: an unauthenticated request never reaches this line.
       //   - The trial counter increments ONLY after a successful pipeline run
       //     below, so failed uploads / API errors never consume a trial.
       //   - The monetization credit gate runs AFTER the duration is measured and
@@ -1845,12 +1840,12 @@ const loginActivity = new AsyncLoginActivityService(loginActivityStore);
   });
 
   // Fast Language Detection endpoint (Step 1 standalone check)
-  // `requireCustomer()` BEFORE the handler: this route calls `runOdiaPipeline`,
+  // `requireTranscriber()` BEFORE the handler: this route calls `runOdiaPipeline`,
   // i.e. it performs real ASR work against the configured provider. It used to
   // be completely unauthenticated, so it was a second free provider-spend hole
   // even after /api/process-audio was locked down. No auth -> 401, no pipeline
   // call, no provider data leaves the process.
-  app.post('/api/detect-language', requireCustomer(), async (req, res) => {
+  app.post('/api/detect-language', requireTranscriber(), async (req, res) => {
     try {
       const { audioBase64, mimeType } = req.body;
       if (!audioBase64) {
