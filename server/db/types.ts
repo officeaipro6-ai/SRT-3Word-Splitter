@@ -209,6 +209,23 @@ export interface UserRecord {
    * together with the server-held admin secret (see server/authz.ts).
    */
   ownerEmail?: string;
+  /**
+   * EMAIL OWNERSHIP VERIFICATION (email/password USER accounts only).
+   *
+   * `false` means the account must click a single-use, expiring email link
+   * before it may consume credits or trigger provider processing. The default
+   * when absent is `true`: pre-existing accounts (and anonymous session users,
+   * which carry no email) are grandfathered as verified, so activating the
+   * feature never locks a legacy user out. Only accounts created AFTER the
+   * feature ships are stored with `emailVerified: false`.
+   */
+  emailVerified?: boolean;
+  /** sha256 hash of the outstanding verification token. The raw token is never stored. */
+  emailVerifyTokenHash?: string;
+  /** ISO timestamp after which the outstanding verification token is invalid. */
+  emailVerifyExpiresAt?: string;
+  /** ISO timestamp of the last verification email sent (resend cooldown anchor). */
+  emailVerifyLastSentAt?: string;
 }
 
 export interface CreditTransactionRecord {
@@ -317,7 +334,7 @@ export interface DbShape {
 }
 
 /** How a session/login was obtained. Never a credential itself. */
-export type LoginMethod = 'SESSION' | 'ACCOUNT_LOGIN' | 'OWNER_BOOTSTRAP';
+export type LoginMethod = 'SESSION' | 'ACCOUNT_LOGIN' | 'OWNER_BOOTSTRAP' | 'EMAIL_VERIFY';
 
 export type LoginOutcome = 'SUCCESS' | 'FAILURE';
 

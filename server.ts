@@ -128,6 +128,21 @@ import {
 import type { TursoStore } from './server/db/tursoStore';
 import { runLoginAlert, startDailyLoginAlertScheduler } from './server/services/loginAlertService';
 import { createTelegramTransport, readTelegramConfig, toLoginAlertTransport } from './server/services/notifications';
+import {
+  createEmailSender,
+  verificationEmailFor,
+  type EmailSender,
+} from './server/services/emailTransport';
+import {
+  isEmailVerified,
+  isVerificationTokenValid,
+  resendCooldownRemainingMs,
+  hashVerificationToken,
+} from './server/services/emailVerification';
+import {
+  normalizeAccountEmail,
+  isValidAccountEmail,
+} from './server/services/accountService';
 
 import {
   ProviderSafetyService,
@@ -897,6 +912,13 @@ const loginActivity = new AsyncLoginActivityService(loginActivityStore);
   const razorpayEnabled = !!razorpay;
 
   const uploadLimiter = new SlidingWindowLimiter(config.uploadRateLimitWindowMs, config.uploadRateLimitMax);
+  // Email-ownership verification transport. Log mode (default when no SMTP is
+  // configured) prints the verification links so a dev/Preview can exercise the
+  // flow; SMTP mode delivers real mail through the configured provider.
+  const verificationSender = createEmailSender();
+  // Resend throttle: a per-address+IP generous allowance on top of the per-account
+  // cooldown so a volume guesser can't cycle many addresses through 429s.
+  const resendRateLimiter = new SlidingWindowLimiter(60 * 60 * 1000, 10);
 
   /**
    * Bearer-token auth: resolves identity, verifies ownership, records access.
@@ -975,6 +997,16 @@ const loginActivity = new AsyncLoginActivityService(loginActivityStore);
           });
           return;
         }
+        // EMAIL OWNERSHIP VERIFICATION: an email account that has not proven its
+        // inbox cannot spend service credits on transcription. No-email session
+        // users and legacy accounts (grandfathered verified) pass untouched.
+        if (!isEmailVerified(user)) {
+          res.status(403).json({
+            error: 'Please verify your email before continuing.',
+            code: 'EMAIL_NOT_VERIFIED',
+          });
+          return;
+        }
         await accounts.touch(user.id).catch((e) => {
           nestedLog.warn('session touch failed', { message: redact((e as Error).message) });
         });
@@ -984,6 +1016,30 @@ const loginActivity = new AsyncLoginActivityService(loginActivityStore);
         nestedLog.error('requireCustomer failed', { message: redact((err as Error).message) });
         if (!res.headersSent) res.status(500).json({ error: 'Failed to verify session.' });
       });
+    };
+  }
+
+  /**
+   * EMAIL OWNERSHIP VERIFICATION — gate for authenticated-but-unverified callers.
+   *
+   * Used on subscription/charge paths that also admit ADMIN sessions (which
+   * requireCustomer() would reject wholesale). It only refuses accounts that
+   * possess an email AND still have it unverified; ADMIN/no-email users are
+   * always allowed, exactly like requireCustomer()'s rule.
+   */
+  function requireEmailVerified() {
+    return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+      const user = res.locals.user;
+      if (!user) {
+        return res.status(401).json({ error: 'Sign in to continue.', code: 'AUTH_REQUIRED' });
+      }
+      if (!isEmailVerified(user)) {
+        return res.status(403).json({
+          error: 'Please verify your email before continuing.',
+          code: 'EMAIL_NOT_VERIFIED',
+        });
+      }
+      next();
     };
   }
 
@@ -1906,6 +1962,7 @@ const loginActivity = new AsyncLoginActivityService(loginActivityStore);
         createdAt: user?.createdAt,
         email: user?.email ?? null,
         account: Boolean(user?.email),
+        emailVerified: isEmailVerified(user),
         lastLoginAt: user?.lastLoginAt ?? null,
       });
     } catch (err: any) {
@@ -1934,6 +1991,7 @@ const loginActivity = new AsyncLoginActivityService(loginActivityStore);
       createdAt: user?.createdAt,
       email: user?.email ?? null,
       account: Boolean(user?.email),
+      emailVerified: isEmailVerified(user),
       lastLoginAt: user?.lastLoginAt ?? null,
     };
   }
@@ -1970,6 +2028,30 @@ const loginActivity = new AsyncLoginActivityService(loginActivityStore);
       } catch (e) {
         nestedLog.warn('signup login-activity record failed', { message: redact((e as Error).message) });
       }
+      // EMAIL OWNERSHIP VERIFICATION: a fresh account is unverified until it
+      // proves the inbox. Persist the token hash first, then deliver the link
+      // best-effort — a transport failure must never fail the signup, and a
+      // resendable link always exists because the hash is already on disk.
+      if (user && user.email) {
+        try {
+          const rawToken = await accounts.issueVerification(user.id);
+          if (rawToken) {
+            const baseUrl = appBaseUrlForRequest(req);
+            const { message } = verificationEmailFor(user.email, rawToken, { requestBaseUrl: baseUrl });
+            const delivery = await verificationSender.sender(message);
+            nestedLog.info('verification email sent', {
+              userId: user.id,
+              transport: verificationSender.mode,
+              delivered: delivery.delivered,
+            });
+          }
+        } catch (e) {
+          nestedLog.warn('verification email issuance failed (signup continues)', {
+            userId: user.id,
+            message: redact((e as Error).message),
+          });
+        }
+      }
       return res.status(201).json(sessionPayload(user, token));
     } catch (err: any) {
       nestedLog.error('account signup failed', { message: redact(err.message) });
@@ -1979,7 +2061,7 @@ const loginActivity = new AsyncLoginActivityService(loginActivityStore);
 
   app.post('/api/account/login', asyncRoute(async (req, res) => {
     try {
-      const result = await accounts.login(req.body ?? {});
+const result = await accounts.login(req.body ?? {});
       if (!result.ok || !result.user) {
         // A FAILED sign-in is recorded with no user, no email and no request
         // metadata: the caller is unauthenticated, so the submitted address and
@@ -1994,7 +2076,12 @@ const loginActivity = new AsyncLoginActivityService(loginActivityStore);
         } catch (e) {
           nestedLog.warn('failed-login record error', { message: redact((e as Error).message) });
         }
-        return res.status(401).json({ error: result.error, code: result.code ?? 'INVALID_CREDENTIALS' });
+        // Unverified accounts are told so with a distinct status + code so the
+        // UI can route them to the verification screen without treating it as a
+        // credential error. No token is ever issued on this path — the session
+        // remains unauthenticated until the email is proven.
+        const status = result.code === 'EMAIL_NOT_VERIFIED' ? 403 : 401;
+        return res.status(status).json({ error: result.error, code: result.code ?? 'INVALID_CREDENTIALS' });
       }
       const token = issueToken();
       await accounts.addToken(result.user.id, hashToken(token));
@@ -2035,13 +2122,136 @@ const loginActivity = new AsyncLoginActivityService(loginActivityStore);
     }
   }));
 
+  // Consensus base URL for verification links: the request's own origin wins
+  // (so a Preview app links back to exactly the host the user is on, and
+  // render.com's x-forwarded-proto keeps the scheme https), else the loopback
+  // default the built-in static client targets.
+  function appBaseUrlForRequest(req: express.Request): string {
+    const proto =
+      (String(req.headers['x-forwarded-proto'] ?? '').split(',')[0]?.trim() || req.protocol || 'http').replace(/[^a-zA-Z0-9+.]/g, '') || 'http';
+    const host = String(req.headers.host || 'localhost:3000').trim();
+    return `${proto}://${host}`;
+  }
+
+  function escapeHtml(value: string): string {
+    return String(value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  // A tiny inline page for the email link destination — no SPA route exists and
+  // the bare JSON body would look broken in a browser tab.
+  function renderVerificationPage(res: express.Response, ok: boolean, message: string): void {
+    const color = ok ? '#059669' : '#b91c1c';
+    res.status(200).send(
+      '<!doctype html><html lang="en"><head><meta charset="utf-8">' +
+        '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+        '<title>Email verification — Odia SRT</title></head>' +
+        '<body style="margin:0;font-family:Arial,Helvetica,sans-serif;background:#f3f4f6;height:100vh;display:flex;align-items:center;justify-content:center">' +
+        `<div style="max-width:420px;padding:32px;background:#fff;border-radius:12px;box-shadow:0 1px 3px rgba(0,0,0,.1);text-align:center">` +
+        `<div style="font-size:40px;margin-bottom:12px">${ok ? '✅' : '⚠️'}</div>` +
+        `<h1 style="font-size:20px;margin:0 0 8px;color:${color}">${escapeHtml(message)}</h1>` +
+        ok
+          ? '<p style="color:#6b7280;font-size:14px;line-height:1.5">You can now close this tab and sign in to continue transcribing.</p>'
+          : '<p style="color:#6b7280;font-size:14px;line-height:1.5">Check your inbox for a fresh verification link, or request a new one from the app.</p>' +
+            '<p style="margin:24px 0 0"><a href="/" style="background:#4f46e5;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none;display:inline-block">Go to Odia SRT</a></p>' +
+        '</div></body></html>'
+    );
+  }
+
+  // EMAIL OWNERSHIP VERIFICATION — link consumption.
+  // Content-negotiated: the browser sees a small inline page, API/tests get JSON.
+  // The token is single-use: consuming it ALSO marks the account verified, and
+  // every state where the presented link is not the live, unexpired match
+  // renders the same neutral "invalid or expired" outcome.
+  app.get('/api/auth/verify-email', asyncRoute(async (req, res) => {
+    const raw = typeof req.query.token === 'string' ? req.query.token : '';
+    const acceptsJson = req.accepts(['json', 'html']) === 'json';
+    const finish = (ok: boolean, message: string, status: number): void => {
+      if (acceptsJson) return void res.status(status).json({ ok, message, status });
+      renderVerificationPage(res, ok, message);
+    };
+    try {
+      if (!raw) return finish(false, 'That verification link is missing or invalid. It may have expired or already been used.', 404);
+      const tokenHash = hashVerificationToken(raw);
+      const user = await accounts.getByEmailVerificationTokenHash(tokenHash);
+      if (!user || !isVerificationTokenValid(user, tokenHash)) {
+        return finish(false, 'That verification link is invalid or has expired.', 404);
+      }
+      await accounts.markEmailVerified(user.id);
+      try {
+        await loginActivity.record({
+          userId: user.id,
+          email: user.email ?? undefined,
+          method: 'EMAIL_VERIFY',
+          outcome: 'SUCCESS',
+          ip: req.ip,
+          userAgent: String(req.headers['user-agent'] ?? ''),
+        });
+      } catch (e) {
+        nestedLog.warn('verify login-activity record failed', { message: redact((e as Error).message) });
+      }
+      return finish(true, 'Your email has been verified. You can now sign in and continue transcribing.', 200);
+    } catch (err: any) {
+      nestedLog.error('email verification failed', { message: redact(err.message) });
+      return finish(false, 'Something went wrong while verifying your email. Please try again.', 500);
+    }
+  }));
+
+  // EMAIL OWNERSHIP VERIFICATION — resend.
+  // 202 for known and unknown addresses alike (no address enumeration), 429 on
+  // the per-account cooldown or the per-address/IP throttle.
+  app.post('/api/account/resend-verification', asyncRoute(async (req, res) => {
+    try {
+      const raw = normalizeAccountEmail(req.body?.email);
+      if (!raw || !isValidAccountEmail(raw)) {
+        return res.status(400).json({ error: 'A valid email address is required.', code: 'VALIDATION' });
+      }
+      if (!resendRateLimiter.isAllowed(`${raw}:${req.ip || ''}`)) {
+        return res.status(429).json({ error: 'Too many requests. Please wait before trying again.', code: 'RATE_LIMITED' });
+      }
+      const user = await accounts.getByEmail(raw);
+      if (!user || !user.email) {
+        // Indistinguishable from a real send: the address is not learnable here.
+        return res.status(202).json({ ok: true });
+      }
+      if (isEmailVerified(user)) {
+        return res.status(202).json({ ok: true, message: 'This email is already verified — you can sign in now.' });
+      }
+      const cooldownMs = resendCooldownRemainingMs(user);
+      if (cooldownMs > 0) {
+        return res.status(429).json({
+          error: 'A verification link was sent recently. Please wait before requesting another.',
+          code: 'RESEND_COOLDOWN',
+          retryAfterMs: cooldownMs,
+        });
+      }
+      const rawToken = await accounts.issueVerification(user.id);
+      if (!rawToken) return res.status(202).json({ ok: true });
+      const baseUrl = appBaseUrlForRequest(req);
+      const { message } = verificationEmailFor(user.email, rawToken, { requestBaseUrl: baseUrl });
+      const delivery = await verificationSender.sender(message);
+      nestedLog.info('resend verification email sent', {
+        userId: user.id,
+        transport: verificationSender.mode,
+        delivered: delivery.delivered,
+      });
+      return res.status(202).json({ ok: true });
+    } catch (err: any) {
+      nestedLog.error('resend verification failed', { message: redact(err.message) });
+      return res.status(500).json({ error: 'Failed to send the verification email.' });
+    }
+  }));
+
   // Upload -> validate -> charge credits server-side -> enqueue (async worker).
   // No long audio is transcribed inside this request.
   // The middleware chain is kept on one line and UNCHANGED: `auth()` must run
   // before `upload.single()` (an unauthenticated caller must never get a file
   // buffered to disk), and a route-registration guard asserts that literal
   // ordering. Only the handler itself gained the asyncRoute() wrapper.
-  app.post('/api/jobs', auth(), upload.single('mediaFile'), asyncRoute(async (req, res) => {
+  app.post('/api/jobs', auth(), requireEmailVerified(), upload.single('mediaFile'), asyncRoute(async (req, res) => {
     try {
       const user = res.locals.user;
       if (!uploadLimiter.isAllowed(`${user.id}:${req.ip || ''}`)) {

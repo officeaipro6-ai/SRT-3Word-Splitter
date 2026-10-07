@@ -91,6 +91,10 @@ export default function App() {
   // Authentication gate: the transcription UI requires a signed-in customer account.
   // Admin bootstrap tokens are not accepted here - they're for admin routes only.
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
+  // Email ownership gate: a customer account whose inbox is not yet verified
+  // may NOT spend credits / run transcription (the server enforces it too);
+  // this screen is the friendly half of that gate.
+  const [emailUnverified, setEmailUnverified] = useState<boolean>(false);
 
   const syncSession = (s: SessionInfo) => {
     setFreeTrial({ used: s.freeTrialsUsed, limit: s.freeTrialLimit, remaining: s.freeTrialsRemaining });
@@ -98,6 +102,7 @@ export default function App() {
     // A customer session has an email and account role (not ADMIN).
     const isCustomer = Boolean(s.account && s.email && s.role !== 'ADMIN');
     setIsAuthenticated(isCustomer);
+    setEmailUnverified(isCustomer && s.emailVerified === false);
   };
 
   useEffect(() => {
@@ -540,6 +545,19 @@ export default function App() {
               <div className="text-center mb-6">
                 <h1 className="text-2xl font-bold text-slate-900">Sign in to transcribe</h1>
                 <p className="text-slate-500 mt-2">Create an account or sign in to access the transcription pipeline.</p>
+              </div>
+              <AccountPanel />
+            </div>
+          </div>
+        ) : emailUnverified ? (
+          <div className="flex-1 flex items-center justify-center animate-in fade-in duration-200">
+            <div className="bg-white/90 backdrop-blur-sm border border-slate-200 rounded-2xl p-8 max-w-md w-full mx-4 shadow-lg">
+              <div className="text-center mb-4">
+                <h1 className="text-2xl font-bold text-slate-900">Verify your email</h1>
+                <p className="text-slate-500 mt-2">
+                  Transcribing is locked until you prove you own this inbox. Check your email for
+                  the one-hour verification link — it can only be used once.
+                </p>
               </div>
               <AccountPanel />
             </div>

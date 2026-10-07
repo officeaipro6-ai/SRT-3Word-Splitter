@@ -1,10 +1,11 @@
 import React, { useEffect, useState } from 'react';
-import { AtSign, LogIn, LogOut, KeyRound, UserRound } from 'lucide-react';
+import { AtSign, LogIn, LogOut, KeyRound, MailCheck, UserRound } from 'lucide-react';
 import {
   ensureSession,
   loginAccount,
   signupAccount,
   logoutAccount,
+  resendVerificationEmail,
   notifyAuthChanged,
   type SessionInfo,
 } from '../lib/sessionClient';
@@ -24,6 +25,9 @@ export const AccountPanel: React.FC = () => {
   const [password, setPassword] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [needsVerification, setNeedsVerification] = useState<string | null>(null);
+  const [resending, setResending] = useState(false);
+  const [resendNotice, setResendNotice] = useState<string | null>(null);
 
   const refresh = () => {
     setLoading(true);
@@ -44,6 +48,8 @@ export const AccountPanel: React.FC = () => {
   const submit = async () => {
     setBusy(true);
     setError(null);
+    setNeedsVerification(null);
+    setResendNotice(null);
     try {
       const next =
         mode === 'signup'
@@ -55,9 +61,30 @@ export const AccountPanel: React.FC = () => {
       setPassword('');
       notifyAuthChanged();
     } catch (e: any) {
+      // The server answers unverified logins with a distinct code so the UI can
+      // offer a resend without ever treating it as a credential error.
+      if (e?.code === 'EMAIL_NOT_VERIFIED') {
+        setNeedsVerification(email);
+      }
       setError(e.message);
     } finally {
       setBusy(false);
+    }
+  };
+
+  const sendVerification = async () => {
+    const target = needsVerification ?? session?.email;
+    if (!target) return;
+    setResending(true);
+    setResendNotice(null);
+    setError(null);
+    try {
+      const message = await resendVerificationEmail(target);
+      setResendNotice(message || 'A fresh verification link has been sent to your inbox.');
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setResending(false);
     }
   };
 
@@ -88,6 +115,19 @@ export const AccountPanel: React.FC = () => {
               <UserRound className="w-3 h-3 text-emerald-400" />
               {session.email}
             </span>
+            {session.emailVerified === false && (
+              <span className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                <MailCheck className="w-3 h-3" />
+                Unverified inbox
+                <button
+                  onClick={() => void sendVerification()}
+                  disabled={resending}
+                  className="underline underline-offset-2 hover:text-amber-200 cursor-pointer disabled:opacity-50"
+                >
+                  {resending ? 'Sending…' : 'Resend link'}
+                </button>
+              </span>
+            )}
             <button
               onClick={() => void signOut()}
               disabled={busy}
@@ -107,6 +147,31 @@ export const AccountPanel: React.FC = () => {
           </button>
         )}
       </div>
+      {resendNotice && (
+        <div className="bg-emerald-500/10 border-t border-emerald-500/20 text-emerald-300">
+          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-1.5 text-xs">
+            {resendNotice}
+          </div>
+        </div>
+      )}
+      {needsVerification && (
+        <div className="bg-amber-500/10 border-t border-amber-500/20 text-amber-300">
+          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-2 flex flex-wrap items-center gap-2 text-xs">
+            <MailCheck className="w-3 h-3" />
+            <span>
+              This email still needs to be verified. Check {needsVerification || 'your inbox'} for the
+              verification link we sent, or request a new one.
+            </span>
+            <button
+              onClick={() => void sendVerification()}
+              disabled={resending}
+              className="px-2 py-1 rounded-lg text-xs font-semibold bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 cursor-pointer disabled:opacity-50 inline-flex items-center gap-1"
+            >
+              {resending ? 'Sending…' : 'Resend verification link'}
+            </button>
+          </div>
+        </div>
+      )}
       {showForm && !isAccount && (
         <div className="bg-slate-900 border-t border-slate-800">
           <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-2 flex flex-wrap items-center gap-2 text-xs">

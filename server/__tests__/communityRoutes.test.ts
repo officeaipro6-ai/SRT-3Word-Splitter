@@ -80,7 +80,11 @@ test('O1. all pre-existing production routes are still registered and unchanged'
     /upload\.single\('mediaFile'\)/,
     'the ASR upload policy must be untouched'
   );
-  assert.match(chainFor('POST', '/api/jobs'), /auth\(\), upload\.single\('mediaFile'\)/);
+  assert.match(
+    chainFor('POST', '/api/jobs'),
+    /auth\(\), requireEmailVerified\(\), upload\.single\('mediaFile'\)/,
+    'the jobs pipeline must stay auth-first, email-verified before the charge/write, and multer never before auth'
+  );
   assert.match(chainFor('GET', '/api/credits/me'), /auth\(\)/);
   // Admin routes keep auth() + requireAdmin in that order, on every method.
   for (const r of required.filter((x) => x.startsWith('/api/admin/'))) {

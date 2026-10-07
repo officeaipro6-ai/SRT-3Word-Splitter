@@ -132,7 +132,7 @@ test('5D-D2. the schema version is bumped to 3 and stamped', async () => {
   await store.init();
   const marked = await client.execute('SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1');
   assert.equal(Number(marked.rows[0].version), SCHEMA_VERSION);
-  assert.equal(SCHEMA_VERSION, 3, 'Stage 5D identity work is schema v3');
+  assert.equal(SCHEMA_VERSION, 4, 'Stage 5D identity work plus email-verification columns is schema v4');
 });
 
 test('5D-D3. re-running the migration is a no-op (idempotent)', async () => {

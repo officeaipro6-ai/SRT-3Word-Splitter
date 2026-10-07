@@ -300,8 +300,8 @@ export class TursoScope implements UnitOfWork<TursoScope> {
   /** Insert a user row. Used by the registration + initial-credit flow. */
   async createUser(user: UserRecord): Promise<void> {
     await this.exec.execute({
-      sql: `INSERT INTO users (id, email, passwordHash, credits, role, creditMode, tokenHashes, ownerEmail, lastLoginAt, lastSeenAt, createdAt, freeTrialsUsed)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      sql: `INSERT INTO users (id, email, passwordHash, credits, role, creditMode, tokenHashes, ownerEmail, lastLoginAt, lastSeenAt, createdAt, freeTrialsUsed, emailVerified, emailVerifyTokenHash, emailVerifyExpiresAt, emailVerifyLastSentAt)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       args: [
         user.id,
         user.email ?? null,
@@ -315,6 +315,13 @@ export class TursoScope implements UnitOfWork<TursoScope> {
         user.lastSeenAt ?? null,
         user.createdAt ?? new Date().toISOString(),
         user.freeTrialsUsed ?? 0,
+        // Matches TursoStore.createUser: no-email session users are verified
+        // (they never participate in email verification); new email accounts
+        // that carry `emailVerified: false` are stored unverified.
+        user.email ? (user.emailVerified === false ? 0 : 1) : 1,
+        user.emailVerifyTokenHash ?? null,
+        user.emailVerifyExpiresAt ?? null,
+        user.emailVerifyLastSentAt ?? null,
       ],
     });
   }

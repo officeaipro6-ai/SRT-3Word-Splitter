@@ -39,6 +39,20 @@ export function normalizeUser(u: any): UserRecord {
     email: typeof u.email === 'string' && u.email.trim() ? u.email.trim().toLowerCase() : undefined,
     passwordHash: typeof u.passwordHash === 'string' && u.passwordHash.trim() ? u.passwordHash.trim() : undefined,
     lastLoginAt: typeof u.lastLoginAt === 'string' ? u.lastLoginAt : undefined,
+    // A missing emailVerified (legacy record, or a row written before the
+    // field existed) means an account that predates the feature: grandfathered
+    // as VERIFIED. Only an explicit stored `false` requires verification. The
+    // Turso provider stores booleans as INTEGER 1/0, so both encodings are
+    // folded onto the boolean here.
+    emailVerified:
+      typeof u.emailVerified === 'boolean'
+        ? u.emailVerified
+        : u.emailVerified === 0
+          ? false
+          : true,
+    emailVerifyTokenHash: typeof u.emailVerifyTokenHash === 'string' ? u.emailVerifyTokenHash : undefined,
+    emailVerifyExpiresAt: typeof u.emailVerifyExpiresAt === 'string' ? u.emailVerifyExpiresAt : undefined,
+    emailVerifyLastSentAt: typeof u.emailVerifyLastSentAt === 'string' ? u.emailVerifyLastSentAt : undefined,
   };
 }
 

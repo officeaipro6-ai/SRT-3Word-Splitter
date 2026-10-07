@@ -26,6 +26,7 @@ import { createTursoAccountFacade } from '../services/accountFacade';
 import { TursoCreditService } from '../services/tursoCreditService';
 import { createTursoCreditFacade } from '../services/creditFacade';
 import { hashToken, issueToken, isValidTokenShape } from '../services/auth';
+import { hashVerificationToken } from '../services/emailVerification';
 import type { AsyncAccountService } from '../services/accountFacade';
 import type { AsyncCreditService } from '../services/creditFacade';
 import { freeTrialsRemaining } from '../services/freeTrialPolicy';
@@ -84,6 +85,19 @@ async function ready(): Promise<AuthStack> {
   };
 }
 
+/**
+ * Simulate the user clicking the emailed link: look the token hash back up and
+ * mark the account verified — exactly what GET /api/auth/verify-email does.
+ */
+async function verifyAccount(accounts: AsyncAccountService, userId: string): Promise<void> {
+  const raw = await accounts.issueVerification(userId);
+  assert.ok(raw, 'issueVerification must produce a usable token');
+  const holder = await accounts.getByEmailVerificationTokenHash(hashVerificationToken(raw as string));
+  assert.ok(holder, 'the verification token must resolve to its account');
+  assert.equal(holder!.id, userId);
+  assert.equal(await accounts.markEmailVerified(holder!.id), true);
+}
+
 test('signup -> login -> refresh -> credits -> logout against real libSQL', async (t) => {
   const s = await ready();
   t.after(() => s.cleanup());
@@ -95,6 +109,7 @@ test('signup -> login -> refresh -> credits -> logout against real libSQL', asyn
   assert.equal(signup.user!.email, EMAIL);
   assert.equal(signup.user!.role, 'USER', 'signup must never grant ADMIN');
   assert.equal(signup.user!.creditMode, 'NORMAL');
+  assert.equal(signup.user!.emailVerified, false, 'a fresh signup is unverified until it proves the inbox');
   assert.ok(signup.user!.passwordHash?.startsWith('scrypt$'), 'password must be scrypt-hashed');
   assert.ok(
     !JSON.stringify(signup.user).includes(PASSWORD),
@@ -117,6 +132,14 @@ test('signup -> login -> refresh -> credits -> logout against real libSQL', asyn
   const dupe = await s.accounts.signup({ email: EMAIL, password: PASSWORD }, INITIAL_CREDITS);
   assert.equal(dupe.ok, false);
   assert.equal(dupe.code, 'EMAIL_TAKEN');
+
+  // An unverified account is refused at login (the ownership gate).
+  const blocked = await s.accounts.login({ email: EMAIL, password: PASSWORD });
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.code, 'EMAIL_NOT_VERIFIED', 'login must refuse the unverified account');
+
+  // Prove the inbox exactly like the emailed link does, then login succeeds.
+  await verifyAccount(s.accounts, signup.user!.id);
 
   // ----------------------------------------------------------------- login ---
   const login = await s.accounts.login({ email: EMAIL, password: PASSWORD });
@@ -227,6 +250,8 @@ test('email is normalized so casing cannot create a second account', async (t) =
   assert.equal(second.code, 'EMAIL_TAKEN');
   assert.equal((await s.store.getUsers()).length, 1);
 
+  await verifyAccount(s.accounts, first.user!.id);
+
   // And the normalized address is what login resolves.
   const login = await s.accounts.login({ email: '  Mixed@Example.com ', password: PASSWORD });
   assert.equal(login.ok, true);
@@ -279,4 +304,42 @@ test('admin bootstrap fields persist and stay off the signup path', async (t) =>
   // A second signup is still a plain USER even while an admin exists.
   const other = await s.accounts.signup({ email: 'other@example.com', password: PASSWORD }, 0);
   assert.equal(other.user!.role, 'USER');
+});
+
+test('verification is single-use and survives the INTEGER->boolean restarted read path', async (t) => {
+  const s = await ready();
+  t.after(() => s.cleanup());
+
+  const signup = await s.accounts.signup({ email: 'verify@example.com', password: PASSWORD }, 5);
+  assert.equal(signup.user!.emailVerified, false);
+
+  const raw = await s.accounts.issueVerification(signup.user!.id);
+  const hash = hashVerificationToken(raw as string);
+
+  // A resend mints a FRESH single-use token and invalidates the previous link.
+  const raw2 = await s.accounts.issueVerification(signup.user!.id);
+  const hash2 = hashVerificationToken(raw2 as string);
+  assert.notEqual(hash2, hash, 'a resend must mint a fresh single-use token');
+  assert.equal(
+    await s.accounts.getByEmailVerificationTokenHash(hash),
+    null,
+    'the previously-issued link must be dead after a resend',
+  );
+  assert.equal((await s.accounts.getByEmailVerificationTokenHash(hash2))?.id, signup.user!.id);
+
+  await s.accounts.markEmailVerified(signup.user!.id);
+
+  // Single use: the very link that verified the account now resolves nowhere.
+  assert.equal(await s.accounts.getByEmailVerificationTokenHash(hash2), null, 'a spent link must never verify again');
+  assert.equal(await s.accounts.markEmailVerified(signup.user!.id), true, 'markEmailVerified stays idempotent');
+
+  // The verification persists past a process restart (a second client/store over
+  // the same file) — the read must decode the INTEGER column back to boolean.
+  const restarted = new TursoStore(s.openClient());
+  await restarted.init();
+  const lookedUp = await restarted.getUserById(signup.user!.id);
+  assert.equal(lookedUp!.emailVerified, true, 'the verified INTEGER must read back as boolean true');
+  assert.equal(lookedUp!.emailVerifyTokenHash, null, 'the consumed token hash must be cleared to NULL');
+  const login = await s.accounts.login({ email: 'verify@example.com', password: PASSWORD });
+  assert.equal(login.ok, true, 'a verified account must log in after restart');
 });

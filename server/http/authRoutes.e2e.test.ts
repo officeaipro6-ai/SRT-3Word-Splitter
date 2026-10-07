@@ -67,6 +67,29 @@ async function get(path: string, token?: string) {
   return { status: res.status, json, text };
 }
 
+/**
+ * The log transport prints each verification link on its own labelled stdout
+ * line. Polls until at least `minCount` links have been printed (the transport
+ * logs before responding, but the pipe can land a tick later) and returns the
+ * MOST RECENT one, which is deterministically the last send in this suite.
+ */
+async function waitForVerificationLinks(minCount: number): Promise<string> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const links = [...stdout.matchAll(/\[email:log\] verification link \(dev only\): (\S+)/g)].map((m) => m[1]);
+    if (links.length >= minCount) return links[links.length - 1];
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  assert.fail(`a verification link never reached stdout\nstdout:\n${stdout}`);
+}
+
+/** Click the emailed link exactly like a browser would — but ask for JSON. */
+async function verifyViaLink(link: string) {
+  const res = await fetch(link, { headers: { Accept: 'application/json' } });
+  const json = await res.json().catch(() => ({}));
+  return { status: res.status, json };
+}
+
 /** Raw read of the on-disk database, bypassing the app entirely. */
 async function db() {
   const client = createClient({ url: dbUrl });
@@ -105,6 +128,20 @@ before(async () => {
       RAZORPAY_WEBHOOK_SECRET: '',
       SARVAM_API_KEY: '',
       LOCAL_SUBMISSION_MODE: 'false',
+      // Force the log transport so the verification LINK lands in stdout where
+      // the test extracts it (and prove no SMTP server is needed to complete
+      // the flow). Stripping the vars also guarantees a real install's email
+      // credentials can never be observed or used by the test.
+      SMTP_HOST: '',
+      SMTP_PORT: '',
+      SMTP_USER: '',
+      SMTP_PASSWORD: '',
+      SMTP_SECURE: '',
+      EMAIL_FROM: '',
+      EMAIL_VERIFY_EXPIRES_MS: '',
+      // Keep the resend cooldown short so the cooldown path can be exercised
+      // without sleeping a real minute (see the resend test below).
+      EMAIL_VERIFY_RESEND_COOLDOWN_MS: '250',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -162,6 +199,11 @@ test('HTTP signup -> login -> refresh -> credits -> logout', async (t) => {
   assert.equal(signup.json.role, 'USER', 'signup must never grant ADMIN');
   assert.equal(signup.json.credits, 25, 'signup must report the opening balance');
   assert.equal(signup.json.account, true);
+  assert.equal(
+    signup.json.emailVerified,
+    false,
+    'a fresh signup is reported as unverified until its inbox is proven',
+  );
   assert.ok(!signup.text.includes(PASSWORD), 'the response must never echo the password');
   const signupToken: string = signup.json.token;
   const userId: string = signup.json.userId;
@@ -200,6 +242,44 @@ test('HTTP signup -> login -> refresh -> credits -> logout', async (t) => {
   assert.equal((await post('/api/account/signup', { email: 'not-an-email', password: PASSWORD })).status, 400);
   assert.equal((await post('/api/account/signup', { email: 'x@example.com', password: 'short' })).status, 400);
 
+  // -------------------------------------------- ownership gate (unverified) ---
+  // The server MUST have emailed a link (log transport prints it to stdout).
+  const verificationLink = await waitForVerificationLinks(1);
+  assert.ok(
+    verificationLink.includes('/api/auth/verify-email?token='),
+    'the printed link must resolve to the verify endpoint',
+  );
+
+  // Until the inbox is proven, login is refused with a dedicated code…
+  const unverifiedLogin = await post('/api/account/login', { email: EMAIL, password: PASSWORD });
+  assert.equal(unverifiedLogin.status, 403, `unverified login must be 403: ${unverifiedLogin.text}`);
+  assert.equal(unverifiedLogin.json.code, 'EMAIL_NOT_VERIFIED');
+  assert.ok(!unverifiedLogin.json.token, 'an unverified login must never issue a session token');
+
+  // …and every credit-spending transcription entry point refuses the account.
+  const gatedJobs = await post('/api/jobs', {}, signupToken);
+  assert.equal(gatedJobs.status, 403, `unverified signup token must be gated from /api/jobs: ${gatedJobs.text}`);
+  assert.equal(gatedJobs.json.code, 'EMAIL_NOT_VERIFIED');
+  const gatedAudio = await post('/api/process-audio', { filename: 'probe.wav' }, signupToken);
+  assert.equal(
+    gatedAudio.status,
+    403,
+    `unverified signup token must be gated from /api/process-audio: ${gatedAudio.text}`,
+  );
+  assert.equal(gatedAudio.json.code, 'EMAIL_NOT_VERIFIED');
+
+  // --------------------------------------------------------- verify inbox ---
+  const verified = await verifyViaLink(verificationLink);
+  assert.equal(verified.status, 200, `the verification link must succeed: ${JSON.stringify(verified.json)}`);
+  assert.equal(verified.json.status, 200);
+  assert.equal(verified.json.ok, true);
+
+  // The same link is single-use: clicking it twice must render the neutral
+  // "invalid or expired" outcome, never a second "verified".
+  const spent = await verifyViaLink(verificationLink);
+  assert.equal(spent.status, 404, 'a spent link must not verify again');
+  assert.equal(spent.json.ok, false);
+
   // -------------------------------------------------------------- login ---
   const login = await post('/api/account/login', { email: EMAIL, password: PASSWORD });
   assert.equal(login.status, 200, `login must not 500 (this is the production bug): ${login.text}`);
@@ -232,6 +312,11 @@ test('HTTP signup -> login -> refresh -> credits -> logout', async (t) => {
   assert.equal(refresh.json.token, loginToken, 'a refresh must hand back the same live token');
   assert.equal(refresh.json.userId, userId);
   assert.equal(refresh.json.credits, 25);
+  assert.equal(
+    refresh.json.emailVerified,
+    true,
+    'the session must report the account as verified after the inbox proof',
+  );
 
   const refreshAgain = await post('/api/session', {}, loginToken);
   assert.equal(refreshAgain.status, 200);
@@ -270,6 +355,50 @@ test('HTTP signup -> login -> refresh -> credits -> logout', async (t) => {
   const relogin = await post('/api/account/login', { email: EMAIL, password: PASSWORD });
   assert.equal(relogin.status, 200, 'the credentials must still work after logout');
   assert.equal((await get('/api/credits/me', relogin.json.token)).status, 200);
+});
+
+test('resend verification: cooldown, no address enumeration, verify via the resent link', async () => {
+  // Signup sends the FIRST link on its own — and that send starts the cooldown.
+  const signup = await post('/api/account/signup', { email: 'resend@example.com', password: PASSWORD });
+  assert.equal(signup.status, 201, signup.text);
+  assert.equal(signup.json.emailVerified, false);
+
+  // So an immediate resend trips the per-account cooldown...
+  const resend1 = await post('/api/account/resend-verification', { email: 'resend@example.com' });
+  assert.equal(resend1.status, 429, resend1.text);
+  assert.equal(resend1.json.code, 'RESEND_COOLDOWN');
+  assert.ok(
+    Number(resend1.json.retryAfterMs) > 0 && Number(resend1.json.retryAfterMs) <= 250,
+    'a bounded retryAfterMs must be reported',
+  );
+
+  // …and once the window elapses a resend is allowed and mints a FRESH link.
+  await new Promise((r) => setTimeout(r, 320));
+  const resend2 = await post('/api/account/resend-verification', { email: 'resend@example.com' });
+  assert.equal(resend2.status, 202, resend2.text);
+  assert.equal(resend2.json.ok, true);
+
+  // Unknown and ALREADY-VERIFIED addresses answer identically — the endpoint
+  // cannot be used to probe which email addresses exist. (EMAIL is verified by
+  // the earlier flow test.)
+  const ghost = await post('/api/account/resend-verification', { email: 'ghost-does-not-exist@example.com' });
+  assert.equal(ghost.status, 202, ghost.text);
+  assert.equal(ghost.json.ok, true);
+  const verifiedAddy = await post('/api/account/resend-verification', { email: EMAIL });
+  assert.equal(verifiedAddy.status, 202, verifiedAddy.text);
+
+  // Blank email is the one refusal that reveals nothing and stays a 400.
+  assert.equal((await post('/api/account/resend-verification', { email: '  ' })).status, 400);
+
+  // The LAST link on stdout is the RESENT one (signup link + resent link); the
+  // unknown/verified resends above never sent anything.
+  const link = await waitForVerificationLinks(2);
+  const verified = await verifyViaLink(link);
+  assert.equal(verified.status, 200, JSON.stringify(verified.json));
+
+  // The resend never handed out a session: login needed the inbox proof first.
+  const login = await post('/api/account/login', { email: 'resend@example.com', password: PASSWORD });
+  assert.equal(login.status, 200, login.text);
 });
 
 test('an anonymous session works end to end on turso', async () => {
@@ -322,6 +451,85 @@ test('two different accounts are fully isolated', async (t) => {
     users.length >= 4,
     'each distinct email must be its own row (no cross-account overwrite)',
   );
+});
+
+test('arbitrary emails cannot login: fresh signup stays UNVERIFIED until the inbox is proven', async (t) => {
+  // The production bug report described "any random email can log in". This is
+  // the exact repro against the REAL server + REAL turso file database, using a
+  // brand-new unique address each run so no state from an earlier run can leak.
+  const unique = `verification-test-${globalThis.crypto.randomUUID()}@gmail.com`;
+  const conn = await db();
+  t.after(() => conn.close());
+
+  // Count the links already printed BEFORE this signup (the signup below emits
+  // the next one; its own link must not be counted into the seam).
+  const linksBefore = [...stdout.matchAll(/\[email:log\] verification link \(dev only\): (\S+)/g)].length;
+
+  // ------------------------------------------------------------- signup ---
+  const signup = await post('/api/account/signup', { email: unique, password: PASSWORD });
+  assert.equal(signup.status, 201, `signup must not 500: ${signup.text}`);
+  assert.equal(signup.json.emailVerified, false, 'a brand-new account is NOT verified at signup');
+  const signupLastLoginAt: string | null = signup.json.lastLoginAt;
+
+  // 1) DB state after signup: the row exists, is UNVERIFIED (INTEGER 0), and
+  //    already carries a verification-token hash + expiry on disk.
+  const rows = await conn.all(
+    `SELECT emailVerified, emailVerifyTokenHash, emailVerifyExpiresAt, lastLoginAt, tokenHashes
+       FROM users WHERE email = ?`,
+    [unique],
+  );
+  assert.equal(rows.length, 1, 'exactly one user row must exist for the random email');
+  const row = rows[0] as Record<string, unknown>;
+  assert.equal(Number(row.emailVerified), 0, 'emailVerified must be stored as INTEGER 0 at signup');
+  assert.ok(
+    typeof row.emailVerifyTokenHash === 'string' && row.emailVerifyTokenHash.length === 64,
+    'a sha256 verification-token hash must be persisted at signup',
+  );
+  assert.ok(
+    typeof row.emailVerifyExpiresAt === 'string' && row.emailVerifyExpiresAt > new Date().toISOString(),
+    'an unexpired verification deadline must be persisted at signup',
+  );
+  const tokenHashesAtSignup = (JSON.parse(String(row.tokenHashes)) as string[]).length;
+
+  // 2) Login BEFORE clicking the link: 403 EMAIL_NOT_VERIFIED, NO token, and the
+  //    failed login stamps neither lastLoginAt nor a new session hash.
+  const unverifiedLogin = await post('/api/account/login', { email: unique, password: PASSWORD });
+  assert.equal(unverifiedLogin.status, 403, `unverified login must be refused: ${unverifiedLogin.text}`);
+  assert.equal(unverifiedLogin.json.code, 'EMAIL_NOT_VERIFIED');
+  assert.ok(!unverifiedLogin.json.token, 'an unverified LOGIN must never mint a session');
+  const afterBlockedLogin = (
+    (await conn.all('SELECT lastLoginAt, tokenHashes FROM users WHERE email = ?', [unique]))[0] as Record<string, unknown>
+  );
+  assert.equal(afterBlockedLogin.lastLoginAt, signupLastLoginAt, 'a refused login must not stamp lastLoginAt');
+  assert.equal(
+    (JSON.parse(String(afterBlockedLogin.tokenHashes)) as string[]).length,
+    tokenHashesAtSignup,
+    'a refused login must not mint or attach any session token',
+  );
+
+  // 3) An arbitrary NONEXISTENT email (never signed up) answers INVALID_CREDENTIALS
+  //    and can never be a success — this is the pupun@gmail.com / xxxxxx@gmail.com
+  //    class of report.
+  for (const ghost of [`pupun-${unique}`, `xxxxxx-${unique}`]) {
+    const attempt = await post('/api/account/login', { email: ghost, password: PASSWORD });
+    assert.equal(attempt.status, 401, `ghost login ${ghost} must be 401: ${attempt.text}`);
+    assert.equal(attempt.json.code, 'INVALID_CREDENTIALS', 'ghost accounts are indistinguishable from a wrong password');
+    assert.ok(!attempt.json.token, 'a nonexistent account must never receive a session');
+  }
+
+  // 4) The emailed link is the ONLY way to unlock the account.
+  const retired = await waitForVerificationLinks(linksBefore + 1);
+  const verified = await verifyViaLink(retired);
+  assert.equal(verified.status, 200, `the verification link must succeed: ${JSON.stringify(verified.json)}`);
+  const provenRow = (await conn.all('SELECT emailVerified FROM users WHERE email = ?', [unique]))[0] as Record<string, unknown>;
+  assert.equal(Number(provenRow.emailVerified), 1, 'the verified account must be stored as INTEGER 1');
+
+  // 5) After the inbox proof the SAME credentials log in successfully.
+  const login = await post('/api/account/login', { email: unique, password: PASSWORD });
+  assert.equal(login.status, 200, `verified login must succeed: ${login.text}`);
+  assert.ok(login.json?.token, 'a verified login must return a session token');
+  assert.equal(login.json.emailVerified, true);
+  assert.ok(login.json.lastLoginAt, 'a successful login must stamp lastLoginAt');
 });
 
 test('no secret material is echoed by any auth response', async () => {

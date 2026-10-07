@@ -17,6 +17,11 @@ export interface SessionInfo {
   account?: boolean;
   /** ISO timestamp of the last successful email login on this account. */
   lastLoginAt?: string | null;
+  /**
+   * Email ownership status. True (or absent, for legacy/anon/none) when the
+   * account may spend credits; false when it must prove its inbox first.
+   */
+  emailVerified?: boolean;
 }
 
 const TOKEN_KEY = 'odia_srt_token';
@@ -77,6 +82,7 @@ function parseSession(data: any, token: string): SessionInfo {
     createdAt: data.createdAt,
     email: data.email ?? null,
     account: Boolean(data.account),
+    emailVerified: data.emailVerified !== false,
     lastLoginAt: data.lastLoginAt ?? null,
   };
 }
@@ -156,9 +162,30 @@ export async function loginAccount(opts: {
     }),
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || 'Sign-in failed.');
+  if (!res.ok) {
+    const err = new Error(data.error || 'Sign-in failed.');
+    (err as Error & { code?: string }).code = data.code;
+    throw err;
+  }
   storeToken(data.token);
   return parseSession(data, data.token);
+}
+
+/**
+ * Ask the server to (re)send the ownership-verification email.
+ * The server answers 202 identically for known, unknown and already-verified
+ * addresses so the endpoint cannot be used to probe which emails exist; a
+ * 429 means "wait and retry" (cooldown). Returns the server message, if any.
+ */
+export async function resendVerificationEmail(email: string): Promise<string> {
+  const res = await fetch(getApiUrl('/api/account/resend-verification'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: email.trim().toLowerCase() }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || 'Could not resend the verification email.');
+  return data.message || '';
 }
 
 /** Sign out: revoke the current token server-side and clear it locally. */

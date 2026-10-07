@@ -51,6 +51,7 @@ test('JSON provider: signup -> login -> refresh -> credits -> logout', async (t)
   assert.equal(signup.ok, true, `signup failed: ${signup.error}`);
   assert.equal(signup.user!.role, 'USER');
   assert.equal(signup.user!.credits, 25);
+  assert.equal(signup.user!.emailVerified, false, 'a fresh facade signup is unverified');
 
   const token = issueToken();
   await s.accounts.addToken(signup.user!.id, hashToken(token));
@@ -60,6 +61,13 @@ test('JSON provider: signup -> login -> refresh -> credits -> logout', async (t)
   await s.accounts.addToken(signup.user!.id, hashToken(token));
   const refreshed = await s.accounts.getById(signup.user!.id);
   assert.equal(refreshed!.tokenHashes.filter((h) => h === hashToken(token)).length, 1);
+
+  // Unverified -> refused at login; wrong password stays INVALID_CREDENTIALS.
+  assert.equal((await s.accounts.login({ email: 'a@example.com', password: PASSWORD })).code, 'EMAIL_NOT_VERIFIED');
+  assert.equal((await s.accounts.login({ email: 'a@example.com', password: 'nope1234' })).code, 'INVALID_CREDENTIALS');
+
+  // Prove the inbox through the facade's own verification surface.
+  assert.equal(await s.accounts.markEmailVerified(signup.user!.id), true);
 
   const login = await s.accounts.login({ email: 'a@example.com', password: PASSWORD });
   assert.equal(login.ok, true);
@@ -137,6 +145,7 @@ test('both facades agree on the signup -> login outcome for the same inputs', as
   assert.equal(verifyPw('wrong-password', viaRepo.passwordHash), false);
 
   // And the facade's login agrees with a direct repo read + verify.
+  assert.equal(await s.accounts.markEmailVerified(viaFacade.user!.id), true);
   const viaFacadeLogin = await s.accounts.login({ email: 'parity@example.com', password: PASSWORD });
   assert.equal(viaFacadeLogin.ok, true);
   assert.equal(viaFacadeLogin.user!.id, viaRepo.id);

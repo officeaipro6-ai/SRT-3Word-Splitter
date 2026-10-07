@@ -1372,9 +1372,10 @@ test('mutate() is genuinely production-reachable, which is why it is documented'
 
 test('schema validation was not loosened in Step 5A', async () => {
   // Pinned deliberately. Stage 5D raised this from 2 to 3 for the credit
-  // identity indexes; any other value means someone changed the schema contract
-  // without updating this guard.
-  assert.equal(SCHEMA_VERSION, 3, 'the schema contract version must not drift');
+  // identity indexes; EMAIL OWNERSHIP VERIFICATION later raised it to 4 for the
+  // users.emailVerified columns. Any other value means someone changed the
+  // schema contract without updating this guard.
+  assert.equal(SCHEMA_VERSION, 4, 'the schema contract version must not drift');
 
   const { client } = await openStore();
   const problems = await new TursoStore(client).validateSchema();
@@ -1394,6 +1395,122 @@ test('schema validation was not loosened in Step 5A', async () => {
   assert.ok(found.some((p) => p.includes('missing table jobs')));
   assert.ok(found.every((p) => !/DROP|DELETE|ALTER|TRUNCATE/i.test(p)), 'no destructive repair');
   await assert.rejects(() => new TursoStore(stale).init(), /incompatible/i);
+});
+
+// --- EMAIL OWNERSHIP VERIFICATION: column migration + read path ---
+
+test('an older database gains the verification columns and grandfathers existing accounts', async () => {
+  // Reproduce the v3 users table exactly (current DDL minus the four email
+  // columns), insert a pre-feature account, then bring the database through
+  // init() — the path production runs on every boot.
+  const client = createClient({ url: 'file::memory:' });
+  await client.execute(`CREATE TABLE users (
+    id TEXT PRIMARY KEY,
+    tokenHashes TEXT NOT NULL DEFAULT '[]',
+    credits INTEGER NOT NULL DEFAULT 0,
+    role TEXT NOT NULL DEFAULT 'USER',
+    creditMode TEXT NOT NULL DEFAULT 'NORMAL',
+    createdAt TEXT NOT NULL,
+    lastSeenAt TEXT,
+    freeTrialsUsed INTEGER NOT NULL DEFAULT 0,
+    ownerEmail TEXT,
+    email TEXT,
+    passwordHash TEXT,
+    lastLoginAt TEXT,
+    purchasedCredits INTEGER NOT NULL DEFAULT 0,
+    bonusCredits INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(email)
+  )`);
+  await client.execute(
+    `INSERT INTO users (id, email, tokenHashes, credits, role, creditMode, createdAt, lastSeenAt, freeTrialsUsed)
+     VALUES ('legacy-1', 'legacy@example.com', '[]', 10, 'USER', 'NORMAL', '2025-01-01T00:00:00.000Z', '2025-01-01T00:00:00.000Z', 0)`
+  );
+
+  const store = new TursoStore(client);
+  await store.init();
+
+  // The four columns now exist…
+  const userCols = await columnNames(client, 'users');
+  assert.ok(userCols.includes('emailVerified'), 'emailVerified column must be added');
+  assert.ok(userCols.includes('emailVerifyTokenHash'), 'emailVerifyTokenHash column must be added');
+  assert.ok(userCols.includes('emailVerifyExpiresAt'), 'emailVerifyExpiresAt column must be added');
+  assert.ok(userCols.includes('emailVerifyLastSentAt'), 'emailVerifyLastSentAt column must be added');
+  assert.deepEqual(await store.validateSchema(), [], 'the upgraded database matches the v4 contract');
+
+  // …and the account that predates the feature reads back VERIFIED (grandfathered).
+  const legacy = await store.getUserById('legacy-1');
+  assert.equal(legacy!.email, 'legacy@example.com');
+  assert.equal(legacy!.emailVerified, true, 'a pre-feature account must never be locked out');
+
+  // A NEW unverified signup stays unverified, and a second boot (idempotent
+  // migration) must NOT re-grandfather it.
+  await store.createUser({
+    id: 'fresh-1',
+    email: 'fresh@example.com',
+    tokenHashes: [],
+    credits: 5,
+    role: 'USER',
+    creditMode: 'NORMAL',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    freeTrialsUsed: 0,
+    emailVerified: false,
+  });
+  await new TursoStore(client).init();
+  const freshRow = await client.execute({ sql: 'SELECT emailVerified FROM users WHERE id = ?', args: ['fresh-1'] });
+  assert.equal(
+    Number(freshRow.rows[0].emailVerified),
+    0,
+    'an account signed up AFTER activation must stay unverified across restarts',
+  );
+});
+
+test('verification fields round-trip through the store and decode as booleans', async () => {
+  const { store } = await openStore();
+  await store.createUser({
+    id: 'vt-1',
+    email: 'verify@roundtrip.example',
+    tokenHashes: [],
+    credits: 0,
+    role: 'USER',
+    creditMode: 'NORMAL',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    freeTrialsUsed: 0,
+    emailVerified: false,
+    emailVerifyTokenHash: 'hash-abc',
+    emailVerifyExpiresAt: '2026-01-01T01:00:00.000Z',
+    emailVerifyLastSentAt: '2026-01-01T00:00:00.000Z',
+  });
+
+  // Raw storage keeps the INTEGER form; the READ path decodes it to boolean.
+  assert.equal(
+    await store.getUserByEmailVerifyTokenHash('hash-abc').then((u) => u?.id),
+    'vt-1',
+    'a standing verification hash must resolve to its account',
+  );
+  assert.equal(
+    await store.getUserByEmailVerifyTokenHash('hash-nope'),
+    null,
+    'a non-matching verification hash resolves nowhere',
+  );
+
+  const before = await store.getUserById('vt-1');
+  assert.equal(before!.emailVerified, false, 'INTEGER 0 must decode to boolean false');
+  assert.equal(before!.emailVerifyTokenHash, 'hash-abc');
+  assert.equal(before!.emailVerifyExpiresAt, '2026-01-01T01:00:00.000Z');
+
+  // markEmailVerified-style write: verified + token cleared (NULL), atomically.
+  // updateUser writes NULL for `undefined` on the nullable TEXT columns, which
+  // is what makes the consumed link single-use at the store level.
+  await store.updateUser('vt-1', { emailVerified: true, emailVerifyTokenHash: undefined, emailVerifyExpiresAt: undefined });
+  const after = await store.getUserById('vt-1');
+  assert.equal(after!.emailVerified, true, 'INTEGER 1 must decode to boolean true');
+  assert.equal(after!.emailVerifyTokenHash, null, 'the consumed hash must be NULL (pinned by 5C3-G semantics)');
+  assert.equal(after!.emailVerifyExpiresAt, null, 'the consumed expiry must be NULL');
+  assert.equal(
+    await store.getUserByEmailVerifyTokenHash('hash-abc'),
+    null,
+    'a spent verification link must not resolve again',
+  );
 });
 
 test('all 9 tables still initialise together, twice', async () => {

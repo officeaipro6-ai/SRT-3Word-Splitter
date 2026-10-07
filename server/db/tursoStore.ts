@@ -74,6 +74,10 @@ const TABLE_COLUMNS: Record<string, string> = {
     lastLoginAt TEXT,
     purchasedCredits INTEGER NOT NULL DEFAULT 0,
     bonusCredits INTEGER NOT NULL DEFAULT 0,
+    emailVerified INTEGER NOT NULL DEFAULT 0,
+    emailVerifyTokenHash TEXT,
+    emailVerifyExpiresAt TEXT,
+    emailVerifyLastSentAt TEXT,
     UNIQUE(email)
   `,
   // `creditTxnId` links a job to its DEBIT ledger entry and `retryCount` drives
@@ -304,6 +308,23 @@ function decodeJsonRow<T>(table: string, row: T): T {
 }
 
 /**
+ * Normalize a decoded `users` row into the shared account shape.
+ *
+ * The ONLY transformation is the email-verification encoding: `emailVerified`
+ * is INTEGER (1/0) on disk and the shared UserRecord type is boolean. Every
+ * other column is deliberately left exactly as the database returned it — SQL
+ * NULL stays `null` (pinned by the 5C3-G contract) and JSON/parity decisions
+ * belong to the service layer via normalizeUser()/snapshot(), not to raw reads.
+ */
+function decodeUserRow(row: unknown): UserRecord {
+  if (row && typeof row === 'object' && (row as Record<string, unknown>).emailVerified !== undefined) {
+    const r = row as Record<string, unknown>;
+    r.emailVerified = r.emailVerified === 1 || r.emailVerified === true;
+  }
+  return row as UserRecord;
+}
+
+/**
  * Schema contract version recorded in the `schema_migrations` marker table.
  *
  * Bump this whenever TABLE_COLUMNS, JSON_COLUMNS or the declared UNIQUE keys
@@ -311,7 +332,7 @@ function decodeJsonRow<T>(table: string, row: T): T {
  * instead of silently accepted. `CREATE TABLE IF NOT EXISTS` never alters an
  * existing table, so this marker is the only way to notice.
  */
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 /**
  * First schema contract version that PROMISES database-level money-identity
@@ -342,6 +363,38 @@ const TURSO_SNAPSHOT_WRITE_UNSUPPORTED =
   'TursoStore cannot persist a whole-database snapshot: mutate()/mutateAsync() are not ' +
   'supported because the repository layer in server/db/repos.ts is synchronous. Use the ' +
   'per-entity async methods (createUser, updateUser, addTransaction, saveAlert, ...) instead.';
+
+/**
+ * Non-destructive, idempotent column addition for email ownership verification.
+ *
+ * `CREATE TABLE IF NOT EXISTS` can never alter an existing table, so a database
+ * provisioned before this feature has none of the four columns and would fail
+ * its first INSERT/UPDATE. This adds each missing column and — ONLY at the
+ * exact moment `emailVerified` first appears — stamps the pre-existing rows as
+ * verified, grandfathering accounts that predate the feature. Because the
+ * UPDATE is guarded by the column-being-added, it runs exactly once: a later
+ * restart finds the columns present and must never re-verify an unverified
+ * account that signed up after activation.
+ *
+ * No row is ever deleted, rewritten or chosen by this migration.
+ */
+async function applyEmailVerificationMigration(client: Client): Promise<void> {
+  const info = await client.execute('PRAGMA table_info(users)');
+  const names = new Set(info.rows.map((r) => String((r as { name?: unknown }).name ?? '')));
+  const missing: Array<[name: string, decl: string]> = [];
+  if (!names.has('emailVerified')) missing.push(['emailVerified', 'INTEGER NOT NULL DEFAULT 0']);
+  if (!names.has('emailVerifyTokenHash')) missing.push(['emailVerifyTokenHash', 'TEXT']);
+  if (!names.has('emailVerifyExpiresAt')) missing.push(['emailVerifyExpiresAt', 'TEXT']);
+  if (!names.has('emailVerifyLastSentAt')) missing.push(['emailVerifyLastSentAt', 'TEXT']);
+
+  for (const [name, decl] of missing) {
+    await client.execute(`ALTER TABLE users ADD COLUMN ${name} ${decl}`);
+  }
+
+  if (missing.some(([name]) => name === 'emailVerified')) {
+    await client.execute('UPDATE users SET emailVerified = 1 WHERE emailVerified = 0');
+  }
+}
 
 /** True for a table-level constraint rather than a column definition. */
 function isConstraintKeyword(token: string): boolean {
@@ -497,8 +550,13 @@ export class TursoStore {
       await applyCreditIdentityMigration(this.client);
     }
 
-    // The expected version is passed explicitly: v3 is only ever recorded after
-    // the identity indexes have been created and re-verified above.
+    // Email ownership verification is an additive column migration. It must run
+    // BEFORE validateSchema() (which compares the live shape to TABLE_COLUMNS),
+    // and it is idempotent, so an already-migrated database is untouched.
+    await applyEmailVerificationMigration(this.client);
+
+    // The expected version is passed explicitly: v4 is only ever recorded after
+    // the identity indexes AND the email-verification columns exist.
     const problems = await this.validateSchema(SCHEMA_VERSION);
     if (problems.length > 0) {
       // Reported, never repaired: no ALTER/DROP here. A human decides.
@@ -783,27 +841,51 @@ export class TursoStore {
 
   /** Get all users. */
   async getUsers(): Promise<UserRecord[]> {
-    return this.queryTable<UserRecord>('users', 'SELECT * FROM users ORDER BY lastSeenAt DESC NULLS LAST, createdAt DESC');
+    return (await this.queryTable<UserRecord>(
+      'users',
+      'SELECT * FROM users ORDER BY lastSeenAt DESC NULLS LAST, createdAt DESC'
+    )).map(decodeUserRow);
   }
 
   async getUserById(id: string): Promise<UserRecord | null> {
-    return this.queryTableRow<UserRecord>('users', 'SELECT * FROM users WHERE id = ?', [id]);
+    const row = await this.queryTableRow<UserRecord>('users', 'SELECT * FROM users WHERE id = ?', [id]);
+    return row ? decodeUserRow(row) : null;
   }
 
   async getUserByToken(tokenHash: string): Promise<UserRecord | null> {
     // Matching happens against the stored JSON text (unchanged); only the row
     // that comes back needs decoding.
-    return this.queryTableRow<UserRecord>('users', "SELECT * FROM users WHERE tokenHashes LIKE ?", [`%${tokenHash}%`]);
+    const row = await this.queryTableRow<UserRecord>(
+      'users',
+      'SELECT * FROM users WHERE tokenHashes LIKE ?',
+      [`%${tokenHash}%`]
+    );
+    return row ? decodeUserRow(row) : null;
   }
 
   async getUserByEmail(email: string): Promise<UserRecord | null> {
-    return this.queryTableRow<UserRecord>('users', 'SELECT * FROM users WHERE email = ?', [email.toLowerCase()]);
+    const row = await this.queryTableRow<UserRecord>(
+      'users',
+      'SELECT * FROM users WHERE email = ?',
+      [email.toLowerCase()]
+    );
+    return row ? decodeUserRow(row) : null;
+  }
+
+  /** Resolve the account holding an outstanding verification-token hash, or null. */
+  async getUserByEmailVerifyTokenHash(tokenHash: string): Promise<UserRecord | null> {
+    const row = await this.queryTableRow<UserRecord>(
+      'users',
+      'SELECT * FROM users WHERE emailVerifyTokenHash = ?',
+      [tokenHash]
+    );
+    return row ? decodeUserRow(row) : null;
   }
 
   async createUser(user: UserRecord): Promise<void> {
     await this.exec(
-      `INSERT INTO users (id, tokenHashes, credits, role, creditMode, createdAt, lastSeenAt, freeTrialsUsed, ownerEmail, email, passwordHash, lastLoginAt, purchasedCredits, bonusCredits)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO users (id, tokenHashes, credits, role, creditMode, createdAt, lastSeenAt, freeTrialsUsed, ownerEmail, email, passwordHash, lastLoginAt, purchasedCredits, bonusCredits, emailVerified, emailVerifyTokenHash, emailVerifyExpiresAt, emailVerifyLastSentAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       user.id,
       JSON.stringify(user.tokenHashes ?? []),
@@ -821,6 +903,14 @@ export class TursoStore {
       user.lastLoginAt ?? null,
       user.purchasedCredits ?? 0,
       user.bonusCredits ?? 0,
+      // New email accounts are stored as UNVERIFIED (0); anonymous/session
+      // users (no email) are stored as verified — they never take part in the
+      // email-verification flow. Missing field on a legacy record is handled by
+      // the grandfather UPDATE in applyEmailVerificationMigration().
+      user.email ? (user.emailVerified === false ? 0 : 1) : 1,
+      user.emailVerifyTokenHash ?? null,
+      user.emailVerifyExpiresAt ?? null,
+      user.emailVerifyLastSentAt ?? null,
     ]);
   }
 
@@ -834,7 +924,11 @@ export class TursoStore {
       if (key === 'tokenHashes') {
         fields.push('tokenHashes = ?');
         args.push(JSON.stringify(value));
-      } else if (key === 'email' || key === 'ownerEmail' || key === 'passwordHash' || key === 'lastLoginAt') {
+      } else if (key === 'email' || key === 'ownerEmail' || key === 'passwordHash' || key === 'lastLoginAt' ||
+        key === 'emailVerifyTokenHash' || key === 'emailVerifyExpiresAt' || key === 'emailVerifyLastSentAt') {
+        // Nullable string policy: the value (or `null`/`undefined`) is written
+        // as-is, so clearing a verification token is a real UPDATE to NULL —
+        // which is what makes the token single-use.
         fields.push(`${key} = ?`);
         args.push(value ?? null);
       } else if (typeof value === 'number' || typeof value === 'string') {

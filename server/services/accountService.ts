@@ -14,8 +14,13 @@
 import { isPasswordLengthValid, verifyPassword, hashPassword } from './password.ts';
 import type { UserRepo, CreditRepo } from '../db/repos.ts';
 import type { UserRecord } from '../db/types.ts';
+import { isEmailVerified } from './emailVerification.ts';
 
-export type AccountErrorCode = 'EMAIL_TAKEN' | 'INVALID_CREDENTIALS' | 'VALIDATION';
+export type AccountErrorCode =
+  | 'EMAIL_TAKEN'
+  | 'INVALID_CREDENTIALS'
+  | 'EMAIL_NOT_VERIFIED'
+  | 'VALIDATION';
 
 export interface AccountResult {
   ok: boolean;
@@ -85,6 +90,10 @@ export function signupAccount(
     email,
     passwordHash: hashPassword(password),
     initialCredits,
+    // New accounts must prove email ownership before they may consume credits or
+    // trigger provider processing. Pre-existing accounts (created before this
+    // field existed) normalise to `emailVerified: true` in both stores.
+    emailVerified: false,
   });
   if (initialCredits > 0) {
     broker.credits.add({
@@ -100,7 +109,14 @@ export function signupAccount(
   return success(user);
 }
 
-/** Email + password login — returns INVALID_CREDENTIALS for unknown email AND wrong password alike. */
+/**
+ * Email + password login — returns INVALID_CREDENTIALS for unknown email AND wrong password alike.
+ *
+ * A correct credential pair on an UNVERIFIED account returns EMAIL_NOT_VERIFIED
+ * instead of a session: the password is real but ownership of the email is not
+ * yet proven, so no token is issued and `lastLoginAt` is NOT stamped. The
+ * account is not revealed as wrong — it is simply not yet usable.
+ */
 export function loginAccount(broker: AccountBroker, input: { email?: unknown; password?: unknown }): AccountResult {
   const creds = parseCredentials(input);
   if ('ok' in creds) return creds;
@@ -109,6 +125,14 @@ export function loginAccount(broker: AccountBroker, input: { email?: unknown; pa
   const user = broker.users.getByEmail(email);
   if (!user || !verifyPassword(password, user.passwordHash)) {
     return failure('INVALID_CREDENTIALS', 'Invalid email or password.');
+  }
+  if (!isEmailVerified(user)) {
+    return {
+      ok: false,
+      code: 'EMAIL_NOT_VERIFIED',
+      error: 'Please verify your email before continuing.',
+      user,
+    };
   }
   broker.users.recordLogin(user.id);
   return success(user);

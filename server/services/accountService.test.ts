@@ -97,6 +97,9 @@ test('login succeeds with the correct password and records lastLoginAt', async (
   const b = makeBroker();
   await b.store.init();
   const { user } = signupAccount(b, { email: 'login@example.com', password: PASSWORD }, 0);
+  assert.equal(user.emailVerified, false, 'a fresh JSON signup is unverified by default');
+  // Prove the inbox the same way the facade verification flow does.
+  assert.equal(b.users.markEmailVerified(user.id), true);
   // Move lastLoginAt into the past so we can prove login updates it.
   b.store.mutate((db) => {
     const u = db.users.find((x) => x.id === user.id)!;
@@ -107,6 +110,28 @@ test('login succeeds with the correct password and records lastLoginAt', async (
   assert.equal(result.user!.id, user.id);
   const after = b.users.getById(user.id)!;
   assert.notEqual(after.lastLoginAt, '2000-01-01T00:00:00.000Z', 'lastLoginAt updated on login');
+});
+
+test('an UNVERIFIED account cannot log in, even with the correct password', async () => {
+  const b = makeBroker();
+  await b.store.init();
+  signupAccount(b, { email: 'newbie@example.com', password: PASSWORD }, 0);
+
+  const blocked = loginAccount(b, { email: 'newbie@example.com', password: PASSWORD });
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.code, 'EMAIL_NOT_VERIFIED');
+  assert.ok(!blocked.error.toLowerCase().includes('invalid email or password'), 'the message must direct to verification');
+
+  // Wrong password on the same unverified account stays INVALID_CREDENTIALS —
+  // verification is never a substitute for a correct credential.
+  const wrong = loginAccount(b, { email: 'newbie@example.com', password: 'bad-password' });
+  assert.equal(wrong.ok, false);
+  assert.equal(wrong.code, 'INVALID_CREDENTIALS');
+
+  // Verifying unlocks the SAME credential instantly.
+  assert.equal(b.users.markEmailVerified(blocked.user!.id), true);
+  const unlocked = loginAccount(b, { email: 'newbie@example.com', password: PASSWORD });
+  assert.equal(unlocked.ok, true);
 });
 
 test('login fails on a wrong password and on an unknown email (same code)', async () => {
@@ -155,8 +180,12 @@ test('logout revokes the presented token so it cannot be reused', async () => {
   assert.equal(b.users.getByToken(hashToken(token)), null, 'token is dead after logout');
   // A re-login mints a fresh, different token.
   const relogin = loginAccount(b, { email: 'logout@example.com', password: PASSWORD });
+  assert.equal(relogin.ok, false);
+  assert.equal(relogin.code, 'EMAIL_NOT_VERIFIED');
+  assert.equal(b.users.markEmailVerified(relogin.user!.id), true);
+  const reloginOk = loginAccount(b, { email: 'logout@example.com', password: PASSWORD });
   const fresh = issueToken();
-  b.users.addToken(relogin.user!.id, hashToken(fresh));
+  b.users.addToken(reloginOk.user!.id, hashToken(fresh));
   assert.notEqual(hashToken(fresh), hashToken(token));
   assert.ok(b.users.getByToken(hashToken(fresh)));
 });

@@ -47,6 +47,7 @@ import {
 import type { UserRepo } from '../db/repos';
 import type { CreditRepo } from '../db/repos';
 import { normalizeAccountEmail } from './accountService';
+import { issueVerificationToken, hashVerificationToken } from './emailVerification';
 
 /**
  * The persistence surface this service needs. Declared structurally (not as
@@ -58,6 +59,7 @@ export interface TursoAccountStore {
   getUserById(id: string): Promise<UserRecord | null>;
   getUserByEmail(email: string): Promise<UserRecord | null>;
   getUserByToken(tokenHash: string): Promise<UserRecord | null>;
+  getUserByEmailVerifyTokenHash(tokenHash: string): Promise<UserRecord | null>;
   createUser(user: UserRecord): Promise<void>;
   updateUser(id: string, patch: Partial<UserRecord>): Promise<void>;
   getUsers(): Promise<UserRecord[]>;
@@ -84,6 +86,7 @@ function buildAccountUser(email: string, passwordHash: string, initialCredits: n
     lastSeenAt: now,
     lastLoginAt: now,
     freeTrialsUsed: 0,
+    emailVerified: false,
   };
 }
 
@@ -165,7 +168,12 @@ export class TursoAccountService {
   private localBroker(existing: UserRecord | null): AccountBroker {
     const users = {
       getByEmail: () => existing,
-      createAccount: (opts: { email: string; passwordHash: string; initialCredits?: number }) =>
+      createAccount: (opts: {
+        email: string;
+        passwordHash: string;
+        initialCredits?: number;
+        emailVerified?: boolean;
+      }) =>
         buildAccountUser(opts.email, opts.passwordHash, opts.initialCredits ?? 0, new Date().toISOString()),
       // `loginAccount` calls this after a successful verifyPassword. The real
       // `lastLoginAt` write is `login()`'s own UPDATE against the store, so this
@@ -234,6 +242,60 @@ export class TursoAccountService {
   /** Record activity. Best-effort: never fails an otherwise-valid request. */
   async touch(userId: string): Promise<void> {
     await this.store.updateUser(userId, { lastSeenAt: new Date().toISOString() });
+  }
+
+  // ------------------------------------------------ email ownership verification
+
+  /**
+   * Issue a fresh single-use verification token for an account and persist only
+   * its sha256 hash + expiry + send time. Returns the RAW token (for the
+   * transport to email) or null when the user does not exist.
+   */
+  async issueVerification(userId: string): Promise<string | null> {
+    const user = await this.store.getUserById(userId);
+    if (!user) return null;
+    const token = issueVerificationToken();
+    await this.store.updateUser(userId, {
+      emailVerifyTokenHash: token.hash,
+      emailVerifyExpiresAt: token.expiresAt,
+      emailVerifyLastSentAt: new Date().toISOString(),
+    });
+    return token.raw;
+  }
+
+  /** Find the account holding an outstanding verification-token hash, or null. */
+  getByEmailVerificationTokenHash(tokenHash: string): Promise<UserRecord | null> {
+    if (!tokenHash) return Promise.resolve(null);
+    return this.store.getUserByEmailVerifyTokenHash(tokenHash);
+  }
+
+  /**
+   * Mark a USER account verified AND consume the token in the same write, so an
+   * already-spent link can never verify anything again (single use).
+   */
+  async markEmailVerified(userId: string): Promise<boolean> {
+    const user = await this.store.getUserById(userId);
+    if (!user) return false;
+    await this.store.updateUser(userId, {
+      emailVerified: true,
+      emailVerifyTokenHash: undefined,
+      emailVerifyExpiresAt: undefined,
+    });
+    return true;
+  }
+
+  /**
+   * Invalidate the outstanding token (a consumed/discarded link) while keeping
+   * the last-sent timestamp so the resend cooldown still applies.
+   */
+  async clearVerificationToken(userId: string): Promise<boolean> {
+    const user = await this.store.getUserById(userId);
+    if (!user) return false;
+    await this.store.updateUser(userId, {
+      emailVerifyTokenHash: undefined,
+      emailVerifyExpiresAt: undefined,
+    });
+    return true;
   }
 
   // -------------------------------------------- admin bootstrap fields ---

@@ -21,6 +21,7 @@
 import type { UserRecord, UserRole, CreditMode } from '../db/types';
 import type { AccountResult } from './accountService';
 import { signupAccount, loginAccount, type AccountBroker } from './accountService';
+import { issueVerificationToken } from './emailVerification';
 import { UserRepo, type CreditRepo } from '../db/repos';
 import type { TursoAccountService } from './tursoAccountService';
 
@@ -49,6 +50,19 @@ export interface AsyncAccountService {
 
   // --- activity + admin bootstrap ---
   touch(userId: string): Promise<void>;
+  /**
+   * Issue a fresh single-use email-verification token for a USER account and
+   * persist only its sha256 hash + expiry. Returns the RAW token — for the
+   * email transport only; it is never stored and never returned to a client —
+   * or null when the user does not exist.
+   */
+  issueVerification(userId: string): Promise<string | null>;
+  /** Resolve the account holding an outstanding verification-token hash. */
+  getByEmailVerificationTokenHash(tokenHash: string): Promise<UserRecord | null>;
+  /** Mark a USER account verified and consume its token (single use). */
+  markEmailVerified(userId: string): Promise<boolean>;
+  /** Invalidate an outstanding verification token (keeps resend cooldown). */
+  clearVerificationToken(userId: string): Promise<boolean>;
   /**
    * Atomically consume ONE free trial and return the new count, or null when the
    * user does not exist.
@@ -122,6 +136,20 @@ export function createFileAccountFacade(users: UserRepo, credits?: CreditRepo): 
     },
 
     touch: async (userId) => users.touch(userId),
+    issueVerification: async (userId) => {
+      const user = users.getById(userId);
+      if (!user) return null;
+      const token = issueVerificationToken();
+      users.setVerificationToken(userId, {
+        tokenHash: token.hash,
+        expiresAt: token.expiresAt,
+        sentAt: new Date().toISOString(),
+      });
+      return token.raw;
+    },
+    getByEmailVerificationTokenHash: async (tokenHash) => users.getByEmailVerifyTokenHash(tokenHash),
+    markEmailVerified: async (userId) => users.markEmailVerified(userId),
+    clearVerificationToken: async (userId) => users.clearVerificationToken(userId),
     incrementFreeTrialsUsed: async (userId) => users.incrementFreeTrialsUsed(userId),
     recordFreeTrialUsage: async (userId, balanceAfter) => {
       if (!credits) return;
@@ -157,6 +185,10 @@ export function createTursoAccountFacade(svc: TursoAccountService): AsyncAccount
       svc.createSessionUser(tokenHash, initialCredits, role, creditMode),
 
     touch: (userId) => svc.touch(userId),
+    issueVerification: (userId) => svc.issueVerification(userId),
+    getByEmailVerificationTokenHash: (tokenHash) => svc.getByEmailVerificationTokenHash(tokenHash),
+    markEmailVerified: (userId) => svc.markEmailVerified(userId),
+    clearVerificationToken: (userId) => svc.clearVerificationToken(userId),
     incrementFreeTrialsUsed: (userId) => svc.incrementFreeTrialsUsed(userId),
     recordFreeTrialUsage: (userId, balanceAfter) => svc.recordFreeTrialUsage(userId, balanceAfter),
     setRole: (userId, role) => svc.setRole(userId, role),

@@ -56,9 +56,12 @@ export class UserRepo {
   /**
    * Create an authenticated email/password account. Always a plain USER
    * (creditMode NORMAL) — ADMIN is NEVER granted through this path. The scrypt
-   * hash is provided by the caller (services/accountService).
+   * hash is provided by the caller (services/accountService). New accounts
+   * start UNVERIFIED (`emailVerified: false`) until they prove ownership of the
+   * email; legacy accounts written before this field existed normalise to true
+   * at read time, so they are never locked out by activation.
    */
-  createAccount(opts: { email: string; passwordHash: string; initialCredits?: number }): UserRecord {
+  createAccount(opts: { email: string; passwordHash: string; initialCredits?: number; emailVerified?: boolean }): UserRecord {
     const now = new Date().toISOString();
     return this.store.mutate((db) => {
       const user: UserRecord = {
@@ -73,6 +76,7 @@ export class UserRepo {
         lastSeenAt: now,
         lastLoginAt: now,
         freeTrialsUsed: 0,
+        emailVerified: opts.emailVerified ?? false,
       };
       db.users.push(user);
       return structuredClone(user);
@@ -117,6 +121,55 @@ export class UserRepo {
       if (!user) return false;
       user.lastLoginAt = now;
       user.lastSeenAt = now;
+      return true;
+    });
+  }
+
+  // ------------------------------------------------------ email verification
+
+  /** Resolve the account holding an outstanding verification-token hash, or null. */
+  getByEmailVerifyTokenHash(tokenHash: string): UserRecord | null {
+    if (!tokenHash) return null;
+    return this.store.snapshot().users.find((u) => u.emailVerifyTokenHash === tokenHash) ?? null;
+  }
+
+  /**
+   * Persist a fresh verification token's HASH + expiry + send time. The raw
+   * token itself is never stored; only its sha256 hash (see services/auth).
+   */
+  setVerificationToken(
+    userId: string,
+    fields: { tokenHash: string; expiresAt: string; sentAt: string }
+  ): boolean {
+    return this.store.mutate((db) => {
+      const user = db.users.find((u) => u.id === userId);
+      if (!user) return false;
+      user.emailVerifyTokenHash = fields.tokenHash;
+      user.emailVerifyExpiresAt = fields.expiresAt;
+      user.emailVerifyLastSentAt = fields.sentAt;
+      return true;
+    });
+  }
+
+  /** Invalidate the outstanding token (single-use). Keeps last-sent for cooldown. */
+  clearVerificationToken(userId: string): boolean {
+    return this.store.mutate((db) => {
+      const user = db.users.find((u) => u.id === userId);
+      if (!user) return false;
+      user.emailVerifyTokenHash = undefined;
+      user.emailVerifyExpiresAt = undefined;
+      return true;
+    });
+  }
+
+  /** Mark a USER account verified and consume its token in one mutation. */
+  markEmailVerified(userId: string): boolean {
+    return this.store.mutate((db) => {
+      const user = db.users.find((u) => u.id === userId);
+      if (!user) return false;
+      user.emailVerified = true;
+      user.emailVerifyTokenHash = undefined;
+      user.emailVerifyExpiresAt = undefined;
       return true;
     });
   }
