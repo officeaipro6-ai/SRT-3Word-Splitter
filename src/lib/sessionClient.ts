@@ -206,9 +206,14 @@ export async function loginAccount(opts: {
 
 /**
  * Ask the server to (re)send the ownership-verification email.
- * The server answers 202 identically for known, unknown and already-verified
- * addresses so the endpoint cannot be used to probe which emails exist; a
- * 429 means "wait and retry" (cooldown). Returns the server message, if any.
+ *
+ * POST /api/account/resend-verification. The server answers 202 identically
+ * for a known address it just sent to and an unknown one (the response cannot
+ * be used to probe which emails exist) — the returned message is therefore
+ * conditional wording, and callers must display it VERBATIM rather than
+ * inventing a "sent" claim. A 429 carries the real safe state (per-account
+ * cooldown / rate limit) and is thrown with the server's message so the UI can
+ * show "Please wait before requesting another verification email."
  */
 export async function resendVerificationEmail(email: string): Promise<string> {
   const res = await fetch(getApiUrl('/api/account/resend-verification'), {

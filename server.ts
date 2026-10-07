@@ -918,6 +918,10 @@ const loginActivity = new AsyncLoginActivityService(loginActivityStore);
   // API key is configured) prints the verification links so a dev/Preview can
   // exercise the flow; Resend mode delivers real mail via the HTTPS API.
   const verificationSender = createEmailSender();
+  // One boot line that answers the first production question: which transport
+  // did this process actually pick (resend = Resend HTTPS 443, log = dev
+  // fallback). Mode only — never the API key or sender credentials.
+  nestedLog.info('email transport configured', { transport: verificationSender.mode });
   // Resend throttle: a per-address+IP generous allowance on top of the per-account
   // cooldown so a volume guesser can't cycle many addresses through 429s.
   const resendRateLimiter = new SlidingWindowLimiter(60 * 60 * 1000, 10);
@@ -2200,35 +2204,84 @@ const result = await accounts.login(req.body ?? {});
   // EMAIL OWNERSHIP VERIFICATION — resend.
   // 202 for known and unknown addresses alike (no address enumeration), 429 on
   // the per-account cooldown or the per-address/IP throttle.
+  //
+  // OBSERVABILITY (production requirement): before this instrumentation every
+  // pre-send gate answered SILENTLY — cooldown/rate-limit 429s and neutral
+  // 202s produced no log line at all, so a click that never reached the email
+  // sender was indistinguishable from one that did. Now:
+  //   1. one "request received" line proves the route was reached,
+  //   2. one "decision" line states WHICH gate answered (never the address),
+  //   3. "token issued" / "send attempt" (with the selected transport) /
+  //      "email sent" (with the result) bracket the delivery itself.
+  // Safe fields only: no email address, no raw or hashed token, no password,
+  // no session token, no API key.
+  const NEUTRAL_VERIFICATION_NOTICE =
+    'If this address has an account that still needs verification, a fresh link has been sent to it. Check your inbox now.';
   app.post('/api/account/resend-verification', asyncRoute(async (req, res) => {
     try {
+      // Header presence ONLY — the token value is never read or logged here.
+      nestedLog.info('resend verification request received', {
+        authenticated: Boolean(req.headers.authorization),
+        hasEmail: Boolean(req.body?.email),
+      });
       const raw = normalizeAccountEmail(req.body?.email);
       if (!raw || !isValidAccountEmail(raw)) {
+        nestedLog.info('resend verification decision', { outcome: 'invalid_email', status: 400 });
         return res.status(400).json({ error: 'A valid email address is required.', code: 'VALIDATION' });
       }
       if (!resendRateLimiter.isAllowed(`${raw}:${req.ip || ''}`)) {
+        nestedLog.info('resend verification decision', { outcome: 'rate_limited', status: 429, ip: req.ip });
         return res.status(429).json({ error: 'Too many requests. Please wait before trying again.', code: 'RATE_LIMITED' });
       }
       const user = await accounts.getByEmail(raw);
       if (!user || !user.email) {
         // Indistinguishable from a real send: the address is not learnable here.
-        return res.status(202).json({ ok: true });
+        nestedLog.info('resend verification decision', { outcome: 'unknown_account', knownAccount: false, status: 202 });
+        return res.status(202).json({ ok: true, message: NEUTRAL_VERIFICATION_NOTICE });
       }
       if (isEmailVerified(user)) {
+        nestedLog.info('resend verification decision', {
+          outcome: 'already_verified',
+          knownAccount: true,
+          userId: user.id,
+          status: 202,
+        });
         return res.status(202).json({ ok: true, message: 'This email is already verified — you can sign in now.' });
       }
       const cooldownMs = resendCooldownRemainingMs(user);
       if (cooldownMs > 0) {
+        nestedLog.info('resend verification decision', {
+          outcome: 'cooldown',
+          knownAccount: true,
+          userId: user.id,
+          cooldownMs,
+          status: 429,
+        });
         return res.status(429).json({
-          error: 'A verification link was sent recently. Please wait before requesting another.',
+          error: 'A verification link was sent recently. Please wait before requesting another verification email.',
           code: 'RESEND_COOLDOWN',
           retryAfterMs: cooldownMs,
         });
       }
       const rawToken = await accounts.issueVerification(user.id);
-      if (!rawToken) return res.status(202).json({ ok: true });
+      if (!rawToken) {
+        // Still a neutral 202 (a 500 here would leak account existence), but
+        // NOW an error line names the userId so the failure is visible.
+        nestedLog.error('resend verification token issuance failed', { userId: user.id });
+        nestedLog.info('resend verification decision', {
+          outcome: 'token_issue_failed',
+          knownAccount: true,
+          userId: user.id,
+          status: 202,
+        });
+        return res.status(202).json({ ok: true, message: NEUTRAL_VERIFICATION_NOTICE });
+      }
+      nestedLog.info('resend verification token issued', { userId: user.id });
       const baseUrl = appBaseUrlForRequest(req);
       const { message } = verificationEmailFor(user.email, rawToken, { requestBaseUrl: baseUrl });
+      // Sender selected (resend|log) + the attempt itself — emitted BEFORE the
+      // transport call so a hanging/failed send still leaves a trace.
+      nestedLog.info('resend verification send attempt', { userId: user.id, transport: verificationSender.mode });
       const delivery = await verificationSender.sender(message);
       nestedLog.info('resend verification email sent', {
         userId: user.id,
@@ -2236,7 +2289,7 @@ const result = await accounts.login(req.body ?? {});
         delivered: delivery.delivered,
         ...(delivery.delivered ? {} : { deliveryError: classifyDeliveryError(delivery.error) }),
       });
-      return res.status(202).json({ ok: true });
+      return res.status(202).json({ ok: true, message: NEUTRAL_VERIFICATION_NOTICE });
     } catch (err: any) {
       nestedLog.error('resend verification failed', { message: redact(err.message) });
       return res.status(500).json({ error: 'Failed to send the verification email.' });

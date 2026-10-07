@@ -11,6 +11,16 @@ import {
 } from '../lib/sessionClient';
 
 /**
+ * Fallback copy for a 202 that carried no message. Worded conditionally on
+ * purpose: a 202 is byte-identical for an address the server actually sent to
+ * and one with no account (anti-enumeration), so the UI may never state
+ * unconditionally that an email was sent. Mirrors the server's
+ * NEUTRAL_VERIFICATION_NOTICE in server.ts.
+ */
+const NEUTRAL_VERIFICATION_NOTICE =
+  'If this address has an account that still needs verification, a fresh link has been sent to it. Check your inbox now.';
+
+/**
  * Normal USER account strip — email/password sign-in, sign-up and sign-out.
  * This is completely separate from the ADMIN bootstrap flow: no bootstrap token
  * is ever entered here, and sign-up can never produce an ADMIN role (the
@@ -32,6 +42,10 @@ export const AccountPanel: React.FC = () => {
   const [needsVerification, setNeedsVerification] = useState<string | null>(null);
   const [resending, setResending] = useState(false);
   const [resendNotice, setResendNotice] = useState<string | null>(null);
+  // Resend failures (cooldown / rate limit / transport) must be visible for a
+  // SIGNED-IN account too: the `error` strip below lives inside the sign-in
+  // form, which is closed precisely when the resend buttons are in use.
+  const [resendError, setResendError] = useState<string | null>(null);
 
   const refresh = () => {
     setLoading(true);
@@ -54,6 +68,7 @@ export const AccountPanel: React.FC = () => {
     setError(null);
     setNeedsVerification(null);
     setResendNotice(null);
+    setResendError(null);
     try {
       const next =
         mode === 'signup'
@@ -78,15 +93,26 @@ export const AccountPanel: React.FC = () => {
 
   const sendVerification = async () => {
     const target = needsVerification ?? session?.email;
-    if (!target) return;
+    if (!target) {
+      // Never fail silently: with no address there is nothing to send to, and
+      // saying nothing looks identical to a broken button.
+      setResendError('No email address is available yet. Sign in first to request a verification link.');
+      return;
+    }
     setResending(true);
     setResendNotice(null);
+    setResendError(null);
     setError(null);
     try {
       const message = await resendVerificationEmail(target);
-      setResendNotice(message || 'A fresh verification link has been sent to your inbox.');
+      // The server message is authoritative: a 202 that did NOT send (neutral
+      // unknown-account answer, already-verified) must never be rendered as an
+      // unqualified "sent to your inbox" claim.
+      setResendNotice(message || NEUTRAL_VERIFICATION_NOTICE);
     } catch (e: any) {
-      setError(e.message);
+      // 429 cooldown / rate limit land here with the server's exact safe state
+      // ("Please wait before requesting another verification email.").
+      setResendError(e.message || 'Could not send the verification email. Please try again.');
     } finally {
       setResending(false);
     }
@@ -177,6 +203,16 @@ export const AccountPanel: React.FC = () => {
         <div className="bg-emerald-500/10 border-t border-emerald-500/20 text-emerald-300">
           <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-1.5 text-xs">
             {resendNotice}
+          </div>
+        </div>
+      )}
+      {/* Always rendered (sibling of the strips above, never inside the
+          sign-in form block), so a signed-in unverified account sees the
+          cooldown/rate-limit state the server actually returned. */}
+      {resendError && (
+        <div className="bg-rose-500/10 border-t border-rose-500/20 text-rose-300">
+          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-1.5 text-xs">
+            {resendError}
           </div>
         </div>
       )}

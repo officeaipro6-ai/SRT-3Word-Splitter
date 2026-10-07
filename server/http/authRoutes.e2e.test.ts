@@ -515,6 +515,10 @@ test('resend verification: cooldown, no address enumeration, verify via the rese
   assert.equal(signup.status, 201, signup.text);
   assert.equal(signup.json.emailVerified, false);
 
+  // Everything after this marker must leave a trace on stdout: before the
+  // instrumentation each gate below answered with NO log line at all.
+  const diagMark = stdout.length;
+
   // So an immediate resend trips the per-account cooldown...
   const resend1 = await post('/api/account/resend-verification', { email: 'resend@example.com' });
   assert.equal(resend1.status, 429, resend1.text);
@@ -523,12 +527,22 @@ test('resend verification: cooldown, no address enumeration, verify via the rese
     Number(resend1.json.retryAfterMs) > 0 && Number(resend1.json.retryAfterMs) <= 250,
     'a bounded retryAfterMs must be reported',
   );
+  assert.match(
+    resend1.json.error,
+    /Please wait before requesting another verification email\./,
+    'the 429 must carry copy the UI can display verbatim',
+  );
 
   // …and once the window elapses a resend is allowed and mints a FRESH link.
   await new Promise((r) => setTimeout(r, 320));
   const resend2 = await post('/api/account/resend-verification', { email: 'resend@example.com' });
   assert.equal(resend2.status, 202, resend2.text);
   assert.equal(resend2.json.ok, true);
+  assert.match(
+    String(resend2.json.message),
+    /If this address has an account that still needs verification/,
+    'a 202 must not claim an unconditional send',
+  );
 
   // Unknown and ALREADY-VERIFIED addresses answer identically — the endpoint
   // cannot be used to probe which email addresses exist. (EMAIL is verified by
@@ -536,8 +550,15 @@ test('resend verification: cooldown, no address enumeration, verify via the rese
   const ghost = await post('/api/account/resend-verification', { email: 'ghost-does-not-exist@example.com' });
   assert.equal(ghost.status, 202, ghost.text);
   assert.equal(ghost.json.ok, true);
+  assert.equal(
+    ghost.json.message,
+    resend2.json.message,
+    'unknown and sent must be byte-identical (no enumeration)',
+  );
+  assert.ok(String(ghost.json.message).length > 10, 'the neutral notice must be present');
   const verifiedAddy = await post('/api/account/resend-verification', { email: EMAIL });
   assert.equal(verifiedAddy.status, 202, verifiedAddy.text);
+  assert.match(String(verifiedAddy.json.message), /already verified/i);
 
   // Blank email is the one refusal that reveals nothing and stays a 400.
   assert.equal((await post('/api/account/resend-verification', { email: '  ' })).status, 400);
@@ -551,6 +572,52 @@ test('resend verification: cooldown, no address enumeration, verify via the rese
   // The resend never handed out a session: login needed the inbox proof first.
   const login = await post('/api/account/login', { email: 'resend@example.com', password: PASSWORD });
   assert.equal(login.status, 200, login.text);
+
+  // ---- production diagnostics: every gate above is observable on stdout ----
+  // Let lines written after the last reply flush through the pipe.
+  await new Promise((r) => setTimeout(r, 150));
+  const diag = stdout.slice(diagMark);
+
+  // Boot logs which transport is in play (this suite forces `log`).
+  const boot = stdout.split('\n').find((l) => l.includes('"msg":"email transport configured"'));
+  assert.ok(boot, 'the configured email transport must be logged at boot');
+  assert.ok(boot.includes('"transport":"log"'), `boot must name the transport: ${boot}`);
+
+  // 1. Route reached: one received line per click (5 requests after the mark).
+  const received = diag.split('\n').filter((l) => l.includes('"msg":"resend verification request received"'));
+  assert.ok(received.length >= 5, `every resend click must be observable, saw ${received.length}`);
+
+  // 2. The cooldown gate is named explicitly — this was the silent branch.
+  assert.ok(
+    diag.includes('"msg":"resend verification decision"') && diag.includes('"outcome":"cooldown"'),
+    'the cooldown decision must identify itself',
+  );
+  assert.ok(diag.includes('"outcome":"unknown_account"'), 'the neutral 202 branch must be logged');
+  assert.ok(diag.includes('"outcome":"already_verified"'), 'the verified branch must be logged');
+  assert.ok(diag.includes('"outcome":"invalid_email"'), 'the validation branch must be logged');
+
+  // 3. The allowed send is bracketed: token -> attempt (transport) -> result.
+  assert.ok(diag.includes('"msg":"resend verification token issued"'), 'token issuance is logged');
+  assert.ok(
+    diag.includes('"msg":"resend verification send attempt"') && diag.includes('"transport":"log"'),
+    'the send attempt must name the selected transport',
+  );
+  assert.ok(
+    diag.includes('"msg":"resend verification email sent"') && diag.includes('"delivered":true'),
+    'the delivery result is logged',
+  );
+
+  // 4. Nothing sensitive ever enters those lines: no address, no token.
+  const resendLines = diag.split('\n').filter((l) => l.includes('"msg":"resend verification'));
+  assert.ok(resendLines.length >= 10, `expected full resend diagnostics, saw ${resendLines.length}`);
+  const allLinks = [...stdout.matchAll(/\[email:log\] verification link \(dev only\): (\S+)/g)].map((m) => m[1]);
+  const tokens = allLinks.map((u) => u.split('token=')[1] || '').filter((t) => t.length >= 20);
+  assert.ok(tokens.length >= 1, 'the test must be able to name the issued token');
+  for (const line of resendLines) {
+    assert.ok(!line.includes('@example.com'), `decision logs must never carry an address: ${line}`);
+    assert.ok(!line.includes('token='), `no token URLs in decision logs: ${line}`);
+    for (const t of tokens) assert.ok(!line.includes(t), `raw token leaked into a log line: ${line}`);
+  }
 });
 
 test('an anonymous session works end to end on turso', async () => {
