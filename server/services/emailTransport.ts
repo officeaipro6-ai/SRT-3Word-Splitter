@@ -150,12 +150,66 @@ export function createSmtpSender(config: EmailTransportConfig): EmailSender {
       logDelivery(msg.to);
       return { delivered: true, transport: 'smtp' };
     } catch (err) {
-      const error = String((err as Error).message ?? err);
-      // Redact anything credential-shaped (SMTP auth lines, tokens, urls).
-      const sanitized = error.replace(/pass\b[^,;]+/gi, 'pass=***').slice(0, 400);
-      return { delivered: false, transport: 'smtp', error: sanitized };
+      // Only machine-safe bits survive here: the nodemailer error `code`
+      // (EAUTH/ETIMEDOUT/...) plus a trimmed message, redacted of anything
+      // credential-shaped. Never the raw error object.
+      const code = typeof (err as { code?: unknown } | null)?.code === 'string'
+        ? String((err as { code: string }).code)
+        : '';
+      const message = String((err as Error | undefined)?.message ?? err);
+      const sanitized = message.replace(/pass\b[^,;]+/gi, 'pass=***').slice(0, 400);
+      const error = (code ? `${code}: ` : '') + sanitized;
+      return { delivered: false, transport: 'smtp', error };
     }
   };
+}
+
+/**
+ * The well-known failure classes this server can actually act on. Anything else
+ * is reduced to a short, scrubbed message by {@link classifyDeliveryError}.
+ */
+const SMTP_ERROR_CODES = [
+  'EAUTH',
+  'ECONNECTION',
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'ECONNABORTED',
+  'ETIMEDOUT',
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'ESOCKET',
+  'EPIPE',
+  'EACCES',
+  'ETLSRCH',
+  'EADDRINUSE',
+] as const;
+
+/**
+ * Reduce a transport's sanitized error to a safe, short value safe for
+ * production logs.
+ *
+ * - A known SMTP failure class (e.g. `EAUTH`, `ECONNECTION`, `ETIMEDOUT`) is
+ *   returned verbatim so ops can sort on it.
+ * - Anything else falls back to the first non-empty line, scrubbed of email
+ *   addresses and any `token=`/`pass=`/`Authorization` fragments, then capped
+ *   at 120 chars (`unknown` when nothing remains).
+ *
+ * Accepts ONLY the already-redacted string from an {@link EmailDelivery} — never
+ * credentials, request objects or nodemailer instances.
+ */
+export function classifyDeliveryError(error: string | undefined | null): string {
+  const sanitized = String(error ?? '').trim();
+  if (!sanitized) return 'unknown';
+  const known = SMTP_ERROR_CODES.find((code) => sanitized.includes(code));
+  if (known) return known;
+  const firstLine = sanitized.split(/\r?\n/)[0].trim();
+  const scrubbed = firstLine
+    .replace(/\bBearer\s+[^\s,;]+/gi, 'Bearer=***')
+    .replace(/\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b/g, '[email]')
+    .replace(/\b(token|pass(?:word)?|auth(?:orization)?|bearer)\b(\s*[=:]\s*[^\s,;]+)?/gi, (_m, name: string) => `${name}=***`)
+    .replace(/\s+/g, ' ')
+    .trim();
+  return scrubbed.slice(0, 120) || 'unknown';
 }
 
 /**

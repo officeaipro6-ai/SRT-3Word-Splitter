@@ -131,6 +131,7 @@ import { createTelegramTransport, readTelegramConfig, toLoginAlertTransport } fr
 import {
   createEmailSender,
   verificationEmailFor,
+  classifyDeliveryError,
   type EmailSender,
 } from './server/services/emailTransport';
 import {
@@ -2043,6 +2044,7 @@ const loginActivity = new AsyncLoginActivityService(loginActivityStore);
               userId: user.id,
               transport: verificationSender.mode,
               delivered: delivery.delivered,
+              ...(delivery.delivered ? {} : { deliveryError: classifyDeliveryError(delivery.error) }),
             });
           }
         } catch (e) {
@@ -2237,6 +2239,7 @@ const result = await accounts.login(req.body ?? {});
         userId: user.id,
         transport: verificationSender.mode,
         delivered: delivery.delivered,
+        ...(delivery.delivered ? {} : { deliveryError: classifyDeliveryError(delivery.error) }),
       });
       return res.status(202).json({ ok: true });
     } catch (err: any) {

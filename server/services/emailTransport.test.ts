@@ -15,6 +15,7 @@ import {
   verificationEmailFor,
   createEmailSender,
   createLogSender,
+  classifyDeliveryError,
   type EmailMessage,
 } from './emailTransport';
 
@@ -139,4 +140,26 @@ test('the log transport prints the verification LINK and never a token hash or c
     !printed.some((l) => l.includes('super-secret')),
     'no credential may ever reach the log transport output'
   );
+});
+
+test('classifyDeliveryError returns the known failure class verbatim', () => {
+  assert.equal(classifyDeliveryError('EAUTH: Invalid login - 535 5.7.8 Username and Password not accepted. For more info go to https://support.google.com/mail/?p=BadCredentials'), 'EAUTH');
+  assert.equal(classifyDeliveryError('getaddrinfo ENOTFOUND smtp.gmail.com'), 'ENOTFOUND');
+  assert.equal(classifyDeliveryError('connect ECONNREFUSED 127.0.0.1:587'), 'ECONNREFUSED');
+  assert.equal(classifyDeliveryError('connect ETIMEDOUT smtp.gmail.com:587'), 'ETIMEDOUT');
+  assert.equal(classifyDeliveryError('EOVERFLOW ECONNRESET during message'), 'ECONNRESET');
+  assert.equal(classifyDeliveryError(''), 'unknown', 'empty input collapses to unknown');
+  assert.equal(classifyDeliveryError(null), 'unknown');
+});
+
+test('classifyDeliveryError falls back to a scrubbed short message, never a credential', () => {
+  const out = classifyDeliveryError(
+    '535 5.7.8 Username and Password not accepted. token=deadbeef pass=supersecret Authorization: Bearer aaaBbbCcc tell user=bob@example.com now'
+  );
+  assert.ok(out.length <= 120, 'output stays short');
+  assert.ok(!out.toLowerCase().includes('supersecret'), 'no password value');
+  assert.ok(!out.includes('deadbeef'), 'no token value');
+  assert.ok(!out.includes('aaaBbbCcc'), 'no bearer value');
+  assert.ok(!out.includes('bob@example.com'), 'no email address');
+  assert.ok(out.includes('535'), 'the safe SMTP response fragment survives');
 });
