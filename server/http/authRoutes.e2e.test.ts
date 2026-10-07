@@ -129,14 +129,10 @@ before(async () => {
       SARVAM_API_KEY: '',
       LOCAL_SUBMISSION_MODE: 'false',
       // Force the log transport so the verification LINK lands in stdout where
-      // the test extracts it (and prove no SMTP server is needed to complete
-      // the flow). Stripping the vars also guarantees a real install's email
+      // the test extracts it (and prove no mail API is needed to complete the
+      // flow). Stripping the vars also guarantees a real install's email
       // credentials can never be observed or used by the test.
-      SMTP_HOST: '',
-      SMTP_PORT: '',
-      SMTP_USER: '',
-      SMTP_PASSWORD: '',
-      SMTP_SECURE: '',
+      RESEND_API_KEY: '',
       EMAIL_FROM: '',
       EMAIL_VERIFY_EXPIRES_MS: '',
       // Keep the resend cooldown short so the cooldown path can be exercised

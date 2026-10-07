@@ -1,10 +1,11 @@
 /**
  * Unit contract for the email transport (server/services/emailTransport.ts).
  *
- * Covers the mode selection, link/message building, HTML escaping and the
- * dev-log transport output. Real SMTP delivery is never attempted here (it
- * would need a server); the log transport and the sender factory are asserted
- * hermetically.
+ * Covers mode selection, link/message building, HTML escaping, the dev-log
+ * transport output, the sanitized error classifier and the Resend HTTPS
+ * sender. Real network delivery is never attempted here: `fetch` is stubbed
+ * and its calls are captured so the Authorization header, payload and failure
+ * handling can be asserted hermetically.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -15,29 +16,53 @@ import {
   verificationEmailFor,
   createEmailSender,
   createLogSender,
+  createResendSender,
   classifyDeliveryError,
+  scrubSensitiveText,
   type EmailMessage,
 } from './emailTransport';
+
+type CapturedFetch = { url: string; init: RequestInit };
+
+const RESEND_URL = 'https://api.resend.com/emails';
+
+/** Swap in a fake fetch that records calls and returns the given response. */
+function withFetchMock(
+  respond: (url: string, init: RequestInit | undefined) => Promise<Response> | Response
+): { calls: CapturedFetch[]; restore: () => void } {
+  const calls: CapturedFetch[] = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    calls.push({ url, init: init ?? {} });
+    return respond(url, init);
+  }) as typeof fetch;
+  return {
+    calls,
+    restore: () => {
+      globalThis.fetch = original;
+    },
+  };
+}
+
+const SAMPLE_MESSAGE: EmailMessage = {
+  to: 'u@example.com',
+  subject: 'Verify your Odia SRT email address',
+  text: 'Click this link to verify your email address and start transcribing:\n\nhttps://app.example.com/api/auth/verify-email?token=raw-token-value',
+  html: '<p>Verify now</p>',
+};
 
 test('emailTransportConfig reads straight from the environment and trims', () => {
   const cfg = emailTransportConfig({
     EMAIL_FROM: '  support@example.com  ',
-    SMTP_HOST: ' smtp.example.com ',
-    SMTP_PORT: ' 587 ',
-    SMTP_USER: ' u ',
-    SMTP_PASSWORD: ' s ',
-    SMTP_SECURE: ' true ',
+    RESEND_API_KEY: '  re_abcdefg  ',
   } as NodeJS.ProcessEnv);
   assert.equal(cfg.emailFrom, 'support@example.com');
-  assert.equal(cfg.smtpHost, 'smtp.example.com');
-  assert.equal(cfg.smtpPort, '587');
-  assert.equal(cfg.smtpUser, 'u');
-  assert.equal(cfg.smtpPassword, 's');
-  assert.equal(cfg.smtpSecure, 'true');
+  assert.equal(cfg.apiKey, 're_abcdefg');
 
   const empty = emailTransportConfig({} as NodeJS.ProcessEnv);
   assert.equal(empty.emailFrom, '');
-  assert.equal(empty.smtpHost, '');
+  assert.equal(empty.apiKey, '');
 });
 
 test('verificationLink resolves one route, normalises base and URL-encodes the token', () => {
@@ -89,44 +114,32 @@ test('verificationEmailFor prefers the explicit app base URL, then the request o
   assert.ok(def.message.text.includes('http://localhost:3000/api/auth/verify-email'));
 });
 
-test('createEmailSender selects SMTP only when host AND from are configured, else the log fallback', () => {
-  const noSmtp = createEmailSender({} as NodeJS.ProcessEnv);
-  assert.equal(noSmtp.mode, 'log', 'no SMTP config -> development log transport');
+test('createEmailSender selects Resend only when key AND from are configured, else the log fallback', () => {
+  const noResend = createEmailSender({} as NodeJS.ProcessEnv);
+  assert.equal(noResend.mode, 'log', 'no Resend config -> development log transport');
 
-  const halfConfigured = createEmailSender({ SMTP_HOST: 'smtp.x.com' } as NodeJS.ProcessEnv);
-  assert.equal(halfConfigured.mode, 'log', 'host alone must NOT enable SMTP (no from-address)');
+  const halfConfigured = createEmailSender({ RESEND_API_KEY: 're_x' } as NodeJS.ProcessEnv);
+  assert.equal(halfConfigured.mode, 'log', 'key alone must NOT enable Resend (no from-address)');
 
-  const smtp = createEmailSender({
-    SMTP_HOST: 'smtp.x.com',
+  const resend = createEmailSender({
+    RESEND_API_KEY: 're_x',
     EMAIL_FROM: 'me@x.com',
-    SMTP_PASSWORD: 'super-secret',
   } as NodeJS.ProcessEnv);
-  assert.equal(smtp.mode, 'smtp');
+  assert.equal(resend.mode, 'resend');
 });
 
 test('the log transport prints the verification LINK and never a token hash or credentials', async () => {
-  const msg: EmailMessage = {
-    to: 'u@example.com',
-    subject: 'Verify your Odia SRT email address',
-    text: 'Click this link to verify your email address and start transcribing:\n\nhttps://app.example.com/api/auth/verify-email?token=raw-token-value',
-    html: '<p>x</p>',
-  };
-
   let printed: string[] = [];
-  let delivery:
-    | Awaited<ReturnType<ReturnType<typeof createLogSender>>>
-    | undefined;
   const original = console.log;
   console.log = (...a: unknown[]) => printed.push(a.map(String).join(' '));
   try {
-    delivery = await createLogSender()(msg);
+    const delivery = await createLogSender()(SAMPLE_MESSAGE);
+    assert.equal(delivery.delivered, true);
+    assert.equal(delivery.transport, 'log');
+    assert.ok(!delivery.error, 'log delivery never reports an error');
   } finally {
     console.log = original;
   }
-
-  assert.equal(delivery!.delivered, true);
-  assert.equal(delivery!.transport, 'log');
-  assert.ok(!delivery!.error, 'log delivery never reports an error');
   assert.ok(printed.some((l) => l.includes('[email:log]')), 'lines must be labelled [email:log]');
   assert.ok(
     printed.some((l) => l.includes('verification link (dev only)')),
@@ -136,17 +149,101 @@ test('the log transport prints the verification LINK and never a token hash or c
     printed.some((l) => l.includes('https://app.example.com/api/auth/verify-email?token=raw-token-value')),
     'the dev log must expose the full clickable verification link'
   );
+});
+
+test('Resend sender posts the exact payload with a Bearer header and reports success', async () => {
+  const mock = withFetchMock(async () => new Response(JSON.stringify({ id: 'resend-id-1' }), { status: 200 }));
+  let printed: string[] = [];
+  const original = console.log;
+  console.log = (...a: unknown[]) => printed.push(a.map(String).join(' '));
+  try {
+    const sender = createResendSender({ apiKey: 're_TOP_SECRET_KEY', emailFrom: 'Odia SRT <noreply@example.com>' });
+    const delivery = await sender(SAMPLE_MESSAGE);
+    assert.equal(delivery.delivered, true);
+    assert.equal(delivery.transport, 'resend');
+    assert.ok(!delivery.error, 'success reports no error');
+  } finally {
+    console.log = original;
+    mock.restore();
+  }
+
+  assert.equal(mock.calls.length, 1, 'exactly one API call');
+  assert.equal(mock.calls[0].url, RESEND_URL);
+  const headers = new Headers(mock.calls[0].init.headers);
+  assert.equal(headers.get('Authorization'), 'Bearer re_TOP_SECRET_KEY', 'the API key travels as a Bearer token');
+  assert.equal(headers.get('Content-Type'), 'application/json');
+
+  const body = JSON.parse(String(mock.calls[0].init.body));
+  assert.equal(body.from, 'Odia SRT <noreply@example.com>');
+  assert.deepEqual(body.to, ['u@example.com']);
+  assert.equal(body.subject, SAMPLE_MESSAGE.subject);
+  assert.equal(body.text, SAMPLE_MESSAGE.text);
+  assert.equal(body.html, SAMPLE_MESSAGE.html);
+
   assert.ok(
-    !printed.some((l) => l.includes('super-secret')),
-    'no credential may ever reach the log transport output'
+    !printed.some((l) => l.includes('re_TOP_SECRET_KEY')),
+    'the API key must never appear in logs'
   );
+  assert.ok(
+    !printed.some((l) => l.includes('raw-token-value')),
+    'the verification token/link must never appear in the success log'
+  );
+});
+
+test('Resend non-2xx returns delivered=false with a sanitized, classified error', async () => {
+  const mock = withFetchMock(async () =>
+    new Response(JSON.stringify({ message: 'You are not allowed to send to bob@example.com. token=abc123' }), {
+      status: 403,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  );
+  try {
+    const sender = createResendSender({ apiKey: 're_TOP_SECRET_KEY', emailFrom: 'noreply@example.com' });
+    const delivery = await sender(SAMPLE_MESSAGE);
+    assert.equal(delivery.delivered, false);
+    assert.equal(delivery.transport, 'resend');
+    assert.ok(delivery.error, 'a failure must carry an error');
+    assert.ok(delivery.error.includes('resend_http_403'), 'the HTTP status class is classified');
+    assert.ok(!delivery.error.includes('re_TOP_SECRET_KEY'), 'no API key in the error');
+    assert.ok(!delivery.error.includes('token=abc123'), 'no token fragment in the error');
+    assert.ok(!delivery.error.includes('bob@example.com'), 'no email address in the error');
+    const classified = classifyDeliveryError(delivery.error);
+    assert.ok(classified.startsWith('resend_http_403'), 'the HTTP status class is classified');
+    assert.ok(!classified.includes('re_TOP_SECRET_KEY'), 'no API key in the logged classification');
+    assert.ok(!classified.includes('bob@example.com'), 'no email address in the logged classification');
+    assert.ok(!classified.includes('abc123'), 'no token value in the logged classification');
+
+    const neverLogs = await sender(SAMPLE_MESSAGE);
+    assert.equal(neverLogs.delivered, false);
+    assert.ok(!neverLogs.error!.includes('raw-token-value'), 'the link/token is never echoed in errors');
+  } finally {
+    mock.restore();
+  }
+});
+
+test('a network failure is classified safely (ENOTFOUND) and never rejects', async () => {
+  const mock = withFetchMock(async () => {
+    const cause = new Error('getaddrinfo ENOTFOUND api.resend.com');
+    (cause as { code?: string }).code = 'ENOTFOUND';
+    throw Object.assign(new TypeError('fetch failed'), { cause });
+  });
+  try {
+    const sender = createResendSender({ apiKey: 're_TOP_SECRET_KEY', emailFrom: 'noreply@example.com' });
+    const delivery = await sender(SAMPLE_MESSAGE);
+    assert.equal(delivery.delivered, false, 'network failure -> delivered=false');
+    assert.equal(delivery.transport, 'resend');
+    assert.ok(delivery.error!.includes('ENOTFOUND'), 'the error code surfaces for classification');
+    assert.ok(!delivery.error!.includes('re_TOP_SECRET_KEY'), 'no API key in the error');
+    assert.equal(classifyDeliveryError(delivery.error), 'ENOTFOUND');
+  } finally {
+    mock.restore();
+  }
 });
 
 test('classifyDeliveryError returns the known failure class verbatim', () => {
   assert.equal(classifyDeliveryError('EAUTH: Invalid login - 535 5.7.8 Username and Password not accepted. For more info go to https://support.google.com/mail/?p=BadCredentials'), 'EAUTH');
-  assert.equal(classifyDeliveryError('getaddrinfo ENOTFOUND smtp.gmail.com'), 'ENOTFOUND');
-  assert.equal(classifyDeliveryError('connect ECONNREFUSED 127.0.0.1:587'), 'ECONNREFUSED');
-  assert.equal(classifyDeliveryError('connect ETIMEDOUT smtp.gmail.com:587'), 'ETIMEDOUT');
+  assert.equal(classifyDeliveryError('getaddrinfo ENOTFOUND api.resend.com'), 'ENOTFOUND');
+  assert.equal(classifyDeliveryError('connect ETIMEDOUT api.resend.com:443'), 'ETIMEDOUT');
   assert.equal(classifyDeliveryError('EOVERFLOW ECONNRESET during message'), 'ECONNRESET');
   assert.equal(classifyDeliveryError(''), 'unknown', 'empty input collapses to unknown');
   assert.equal(classifyDeliveryError(null), 'unknown');
@@ -162,4 +259,18 @@ test('classifyDeliveryError falls back to a scrubbed short message, never a cred
   assert.ok(!out.includes('aaaBbbCcc'), 'no bearer value');
   assert.ok(!out.includes('bob@example.com'), 'no email address');
   assert.ok(out.includes('535'), 'the safe SMTP response fragment survives');
+});
+
+test('scrubSensitiveText removes emails, Bearer/token/pass fragments and collapses space', () => {
+  const out = scrubSensitiveText('mail to a@b.com token=xyz pass=abc then Bearer qwerty123 and Authorization: Bearer aj12345');
+  assert.ok(!out.includes('a@b.com'));
+  assert.ok(!out.includes('xyz'));
+  assert.ok(!out.includes('abc'));
+  assert.ok(!out.includes('qwerty123'));
+  assert.ok(!out.includes('aj12345'));
+  assert.ok(out.includes('Bearer=***'));
+  assert.ok(out.includes('token=***'));
+  assert.ok(out.includes('pass=***'));
+  assert.ok(out.includes('Authorization=***'));
+  assert.ok(!/\s{2,}/.test(out), 'whitespace collapses');
 });

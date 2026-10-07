@@ -913,9 +913,9 @@ const loginActivity = new AsyncLoginActivityService(loginActivityStore);
   const razorpayEnabled = !!razorpay;
 
   const uploadLimiter = new SlidingWindowLimiter(config.uploadRateLimitWindowMs, config.uploadRateLimitMax);
-  // Email-ownership verification transport. Log mode (default when no SMTP is
-  // configured) prints the verification links so a dev/Preview can exercise the
-  // flow; SMTP mode delivers real mail through the configured provider.
+  // Email-ownership verification transport. Log mode (default when no Resend
+  // API key is configured) prints the verification links so a dev/Preview can
+  // exercise the flow; Resend mode delivers real mail via the HTTPS API.
   const verificationSender = createEmailSender();
   // Resend throttle: a per-address+IP generous allowance on top of the per-account
   // cooldown so a volume guesser can't cycle many addresses through 429s.
